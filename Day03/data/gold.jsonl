@@ -1,0 +1,18 @@
+{"id": "simple", "required_docs": ["sla-a-v2"], "expected_facts": ["99.9%"], "abstain": false, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "amendment", "required_docs": ["sla-a-v2", "sla-a-amendment"], "expected_facts": ["다음 달 20일", "가용률 구간과 크레딧 비율 및 제외 시간은 v2.0 유지"], "abstain": false, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "parallel", "required_docs": ["runbook", "security"], "expected_facts": ["upstream 지연, 연결 풀 포화, 인덱스 상태 순서", "90일", "보안 사고 조사 별도 보존 명령이면 조사 종료 승인까지"], "abstain": false, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "sequential", "required_docs": ["runbook"], "expected_facts": ["배포 후 10분 내 오류율 5% 초과와 스키마 호환이 모두 필요", "스키마 미호환이므로 자동 롤백하지 않고 장애 책임자 승인 요청"], "abstain": false, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "followup", "required_docs": ["sla-a-v2", "sla-a-amendment"], "expected_facts": ["추가 약정은 신청 기한만 변경", "가용률 목표 99.9% 유지"], "abstain": false, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "unknown", "required_docs": ["security"], "expected_facts": ["이 문서는 애플리케이션 오류 로그에 적용되지 않음", "정확한 기간은 문서에 없어 보류"], "abstain": true, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "old_version", "required_docs": ["sla-a-v1"], "expected_facts": ["99.5%", "다음 달 말일"], "abstain": false, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "before_amendment", "required_docs": ["sla-a-v2"], "expected_facts": ["다음 달 15일", "8월 시행 추가 약정 미적용"], "abstain": false, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "beta", "required_docs": ["sla-b"], "expected_facts": ["99.99%", "장애 발생 후 60일"], "abstain": false, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "draft", "required_docs": ["sla-a-v2"], "expected_facts": ["초안은 승인 전이므로 적용하지 않음", "승인된 v2.0 적용"], "abstain": false, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "travel", "required_docs": ["travel"], "expected_facts": ["1박 120000원 부가세 포함", "박람회 사전 부서장 승인 시 180000원", "출장 종료일부터 14일"], "abstain": false, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "purchase", "required_docs": ["purchase"], "expected_facts": ["개별 계약 90일 우선", "일반 규칙 60일"], "abstain": false, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "sales", "required_docs": ["sales"], "expected_facts": ["120에서 150으로 증가하여 25% 증가", "백만원 단위 부가세 제외"], "abstain": false, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "maintenance", "required_docs": ["sla-a-v2"], "expected_facts": ["48시간 전에 공지", "월 누적 120분 초과 점검 시간 포함"], "abstain": false, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "credit", "required_docs": ["sla-a-v2"], "expected_facts": ["15%", "15만원", "기본 이용료 기준"], "abstain": false, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "security_exception", "required_docs": ["security"], "expected_facts": ["아니오", "조사 종료 승인까지 보존"], "abstain": false, "review_note": "Day-02 동봉 원문 기준의 교재 평가 항목"}
+{"id": "web_timeout", "required_docs": ["runbook"], "expected_facts": ["upstream 지연, 연결 풀 포화, 인덱스 상태 순서", "connect 연결 수립, read 데이터 수신, write 전송, pool 연결 풀 대기 timeout"], "abstain": false, "review_note": "내부 항목은 Day-02 동봉 원문 대조. 웹 항목은 공식 HTTPX timeout 문서 대조 필요."}
+{"id": "web_reuse", "required_docs": [], "expected_facts": ["pool timeout"], "abstain": false, "review_note": "내부 항목은 Day-02 동봉 원문 대조. 웹 항목은 공식 HTTPX timeout 문서 대조 필요."}

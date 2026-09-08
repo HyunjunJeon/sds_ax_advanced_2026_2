@@ -1,0 +1,12 @@
+{"id": "simple-deadline-current", "expected_docs": ["sla-a-v2", "sla-a-amendment"], "facts": ["신청 기한은 다음 달 20일이다(2026-08 개별 추가 약정 기준)."], "abstain": false}
+{"id": "versioned-deadline-july", "expected_docs": ["sla-a-v2"], "facts": ["추가 약정 적용 전 기준 기한은 매월 15일이다(20일이 아니어야 한다)."], "abstain": false}
+{"id": "versioned-deadline-june", "expected_docs": ["sla-a-v1"], "facts": ["v1 기준 기한은 매월 15일이다."], "abstain": false}
+{"id": "table-interval-comparison", "expected_docs": ["sla-a-v2"], "facts": ["가용률 구간별 크레딧 비율의 최댓값은 20%이다."], "abstain": false}
+{"id": "table-ratio-max", "expected_docs": ["sla-a-v2"], "facts": ["최댓값은 20%(단위 %)다."], "abstain": false}
+{"id": "procedure-credit-application", "expected_docs": ["sla-a-v2", "sla-a-amendment"], "facts": [], "abstain": false}
+{"id": "simple-amendment-scope", "expected_docs": ["sla-a-amendment"], "facts": ["개별 추가 약정의 신청 기한은 다음 달 20일이다."], "abstain": false}
+{"id": "cross-ops-and-log-retention", "expected_docs": ["runbook", "security"], "facts": ["타임아웃 증가 시 upstream 지연, 연결 풀 포화, 인덱스 상태 순으로 확인한다.", "운영 접근 로그는 90일 보관 후 삭제하되 보존 명령 로그는 조사 종료 승인까지 보존한다."], "abstain": false}
+{"id": "single-travel-receipt", "expected_docs": ["travel"], "facts": ["카드 매출전표 또는 현금영수증과 숙박 내역을 제출한다."], "abstain": false}
+{"id": "single-renewal-notice", "expected_docs": ["purchase"], "facts": ["자동 갱신 계약은 만료일 60일 전까지 갱신 거절 의사를 통지한다(개별 계약서에 90일 명시 시 우선)."], "abstain": false}
+{"id": "unknown-mars-branch", "expected_docs": [], "facts": ["문서에 없는 사실이므로 근거 부족으로 보류해야 한다."], "abstain": true}
+{"id": "scope-trap-beta-ratio", "expected_docs": [], "facts": ["베타 서비스 문서는 알파 고객 범위 밖이므로 답변 근거로 쓸 수 없다."], "abstain": true}

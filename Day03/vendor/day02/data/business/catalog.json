@@ -1,0 +1,219 @@
+[
+  {
+    "path": "data/business/sla-a-v1.md",
+    "metadata": {
+      "doc_id": "sla-a-v1",
+      "title": "알파 서비스 SLA",
+      "source": "data/business/sla-a-v1.md",
+      "domain": "계약",
+      "entity": "알파",
+      "version": "1.0",
+      "valid_from": "2025-01-01",
+      "valid_until": "2026-07-01",
+      "status": "approved",
+      "topics": [
+        "가용률",
+        "서비스 크레딧"
+      ],
+      "owner": "계약 담당",
+      "page": null,
+      "extraction_method": "authored"
+    }
+  },
+  {
+    "path": "data/business/sla-a-v2.md",
+    "metadata": {
+      "doc_id": "sla-a-v2",
+      "title": "알파 서비스 SLA",
+      "source": "data/business/sla-a-v2.md",
+      "domain": "계약",
+      "entity": "알파",
+      "version": "2.0",
+      "valid_from": "2026-07-01",
+      "valid_until": null,
+      "status": "approved",
+      "topics": [
+        "가용률",
+        "서비스 크레딧",
+        "신청"
+      ],
+      "owner": "계약 담당",
+      "page": null,
+      "extraction_method": "authored"
+    }
+  },
+  {
+    "path": "data/business/sla-b.md",
+    "metadata": {
+      "doc_id": "sla-b",
+      "title": "베타 서비스 SLA",
+      "source": "data/business/sla-b.md",
+      "domain": "계약",
+      "entity": "베타",
+      "version": "1.0",
+      "valid_from": "2026-01-01",
+      "valid_until": null,
+      "status": "approved",
+      "topics": [
+        "가용률",
+        "서비스 크레딧"
+      ],
+      "owner": "계약 담당",
+      "page": null,
+      "extraction_method": "authored"
+    }
+  },
+  {
+    "path": "data/business/sla-a-draft.md",
+    "metadata": {
+      "doc_id": "sla-a-draft",
+      "title": "알파 SLA 개정 검토안",
+      "source": "data/business/sla-a-draft.md",
+      "domain": "계약",
+      "entity": "알파",
+      "version": "3.0-draft",
+      "valid_from": "2026-08-01",
+      "valid_until": null,
+      "status": "draft",
+      "topics": [
+        "가용률",
+        "서비스 크레딧"
+      ],
+      "owner": "계약 담당",
+      "page": null,
+      "extraction_method": "authored"
+    }
+  },
+  {
+    "path": "data/business/travel.md",
+    "metadata": {
+      "doc_id": "travel",
+      "title": "국내 출장비 정산 규정",
+      "source": "data/business/travel.md",
+      "domain": "인사",
+      "entity": "공통",
+      "version": "2026.2",
+      "valid_from": "2026-06-01",
+      "valid_until": null,
+      "status": "approved",
+      "topics": [
+        "숙박",
+        "영수증",
+        "정산"
+      ],
+      "owner": "인사 담당",
+      "page": null,
+      "extraction_method": "authored"
+    }
+  },
+  {
+    "path": "data/business/purchase.md",
+    "metadata": {
+      "doc_id": "purchase",
+      "title": "구매 계약 갱신 절차",
+      "source": "data/business/purchase.md",
+      "domain": "구매",
+      "entity": "공통",
+      "version": "4.1",
+      "valid_from": "2026-01-01",
+      "valid_until": null,
+      "status": "approved",
+      "topics": [
+        "갱신",
+        "해지",
+        "통지"
+      ],
+      "owner": "구매 담당",
+      "page": null,
+      "extraction_method": "authored"
+    }
+  },
+  {
+    "path": "data/business/runbook.md",
+    "metadata": {
+      "doc_id": "runbook",
+      "title": "검색 서비스 장애 대응 절차",
+      "source": "data/business/runbook.md",
+      "domain": "운영",
+      "entity": "공통",
+      "version": "2.3",
+      "valid_from": "2026-05-01",
+      "valid_until": null,
+      "status": "approved",
+      "topics": [
+        "타임아웃",
+        "롤백",
+        "장애"
+      ],
+      "owner": "운영 담당",
+      "page": null,
+      "extraction_method": "authored"
+    }
+  },
+  {
+    "path": "data/business/sales.md",
+    "metadata": {
+      "doc_id": "sales",
+      "title": "2026년 2분기 제품 매출",
+      "source": "data/business/sales.md",
+      "domain": "재무",
+      "entity": "공통",
+      "version": "final",
+      "valid_from": "2026-07-15",
+      "valid_until": null,
+      "status": "approved",
+      "topics": [
+        "매출",
+        "단위",
+        "분기"
+      ],
+      "owner": "재무 담당",
+      "page": null,
+      "extraction_method": "authored"
+    }
+  },
+  {
+    "path": "data/business/security.md",
+    "metadata": {
+      "doc_id": "security",
+      "title": "고객 로그 보관 정책",
+      "source": "data/business/security.md",
+      "domain": "보안",
+      "entity": "공통",
+      "version": "1.2",
+      "valid_from": "2026-04-01",
+      "valid_until": null,
+      "status": "approved",
+      "topics": [
+        "로그",
+        "보관",
+        "삭제"
+      ],
+      "owner": "보안 담당",
+      "page": null,
+      "extraction_method": "authored"
+    }
+  },
+  {
+    "path": "data/business/sla-a-amendment.md",
+    "metadata": {
+      "doc_id": "sla-a-amendment",
+      "title": "알파 SLA 개별 추가 약정",
+      "source": "data/business/sla-a-amendment.md",
+      "domain": "계약",
+      "entity": "알파",
+      "version": "A-01",
+      "valid_from": "2026-08-01",
+      "valid_until": null,
+      "status": "approved",
+      "topics": [
+        "가용률",
+        "추가 약정",
+        "신청"
+      ],
+      "owner": "계약 담당",
+      "page": null,
+      "extraction_method": "authored"
+    }
+  }
+]

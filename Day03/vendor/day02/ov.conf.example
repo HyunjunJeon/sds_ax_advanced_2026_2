@@ -1,0 +1,41 @@
+{
+  "embedding": {
+    "dense": {
+      "provider": "openai",
+      "model": "qwen/qwen3-embedding-8b",
+      "api_base": "https://openrouter.ai/api/v1",
+      "api_key": "your-openrouter-api-key",
+      "dimension": 4096,
+      "encoding_format": "float"
+    }
+  },
+  "vlm": {
+    "provider": "openai",
+    "model": "google/gemini-3.8-flash",
+    "api_base": "https://openrouter.ai/api/v1",
+    "api_key": "your-openrouter-api-key",
+    "temperature": 0,
+    "thinking": false,
+    "extra_headers": {
+      "HTTP-Referer": "https://sds-ax-advanced.local",
+      "X-Title": "SDS AX Advanced Day02"
+    }
+  },
+  "storage": {
+    "workspace": "/app/.openviking/data",
+    "agfs": {
+      "backend": "local"
+    },
+    "vectordb": {
+      "backend": "local"
+    }
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 1933,
+    "root_api_key": "change-me-before-compose-up",
+    "cors_origins": [
+      "*"
+    ]
+  }
+}

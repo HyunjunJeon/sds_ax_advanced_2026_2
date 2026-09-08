@@ -1,0 +1,12 @@
+{"id": "simple-deadline-current", "question": "알파 서비스 크레딧 신청 기한은 언제인가요?", "entity": "알파", "as_of": "2026-09-08", "namespace": "business", "type": "simple"}
+{"id": "versioned-deadline-july", "question": "알파 서비스 크레딧 신청 기한은 언제인가요?", "entity": "알파", "as_of": "2026-07-15", "namespace": "business", "type": "versioned"}
+{"id": "versioned-deadline-june", "question": "알파 서비스 크레딧 신청 기한은 언제인가요?", "entity": "알파", "as_of": "2026-06-30", "namespace": "business", "type": "versioned"}
+{"id": "table-interval-comparison", "question": "알파 SLA의 월간 가용률 구간별 서비스 크레딧 비율을 비교해주세요.", "entity": "알파", "as_of": "2026-09-08", "namespace": "business", "type": "table"}
+{"id": "table-ratio-max", "question": "알파 SLA 표의 서비스 크레딧 비율 중 최댓값은 무엇인가요?", "entity": "알파", "as_of": "2026-09-08", "namespace": "business", "type": "table"}
+{"id": "procedure-credit-application", "question": "알파 SLA 서비스 크레딧을 신청하는 절차와 제출 자료를 알려주세요.", "entity": "알파", "as_of": "2026-09-08", "namespace": "business", "type": "procedural"}
+{"id": "simple-amendment-scope", "question": "2026년 8월 개별 추가 약정의 적용 대상과 신청 기한은 무엇인가요?", "entity": "알파", "as_of": "2026-09-08", "namespace": "business", "type": "simple"}
+{"id": "cross-ops-and-log-retention", "question": "검색 서비스 장애 시 타임아웃 증가 점검 순서와 운영 접근 로그의 보관 기간·예외를 설명하세요.", "entity": "공통", "as_of": "2026-09-08", "namespace": "business", "type": "cross"}
+{"id": "single-travel-receipt", "question": "국내 출장 숙박비 정산에 필요한 영수증과 제출 기한을 알려주세요.", "entity": "공통", "as_of": "2026-09-08", "namespace": "business", "type": "single"}
+{"id": "single-renewal-notice", "question": "구매 계약 갱신의 사전 통지 기한과 해지 절차를 알려주세요.", "entity": "공통", "as_of": "2026-09-08", "namespace": "business", "type": "single"}
+{"id": "unknown-mars-branch", "question": "알파 고객의 2035년 화성 지사 주소와 우편번호는 무엇인가요?", "entity": "알파", "as_of": "2026-09-08", "namespace": "business", "type": "unknown"}
+{"id": "scope-trap-beta-ratio", "question": "알파 계약 기준으로 베타 서비스의 크레딧 비율을 알려주세요.", "entity": "알파", "as_of": "2026-09-08", "namespace": "business", "type": "scope-trap"}

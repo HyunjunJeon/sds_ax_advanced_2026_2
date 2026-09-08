@@ -1,0 +1,11 @@
+.env
+.venv/
+.openviking/
+.runtime/
+outputs/
+bin/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/

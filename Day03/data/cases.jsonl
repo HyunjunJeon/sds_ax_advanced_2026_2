@@ -1,0 +1,18 @@
+{"id": "simple", "question": "알파 서비스의 현재 월간 가용률 목표는?", "entity": "알파", "as_of": "2026-09-08"}
+{"id": "amendment", "question": "알파 서비스 크레딧 신청 기한과 추가 약정이 바꾸지 않은 항목을 설명하세요.", "entity": "알파", "as_of": "2026-09-08"}
+{"id": "parallel", "question": "검색 장애의 타임아웃 증가 점검 순서와 운영 접근 로그의 보관 기간·예외를 설명하세요.", "entity": "알파", "as_of": "2026-09-08"}
+{"id": "sequential", "question": "배포 8분 후 오류율이 7%이고 이전 인덱스 스키마가 호환되지 않습니다. 규정의 롤백 조건을 찾아 지금 자동 롤백할 수 있는지 판단하세요.", "entity": "알파", "as_of": "2026-09-08"}
+{"id": "followup", "question": "그 약정이 가용률 목표도 바꾸나요?", "entity": "알파", "as_of": "2026-09-08", "turns": ["알파 서비스 크레딧 신청 기한과 추가 약정은 무엇인가요?", "그 약정이 가용률 목표도 바꾸나요?"]}
+{"id": "unknown", "question": "우리 회사 애플리케이션 오류 로그는 며칠 보관해야 하나요?", "entity": "알파", "as_of": "2026-09-08"}
+{"id": "old_version", "question": "2026년 6월 15일 기준 알파 서비스 가용률 목표와 신청 기한은?", "entity": "알파", "as_of": "2026-06-15"}
+{"id": "before_amendment", "question": "2026년 7월 20일 기준 알파 서비스 크레딧 신청 기한은?", "entity": "알파", "as_of": "2026-07-20"}
+{"id": "beta", "question": "베타 서비스의 월간 가용률 목표와 크레딧 신청 기한은?", "entity": "베타", "as_of": "2026-09-08"}
+{"id": "draft", "question": "알파 SLA 검토안의 40% 크레딧이 현재 승인된 계약에 적용되나요?", "entity": "알파", "as_of": "2026-09-08"}
+{"id": "travel", "question": "국내 출장 숙박비 한도와 박람회 예외, 정산 신청 기한은?", "entity": "알파", "as_of": "2026-09-08"}
+{"id": "purchase", "question": "자동 갱신 계약인데 개별 계약서에 90일 전 통지가 명시되어 있으면 언제 갱신 거절을 통지하나요?", "entity": "알파", "as_of": "2026-09-08"}
+{"id": "sales", "question": "검색 제품의 1분기 대비 2분기 매출 증감률과 표의 단위는?", "entity": "알파", "as_of": "2026-09-08"}
+{"id": "maintenance", "question": "알파 서비스에서 정기 점검 제외 조건과 월 누적 한도는?", "entity": "알파", "as_of": "2026-09-08"}
+{"id": "credit", "question": "알파 월간 가용률이 99.3%이고 기본 이용료가 100만원입니다. 크레딧 비율과 금액은?", "entity": "알파", "as_of": "2026-09-08"}
+{"id": "security_exception", "question": "보안 사고 조사 보존 명령을 받은 운영 접근 로그도 90일 후 삭제해야 하나요?", "entity": "알파", "as_of": "2026-09-08"}
+{"id": "web_timeout", "question": "내부 runbook의 타임아웃 증가 점검 순서와 HTTPX connect/read/write/pool timeout의 차이를 설명하세요.", "entity": "알파", "as_of": "2026-09-08", "public_topic": "HTTPX timeout connect read write pool official documentation"}
+{"id": "web_reuse", "question": "HTTPX에서 연결 풀의 연결을 기다리다가 초과하는 timeout은 무엇인가요?", "entity": "알파", "as_of": "2026-09-08", "public_topic": "HTTPX timeout connect read write pool official documentation"}

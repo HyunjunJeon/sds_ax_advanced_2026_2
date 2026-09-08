@@ -1,0 +1,40 @@
+{
+  "pythonVersion": "3.13",
+  "executionEnvironments": [
+    {
+      "root": "Day02",
+      "extraPaths": ["Day02/src"],
+      "pythonVersion": "3.13"
+    },
+    {
+      "root": "Day03",
+      "extraPaths": ["Day03", "Day03/vendor/day02/src"],
+      "pythonVersion": "3.13"
+    },
+    {
+      "root": "Day04",
+      "extraPaths": ["Day04", "Day04/src"],
+      "pythonVersion": "3.13"
+    },
+    {
+      "root": "Day05",
+      "extraPaths": ["Day05", "Day05/src"],
+      "pythonVersion": "3.13"
+    },
+    {
+      "root": "Day06",
+      "extraPaths": ["Day06", "Day06/src"],
+      "pythonVersion": "3.13"
+    },
+    {
+      "root": "Day07",
+      "extraPaths": ["Day07", "Day07/src"],
+      "pythonVersion": "3.13"
+    },
+    {
+      "root": "Day08",
+      "extraPaths": ["Day08", "Day08/src"],
+      "pythonVersion": "3.13"
+    }
+  ]
+}

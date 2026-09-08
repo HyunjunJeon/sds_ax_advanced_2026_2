@@ -1,0 +1,19 @@
+[project]
+name = "sds-ax-advanced-class"
+version = "0.1.0"
+description = "SDS AX 심화 과정. Day02–Day08은 각각 독립 uv 프로젝트로 구성"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "deepagents>=0.7.13",
+    "langchain-openrouter>=0.2.8",
+    "python-dotenv>=1.2.3",
+]
+
+[tool.uv]
+package = false
+
+[tool.pyright]
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"

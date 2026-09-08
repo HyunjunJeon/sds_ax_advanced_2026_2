@@ -1,0 +1,28 @@
+[project]
+name = "day03-agent-architecture-labs"
+version = "0.3.0"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "deepagents==0.7.13",
+  "langchain==1.4.0",
+  "langchain-core==1.6.2",
+  "langgraph==1.2.11",
+  "langchain-openai==1.6.0",
+  "python-dotenv>=1.2,<2",
+  "httpx==0.28.1",
+  "pandas>=2.2,<4",
+  "langgraph-checkpoint-sqlite==3.1.1",
+]
+[dependency-groups]
+dev = ["pytest>=9,<10"]
+[tool.pytest.ini_options]
+# tests/는 제공 코드의 회귀검사로 항상 통과해야 한다. challenge_tests/는 학생 구현
+# 검사이므로 구현 전에는 실패가 정상이며, 과제 파일 실행이나 직접 지정 때만 돌아간다.
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.pyright]
+extraPaths = [".", "vendor/day02/src"]
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"

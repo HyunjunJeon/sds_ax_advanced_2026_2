@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+.openviking/
+.venv/
+.ov_root_uri
+__pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
+work/
+outputs/

@@ -1,0 +1,25 @@
+{
+  "sections": [
+    {
+      "heading": "비교 기준",
+      "style": "paragraph"
+    },
+    {
+      "heading": "비교표",
+      "style": "table",
+      "columns": [
+        "항목",
+        "내용",
+        "근거"
+      ]
+    },
+    {
+      "heading": "차이와 적용 조건",
+      "style": "paragraph"
+    }
+  ],
+  "missing_heading": "추가 확인이 필요한 사항",
+  "conflicts_heading": "상충하는 근거",
+  "sources_heading": "근거",
+  "empty_section": "확인된 근거 없음"
+}

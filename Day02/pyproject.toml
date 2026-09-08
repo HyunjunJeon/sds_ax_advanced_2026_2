@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "day02-deepagents-rag"
+version = "1.0.0"
+description = "DeepAgents, native OpenViking, and answer Skills RAG classroom"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "deepagents==0.7.13",
+  "langchain-openai>=1.1,<2",
+  "httpx==0.28.1",
+  "pydantic>=2.12,<3",
+  "python-dotenv>=1.2,<2",
+  "psutil>=7,<8",
+  "filelock>=3.20,<4",
+  "pyyaml>=6,<7",
+  "pymupdf4llm>=1.27.2.2,<2",
+  "markitdown[pptx]==0.1.7",
+  "pandas>=2.2,<4",
+  "numpy>=2,<3",
+  "rank-bm25==0.2.2",
+  "kiwipiepy>=0.23,<0.24",
+]
+
+[project.scripts]
+day02 = "day02.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=9,<10", "ruff>=0.16,<0.17"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/day02"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["live: real local OpenViking and paid model APIs"]
+
+[tool.pyright]
+include = ["."]
+extraPaths = ["src"]
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

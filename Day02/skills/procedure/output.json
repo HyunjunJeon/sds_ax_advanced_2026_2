@@ -1,0 +1,20 @@
+{
+  "sections": [
+    {
+      "heading": "적용 조건",
+      "style": "paragraph"
+    },
+    {
+      "heading": "절차",
+      "style": "steps"
+    },
+    {
+      "heading": "예외와 확인 사항",
+      "style": "paragraph"
+    }
+  ],
+  "missing_heading": "추가 확인이 필요한 사항",
+  "conflicts_heading": "상충하는 근거",
+  "sources_heading": "근거",
+  "empty_section": "확인된 근거 없음"
+}
