@@ -13,6 +13,8 @@ wheels/
 # Environment variables
 .env
 
+# OS
+.DS_Store
 
 # Lecture Note
 Lecture_Note/
