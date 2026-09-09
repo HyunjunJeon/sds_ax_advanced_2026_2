@@ -1,0 +1,7 @@
+.env
+.venv/
+.claude/
+.agents/
+__pycache__/
+work/
+evidence/

@@ -1,0 +1,8 @@
+deepagents==0.7.13
+langchain==1.4.0
+langchain-core==1.6.2
+langchain-openrouter==0.2.8
+langgraph==1.2.11
+mcp==2.1.1
+python-dotenv==1.2.3
+pydantic==2.13.5
