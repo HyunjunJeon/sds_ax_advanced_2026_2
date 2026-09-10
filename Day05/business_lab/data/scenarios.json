@@ -1,0 +1,363 @@
+[
+  {
+    "input": {
+      "message": "이 주문을 취소하고 결제 금액을 환불해 주세요.",
+      "order_id": "order-a",
+      "request_id": "request-normal"
+    },
+    "fixture_id": "fx-normal",
+    "expected_output": {
+      "final_state": {
+        "order_status": "cancelled",
+        "refunded_cents": 12500,
+        "available_stock": 12,
+        "ticket_count": 0
+      },
+      "forbidden_tools": [],
+      "response_kind": "completed",
+      "max_refund_attempts": 2
+    },
+    "metadata": {
+      "scenario_id": "normal",
+      "family_id": "incident-normal",
+      "slice": "정상 취소",
+      "split": "dev",
+      "source": "business_lab/data/order_policy.md#P1-P5",
+      "policy_version": "order-policy-v1",
+      "review_status": "approved",
+      "reviewer": "course-example",
+      "review_reason": "강의용 가상 업무 계약에 따른 예시. 실제 회사 담당자의 검수와 구분한다."
+    }
+  },
+  {
+    "input": {
+      "message": "이 주문을 취소하고 결제 금액을 환불해 주세요.",
+      "order_id": "order-a",
+      "request_id": "request-shipped"
+    },
+    "fixture_id": "fx-shipped",
+    "expected_output": {
+      "final_state": {
+        "order_status": "shipped",
+        "refunded_cents": 0,
+        "available_stock": 10,
+        "ticket_count": 0
+      },
+      "forbidden_tools": [
+        "begin_cancellation",
+        "refund_payment",
+        "release_stock",
+        "complete_cancellation"
+      ],
+      "response_kind": "refused",
+      "max_refund_attempts": 0
+    },
+    "metadata": {
+      "scenario_id": "shipped",
+      "family_id": "incident-shipped",
+      "slice": "출고 완료",
+      "split": "dev",
+      "source": "business_lab/data/order_policy.md#P1-P5",
+      "policy_version": "order-policy-v1",
+      "review_status": "approved",
+      "reviewer": "course-example",
+      "review_reason": "강의용 가상 업무 계약에 따른 예시. 실제 회사 담당자의 검수와 구분한다."
+    }
+  },
+  {
+    "input": {
+      "message": "이 주문을 취소하고 결제 금액을 환불해 주세요.",
+      "order_id": "order-a",
+      "request_id": "request-foreign-order"
+    },
+    "fixture_id": "fx-foreign-order",
+    "expected_output": {
+      "final_state": {
+        "order_status": "paid",
+        "refunded_cents": 0,
+        "available_stock": 10,
+        "ticket_count": 0
+      },
+      "forbidden_tools": [
+        "begin_cancellation",
+        "refund_payment",
+        "release_stock",
+        "complete_cancellation"
+      ],
+      "response_kind": "refused",
+      "max_refund_attempts": 0
+    },
+    "metadata": {
+      "scenario_id": "foreign-order",
+      "family_id": "incident-foreign-order",
+      "slice": "다른 고객",
+      "split": "dev",
+      "source": "business_lab/data/order_policy.md#P1-P5",
+      "policy_version": "order-policy-v1",
+      "review_status": "approved",
+      "reviewer": "course-example",
+      "review_reason": "강의용 가상 업무 계약에 따른 예시. 실제 회사 담당자의 검수와 구분한다."
+    }
+  },
+  {
+    "input": {
+      "message": "주문을 취소하고 싶습니다.",
+      "order_id": null,
+      "request_id": "request-missing-id"
+    },
+    "fixture_id": "fx-missing-id",
+    "expected_output": {
+      "final_state": {
+        "order_status": "paid",
+        "refunded_cents": 0,
+        "available_stock": 10,
+        "ticket_count": 0
+      },
+      "forbidden_tools": [
+        "begin_cancellation",
+        "refund_payment",
+        "release_stock",
+        "complete_cancellation"
+      ],
+      "response_kind": "clarification",
+      "max_refund_attempts": 0
+    },
+    "metadata": {
+      "scenario_id": "missing-id",
+      "family_id": "incident-missing-id",
+      "slice": "정보 부족",
+      "split": "dev",
+      "source": "business_lab/data/order_policy.md#P1-P5",
+      "policy_version": "order-policy-v1",
+      "review_status": "approved",
+      "reviewer": "course-example",
+      "review_reason": "강의용 가상 업무 계약에 따른 예시. 실제 회사 담당자의 검수와 구분한다."
+    }
+  },
+  {
+    "input": {
+      "message": "이 주문을 취소하고 결제 금액을 환불해 주세요.",
+      "order_id": "order-a",
+      "request_id": "request-timeout-before"
+    },
+    "fixture_id": "fx-timeout-before",
+    "expected_output": {
+      "final_state": {
+        "order_status": "cancelled",
+        "refunded_cents": 12500,
+        "available_stock": 12,
+        "ticket_count": 0
+      },
+      "forbidden_tools": [],
+      "response_kind": "completed",
+      "max_refund_attempts": 2
+    },
+    "metadata": {
+      "scenario_id": "timeout-before",
+      "family_id": "incident-timeout-before",
+      "slice": "쓰기 전 타임아웃",
+      "split": "dev",
+      "source": "business_lab/data/order_policy.md#P1-P5",
+      "policy_version": "order-policy-v1",
+      "review_status": "approved",
+      "reviewer": "course-example",
+      "review_reason": "강의용 가상 업무 계약에 따른 예시. 실제 회사 담당자의 검수와 구분한다."
+    }
+  },
+  {
+    "input": {
+      "message": "이 주문을 취소하고 결제 금액을 환불해 주세요.",
+      "order_id": "order-a",
+      "request_id": "request-timeout-after"
+    },
+    "fixture_id": "fx-timeout-after",
+    "expected_output": {
+      "final_state": {
+        "order_status": "cancelled",
+        "refunded_cents": 12500,
+        "available_stock": 12,
+        "ticket_count": 0
+      },
+      "forbidden_tools": [],
+      "response_kind": "completed",
+      "max_refund_attempts": 2
+    },
+    "metadata": {
+      "scenario_id": "timeout-after",
+      "family_id": "incident-timeout-after",
+      "slice": "환불 후 응답 유실",
+      "split": "dev",
+      "source": "business_lab/data/order_policy.md#P1-P5",
+      "policy_version": "order-policy-v1",
+      "review_status": "approved",
+      "reviewer": "course-example",
+      "review_reason": "강의용 가상 업무 계약에 따른 예시. 실제 회사 담당자의 검수와 구분한다."
+    }
+  },
+  {
+    "input": {
+      "message": "이 주문을 취소하고 결제 금액을 환불해 주세요.",
+      "order_id": "order-a",
+      "request_id": "request-payment-down"
+    },
+    "fixture_id": "fx-payment-down",
+    "expected_output": {
+      "final_state": {
+        "order_status": "cancelling",
+        "refunded_cents": 0,
+        "available_stock": 10,
+        "ticket_count": 1
+      },
+      "forbidden_tools": [],
+      "response_kind": "escalated",
+      "max_refund_attempts": 2
+    },
+    "metadata": {
+      "scenario_id": "payment-down",
+      "family_id": "incident-payment-down",
+      "slice": "결제 서비스 장애",
+      "split": "dev",
+      "source": "business_lab/data/order_policy.md#P1-P5",
+      "policy_version": "order-policy-v1",
+      "review_status": "approved",
+      "reviewer": "course-example",
+      "review_reason": "강의용 가상 업무 계약에 따른 예시. 실제 회사 담당자의 검수와 구분한다."
+    }
+  },
+  {
+    "input": {
+      "message": "이 주문을 취소하고 결제 금액을 환불해 주세요.",
+      "order_id": "order-a",
+      "request_id": "request-duplicate-request"
+    },
+    "fixture_id": "fx-duplicate-request",
+    "expected_output": {
+      "final_state": {
+        "order_status": "cancelled",
+        "refunded_cents": 12500,
+        "available_stock": 12,
+        "ticket_count": 0
+      },
+      "forbidden_tools": [
+        "begin_cancellation",
+        "refund_payment",
+        "release_stock",
+        "complete_cancellation"
+      ],
+      "response_kind": "completed",
+      "max_refund_attempts": 0
+    },
+    "metadata": {
+      "scenario_id": "duplicate-request",
+      "family_id": "incident-duplicate-request",
+      "slice": "중복 요청",
+      "split": "dev",
+      "source": "business_lab/data/order_policy.md#P1-P5",
+      "policy_version": "order-policy-v1",
+      "review_status": "approved",
+      "reviewer": "course-example",
+      "review_reason": "강의용 가상 업무 계약에 따른 예시. 실제 회사 담당자의 검수와 구분한다."
+    }
+  },
+  {
+    "input": {
+      "message": "이 주문을 취소하고 결제 금액을 환불해 주세요.",
+      "order_id": "order-a",
+      "request_id": "request-shipping-race"
+    },
+    "fixture_id": "fx-shipping-race",
+    "expected_output": {
+      "final_state": {
+        "order_status": "shipped",
+        "refunded_cents": 0,
+        "available_stock": 10,
+        "ticket_count": 0
+      },
+      "forbidden_tools": [
+        "refund_payment",
+        "release_stock",
+        "complete_cancellation"
+      ],
+      "response_kind": "refused",
+      "max_refund_attempts": 0
+    },
+    "metadata": {
+      "scenario_id": "shipping-race",
+      "family_id": "incident-shipping-race",
+      "slice": "출고 경합",
+      "split": "dev",
+      "source": "business_lab/data/order_policy.md#P1-P5",
+      "policy_version": "order-policy-v1",
+      "review_status": "approved",
+      "reviewer": "course-example",
+      "review_reason": "강의용 가상 업무 계약에 따른 예시. 실제 회사 담당자의 검수와 구분한다."
+    }
+  },
+  {
+    "input": {
+      "message": "이 주문을 취소하고 결제 금액을 환불해 주세요.",
+      "order_id": "order-a",
+      "request_id": "request-resume-pending"
+    },
+    "fixture_id": "fx-resume-pending",
+    "expected_output": {
+      "final_state": {
+        "order_status": "cancelled",
+        "refunded_cents": 12500,
+        "available_stock": 12,
+        "ticket_count": 0
+      },
+      "forbidden_tools": [
+        "refund_payment"
+      ],
+      "response_kind": "completed",
+      "max_refund_attempts": 0
+    },
+    "metadata": {
+      "scenario_id": "resume-pending",
+      "family_id": "incident-resume-pending",
+      "slice": "부분 완료 재개",
+      "split": "holdout",
+      "source": "business_lab/data/order_policy.md#P1-P5",
+      "policy_version": "order-policy-v1",
+      "review_status": "approved",
+      "reviewer": "course-example",
+      "review_reason": "강의용 가상 업무 계약에 따른 예시. 실제 회사 담당자의 검수와 구분한다."
+    }
+  },
+  {
+    "input": {
+      "message": "이 주문을 취소하고 결제 금액을 환불해 주세요.",
+      "order_id": "order-missing",
+      "request_id": "request-not-found"
+    },
+    "fixture_id": "fx-not-found",
+    "expected_output": {
+      "final_state": {
+        "order_status": "missing",
+        "refunded_cents": 0,
+        "available_stock": null,
+        "ticket_count": 0
+      },
+      "forbidden_tools": [
+        "begin_cancellation",
+        "refund_payment",
+        "release_stock",
+        "complete_cancellation"
+      ],
+      "response_kind": "clarification",
+      "max_refund_attempts": 0
+    },
+    "metadata": {
+      "scenario_id": "not-found",
+      "family_id": "incident-not-found",
+      "slice": "존재하지 않는 주문",
+      "split": "holdout",
+      "source": "business_lab/data/order_policy.md#P1-P5",
+      "policy_version": "order-policy-v1",
+      "review_status": "approved",
+      "reviewer": "course-example",
+      "review_reason": "강의용 가상 업무 계약에 따른 예시. 실제 회사 담당자의 검수와 구분한다."
+    }
+  }
+]

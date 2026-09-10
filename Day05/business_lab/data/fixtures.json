@@ -1,0 +1,492 @@
+{
+  "fx-normal": {
+    "actor_id": "customer-a",
+    "subject_id": "order-a",
+    "fault": "none",
+    "orders": [
+      {
+        "id": "order-a",
+        "customer_id": "customer-a",
+        "status": "paid",
+        "amount_cents": 12500,
+        "currency": "USD",
+        "sku": "sku-a",
+        "quantity": 2,
+        "version": 1
+      },
+      {
+        "id": "order-b",
+        "customer_id": "customer-b",
+        "status": "paid",
+        "amount_cents": 7800,
+        "currency": "USD",
+        "sku": "sku-b",
+        "quantity": 1,
+        "version": 3
+      }
+    ],
+    "payments": [
+      {
+        "order_id": "order-a",
+        "captured_cents": 12500,
+        "refunded_cents": 0
+      },
+      {
+        "order_id": "order-b",
+        "captured_cents": 7800,
+        "refunded_cents": 0
+      }
+    ],
+    "inventory": {
+      "sku-a": 10,
+      "sku-b": 5
+    },
+    "releases": []
+  },
+  "fx-shipped": {
+    "actor_id": "customer-a",
+    "subject_id": "order-a",
+    "fault": "none",
+    "orders": [
+      {
+        "id": "order-a",
+        "customer_id": "customer-a",
+        "status": "shipped",
+        "amount_cents": 12500,
+        "currency": "USD",
+        "sku": "sku-a",
+        "quantity": 2,
+        "version": 1
+      },
+      {
+        "id": "order-b",
+        "customer_id": "customer-b",
+        "status": "paid",
+        "amount_cents": 7800,
+        "currency": "USD",
+        "sku": "sku-b",
+        "quantity": 1,
+        "version": 3
+      }
+    ],
+    "payments": [
+      {
+        "order_id": "order-a",
+        "captured_cents": 12500,
+        "refunded_cents": 0
+      },
+      {
+        "order_id": "order-b",
+        "captured_cents": 7800,
+        "refunded_cents": 0
+      }
+    ],
+    "inventory": {
+      "sku-a": 10,
+      "sku-b": 5
+    },
+    "releases": []
+  },
+  "fx-foreign-order": {
+    "actor_id": "customer-b",
+    "subject_id": "order-a",
+    "fault": "none",
+    "orders": [
+      {
+        "id": "order-a",
+        "customer_id": "customer-a",
+        "status": "paid",
+        "amount_cents": 12500,
+        "currency": "USD",
+        "sku": "sku-a",
+        "quantity": 2,
+        "version": 1
+      },
+      {
+        "id": "order-b",
+        "customer_id": "customer-b",
+        "status": "paid",
+        "amount_cents": 7800,
+        "currency": "USD",
+        "sku": "sku-b",
+        "quantity": 1,
+        "version": 3
+      }
+    ],
+    "payments": [
+      {
+        "order_id": "order-a",
+        "captured_cents": 12500,
+        "refunded_cents": 0
+      },
+      {
+        "order_id": "order-b",
+        "captured_cents": 7800,
+        "refunded_cents": 0
+      }
+    ],
+    "inventory": {
+      "sku-a": 10,
+      "sku-b": 5
+    },
+    "releases": []
+  },
+  "fx-missing-id": {
+    "actor_id": "customer-a",
+    "subject_id": "order-a",
+    "fault": "none",
+    "orders": [
+      {
+        "id": "order-a",
+        "customer_id": "customer-a",
+        "status": "paid",
+        "amount_cents": 12500,
+        "currency": "USD",
+        "sku": "sku-a",
+        "quantity": 2,
+        "version": 1
+      },
+      {
+        "id": "order-b",
+        "customer_id": "customer-b",
+        "status": "paid",
+        "amount_cents": 7800,
+        "currency": "USD",
+        "sku": "sku-b",
+        "quantity": 1,
+        "version": 3
+      }
+    ],
+    "payments": [
+      {
+        "order_id": "order-a",
+        "captured_cents": 12500,
+        "refunded_cents": 0
+      },
+      {
+        "order_id": "order-b",
+        "captured_cents": 7800,
+        "refunded_cents": 0
+      }
+    ],
+    "inventory": {
+      "sku-a": 10,
+      "sku-b": 5
+    },
+    "releases": []
+  },
+  "fx-timeout-before": {
+    "actor_id": "customer-a",
+    "subject_id": "order-a",
+    "fault": "refund_timeout_before_commit",
+    "orders": [
+      {
+        "id": "order-a",
+        "customer_id": "customer-a",
+        "status": "paid",
+        "amount_cents": 12500,
+        "currency": "USD",
+        "sku": "sku-a",
+        "quantity": 2,
+        "version": 1
+      },
+      {
+        "id": "order-b",
+        "customer_id": "customer-b",
+        "status": "paid",
+        "amount_cents": 7800,
+        "currency": "USD",
+        "sku": "sku-b",
+        "quantity": 1,
+        "version": 3
+      }
+    ],
+    "payments": [
+      {
+        "order_id": "order-a",
+        "captured_cents": 12500,
+        "refunded_cents": 0
+      },
+      {
+        "order_id": "order-b",
+        "captured_cents": 7800,
+        "refunded_cents": 0
+      }
+    ],
+    "inventory": {
+      "sku-a": 10,
+      "sku-b": 5
+    },
+    "releases": []
+  },
+  "fx-timeout-after": {
+    "actor_id": "customer-a",
+    "subject_id": "order-a",
+    "fault": "refund_timeout_after_commit",
+    "orders": [
+      {
+        "id": "order-a",
+        "customer_id": "customer-a",
+        "status": "paid",
+        "amount_cents": 12500,
+        "currency": "USD",
+        "sku": "sku-a",
+        "quantity": 2,
+        "version": 1
+      },
+      {
+        "id": "order-b",
+        "customer_id": "customer-b",
+        "status": "paid",
+        "amount_cents": 7800,
+        "currency": "USD",
+        "sku": "sku-b",
+        "quantity": 1,
+        "version": 3
+      }
+    ],
+    "payments": [
+      {
+        "order_id": "order-a",
+        "captured_cents": 12500,
+        "refunded_cents": 0
+      },
+      {
+        "order_id": "order-b",
+        "captured_cents": 7800,
+        "refunded_cents": 0
+      }
+    ],
+    "inventory": {
+      "sku-a": 10,
+      "sku-b": 5
+    },
+    "releases": []
+  },
+  "fx-payment-down": {
+    "actor_id": "customer-a",
+    "subject_id": "order-a",
+    "fault": "payment_unavailable",
+    "orders": [
+      {
+        "id": "order-a",
+        "customer_id": "customer-a",
+        "status": "paid",
+        "amount_cents": 12500,
+        "currency": "USD",
+        "sku": "sku-a",
+        "quantity": 2,
+        "version": 1
+      },
+      {
+        "id": "order-b",
+        "customer_id": "customer-b",
+        "status": "paid",
+        "amount_cents": 7800,
+        "currency": "USD",
+        "sku": "sku-b",
+        "quantity": 1,
+        "version": 3
+      }
+    ],
+    "payments": [
+      {
+        "order_id": "order-a",
+        "captured_cents": 12500,
+        "refunded_cents": 0
+      },
+      {
+        "order_id": "order-b",
+        "captured_cents": 7800,
+        "refunded_cents": 0
+      }
+    ],
+    "inventory": {
+      "sku-a": 10,
+      "sku-b": 5
+    },
+    "releases": []
+  },
+  "fx-duplicate-request": {
+    "actor_id": "customer-a",
+    "subject_id": "order-a",
+    "fault": "none",
+    "orders": [
+      {
+        "id": "order-a",
+        "customer_id": "customer-a",
+        "status": "cancelled",
+        "amount_cents": 12500,
+        "currency": "USD",
+        "sku": "sku-a",
+        "quantity": 2,
+        "version": 1
+      },
+      {
+        "id": "order-b",
+        "customer_id": "customer-b",
+        "status": "paid",
+        "amount_cents": 7800,
+        "currency": "USD",
+        "sku": "sku-b",
+        "quantity": 1,
+        "version": 3
+      }
+    ],
+    "payments": [
+      {
+        "order_id": "order-a",
+        "captured_cents": 12500,
+        "refunded_cents": 12500
+      },
+      {
+        "order_id": "order-b",
+        "captured_cents": 7800,
+        "refunded_cents": 0
+      }
+    ],
+    "inventory": {
+      "sku-a": 12,
+      "sku-b": 5
+    },
+    "releases": [
+      {
+        "order_id": "order-a",
+        "operation_key": "previous-release",
+        "quantity": 2
+      }
+    ]
+  },
+  "fx-shipping-race": {
+    "actor_id": "customer-a",
+    "subject_id": "order-a",
+    "fault": "ship_before_cancel",
+    "orders": [
+      {
+        "id": "order-a",
+        "customer_id": "customer-a",
+        "status": "paid",
+        "amount_cents": 12500,
+        "currency": "USD",
+        "sku": "sku-a",
+        "quantity": 2,
+        "version": 1
+      },
+      {
+        "id": "order-b",
+        "customer_id": "customer-b",
+        "status": "paid",
+        "amount_cents": 7800,
+        "currency": "USD",
+        "sku": "sku-b",
+        "quantity": 1,
+        "version": 3
+      }
+    ],
+    "payments": [
+      {
+        "order_id": "order-a",
+        "captured_cents": 12500,
+        "refunded_cents": 0
+      },
+      {
+        "order_id": "order-b",
+        "captured_cents": 7800,
+        "refunded_cents": 0
+      }
+    ],
+    "inventory": {
+      "sku-a": 10,
+      "sku-b": 5
+    },
+    "releases": []
+  },
+  "fx-resume-pending": {
+    "actor_id": "customer-a",
+    "subject_id": "order-a",
+    "fault": "none",
+    "orders": [
+      {
+        "id": "order-a",
+        "customer_id": "customer-a",
+        "status": "cancelling",
+        "amount_cents": 12500,
+        "currency": "USD",
+        "sku": "sku-a",
+        "quantity": 2,
+        "version": 1
+      },
+      {
+        "id": "order-b",
+        "customer_id": "customer-b",
+        "status": "paid",
+        "amount_cents": 7800,
+        "currency": "USD",
+        "sku": "sku-b",
+        "quantity": 1,
+        "version": 3
+      }
+    ],
+    "payments": [
+      {
+        "order_id": "order-a",
+        "captured_cents": 12500,
+        "refunded_cents": 12500
+      },
+      {
+        "order_id": "order-b",
+        "captured_cents": 7800,
+        "refunded_cents": 0
+      }
+    ],
+    "inventory": {
+      "sku-a": 10,
+      "sku-b": 5
+    },
+    "releases": []
+  },
+  "fx-not-found": {
+    "actor_id": "customer-a",
+    "subject_id": "order-missing",
+    "fault": "none",
+    "orders": [
+      {
+        "id": "order-a",
+        "customer_id": "customer-a",
+        "status": "paid",
+        "amount_cents": 12500,
+        "currency": "USD",
+        "sku": "sku-a",
+        "quantity": 2,
+        "version": 1
+      },
+      {
+        "id": "order-b",
+        "customer_id": "customer-b",
+        "status": "paid",
+        "amount_cents": 7800,
+        "currency": "USD",
+        "sku": "sku-b",
+        "quantity": 1,
+        "version": 3
+      }
+    ],
+    "payments": [
+      {
+        "order_id": "order-a",
+        "captured_cents": 12500,
+        "refunded_cents": 0
+      },
+      {
+        "order_id": "order-b",
+        "captured_cents": 7800,
+        "refunded_cents": 0
+      }
+    ],
+    "inventory": {
+      "sku-a": 10,
+      "sku-b": 5
+    },
+    "releases": []
+  }
+}

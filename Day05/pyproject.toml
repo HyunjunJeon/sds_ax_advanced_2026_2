@@ -1,0 +1,37 @@
+[project]
+name = "day05-agent-evaluation-labs"
+version = "0.1.0"
+description = "Day05: DeepEval 로 에이전트를 평가하고 Langfuse 와 연동한다"
+requires-python = ">=3.13,<3.14"
+# Day03 과 겹치는 패키지는 같은 버전으로 고정한다.
+# deepeval 은 rich·huggingface-hub 를 내려받게 만들므로 Day05 를 독립 프로젝트로 둔다.
+dependencies = [
+  "deepagents==0.7.13",
+  "langchain==1.4.0",
+  "langchain-core==1.6.2",
+  "langgraph==1.2.11",
+  "langchain-openrouter==0.2.8",
+  # 0.11+ 는 pydantic<2.13 을 강제해 deepeval 스택과 어긋난다. Day04 와 같은 0.10.8.
+  "openrouter==0.10.8",
+  "deepeval==4.2.2",
+  "langfuse==4.15.1",
+  "openpyxl==3.1.5",
+  "python-dotenv>=1.2,<2",
+]
+
+[dependency-groups]
+dev = ["pytest>=9,<10"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+# 모두 LLM 호출 없이 도는 테스트다. 설치 확인용으로 비용 없이 돌릴 수 있다.
+testpaths = ["tests", "legacy/tests"]
+pythonpath = ["."]
+
+[tool.pyright]
+extraPaths = ["."]
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
