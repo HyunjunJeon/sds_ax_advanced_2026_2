@@ -98,7 +98,5 @@ cd Day03 && uv run ...     # Day03 작업
 |---|---|---|
 | `Day02/` | DeepAgents · OpenViking · Skills 기반 RAG 한 개를 끝까지 만든다 | [Day02/AGENTS.md](Day02/AGENTS.md) |
 | `Day03/` | 같은 RAG를 7가지 멀티에이전트 구조로 확장하고 통제 실험으로 비교한다 | [Day03/AGENTS.md](Day03/AGENTS.md) |
+| `Day05/` | DeepEval로 에이전트 궤적을 평가·진단하고 Langfuse와 양방향으로 연동한다 | [Day05/AGENTS.md](Day05/AGENTS.md) |
 | `Lecture_Note/` | 강의 슬라이드 (git 제외) | — |
-
-Day03은 `vendor/day02/`에 Day02 코드 스냅샷을 동봉한다. Day03 질문에 답할 때 Day02 원본이 아니라
-`Day03/vendor/day02/`를 봐야 하는 경우가 있다.
