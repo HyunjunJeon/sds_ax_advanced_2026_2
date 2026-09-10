@@ -7,11 +7,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
+from evidence import EvidenceError, EvidenceStore
 from mcp.server import MCPServer
 from pydantic import BaseModel
 from workflow import Workflow, WorkflowError
-
-from evidence import EvidenceError, EvidenceStore
 
 
 def create_server(db_path: Path, evidence_dir: Path | None = None) -> MCPServer:
