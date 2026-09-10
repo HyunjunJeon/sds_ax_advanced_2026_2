@@ -13,7 +13,12 @@
     },
     {
       "root": "Day04",
-      "extraPaths": ["Day04", "Day04/src"],
+      "extraPaths": [
+        "Day04",
+        "Day04/src",
+        "Day04/build_mcp/reference",
+        "Day04/.venv/lib/python3.13/site-packages"
+      ],
       "pythonVersion": "3.13"
     },
     {
