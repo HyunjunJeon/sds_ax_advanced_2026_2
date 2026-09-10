@@ -7,10 +7,7 @@
 
 결론적으로 "agent.py 가 MCP 서버를 연동하지 않고도, 원래 기능을 똑같이 활용할 수 있어야 합니다."
 
+---
 
-[쉬는 시간]
-~11:00
-
-
-[강의 자료 - Github]
-https://bit.ly/sds-ax-advanced-class
+MCP Tools
+-> 코드 실행하는걸로 가져오자.

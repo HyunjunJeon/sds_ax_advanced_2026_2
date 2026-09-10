@@ -33,3 +33,5 @@ https://www.skills.sh/
 3. https://github.com/tt-a1i/archify
 
 4. https://github.com/earthtojake/text-to-cad
+
+5. https://github.com/mvanhorn/last30days-skill

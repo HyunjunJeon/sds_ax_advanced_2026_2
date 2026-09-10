@@ -80,7 +80,9 @@ async def run(args, files: RunFiles) -> None:
         memory=["/AGENTS.md"],
         permissions=[
             FilesystemPermission(
-                operations=["write"], paths=["/skills/**"], mode="deny"
+                operations=["write"],
+                paths=["/skills/**"],
+                mode="deny",
             ),
         ],
         system_prompt=(
