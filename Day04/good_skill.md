@@ -2,7 +2,7 @@
 
 1. https://github.com/addyosmani/agent-skills
 
-2. https://github.com/mattpocock/skills
+* 2. https://github.com/mattpocock/skills
 
 3. https://github.com/obra/superpowers
 

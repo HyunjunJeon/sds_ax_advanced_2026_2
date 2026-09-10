@@ -1,0 +1,14 @@
+
+1. diagram-design 스킬을 agent.py 가 읽을 수 있도록 추가하고, 생성한 코드의 Flow 를 HTML 로 출력하세요.
+> Claude 가 만드는게 아닙니다, agent.py 가 만들도록 해야합니다.
+
+>> 과연 이 문제를 어떻게 "Skills 를 수정"해서 해결해야할까요?
+- 우리 에이전트가 처해진 환경
+  > Interative X
+- 스킬은 우리 에이전트 모델 제한에 맞게.
+
+1) **현재 Skills 의 구조를 파악하세요.**
+2) **SKILL.md 를 어떻게 나누면 좋을지 설계.**
+3) 현재 불필요한 reference, scripts, assets 를 선택하세요.
+4) 계획대로 구현.
+5) 구현된 것 실행.
