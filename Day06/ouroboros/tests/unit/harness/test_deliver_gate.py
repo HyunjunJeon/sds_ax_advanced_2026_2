@@ -1,0 +1,1917 @@
+"""Tests for the #978 P2 read-only deliver-gate manifest loader."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import pytest
+
+from ouroboros.events.base import BaseEvent
+from ouroboros.harness.claim_term_guard import (
+    deterministic_claim_term_guard,
+    strict_deterministic_claim_term_guard,
+)
+from ouroboros.harness.deliver_gate import (
+    DeliverEvidenceClaim,
+    DeliverEvidenceFact,
+    TraceGuardEvidenceInput,
+    evaluate_deliver_claim,
+    load_ac_evidence_manifest,
+)
+from ouroboros.harness.journal import (
+    EvidenceEntry,
+    EvidenceKind,
+    EvidenceManifest,
+    normalize_events,
+)
+from ouroboros.orchestrator.adapter import AgentMessage
+from ouroboros.orchestrator.runtime_message_projection import project_runtime_message
+
+
+def _tool_started(
+    *,
+    call_id: str,
+    ac_id: str | None = "ac_1",
+    aggregate_id: str = "exec_1",
+    session_id: str | None = None,
+    execution_id: str | None = None,
+    tool_name: str = "Bash",
+    args_preview: str | None = None,
+    child_ac_id: str | None = None,
+    when: datetime,
+) -> BaseEvent:
+    return BaseEvent(
+        id=f"evt_started_{call_id}",
+        type="tool.call.started",
+        timestamp=when,
+        aggregate_type="execution",
+        aggregate_id=aggregate_id,
+        data={
+            key: value
+            for key, value in {
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "ac_id": ac_id,
+                "args_preview": args_preview,
+                "extra": {"child_ac_id": child_ac_id} if child_ac_id is not None else None,
+                "session_id": session_id,
+                "execution_id": execution_id,
+            }.items()
+            if value is not None
+        },
+    )
+
+
+def _tool_returned(
+    *,
+    call_id: str,
+    ac_id: str | None = "ac_1",
+    aggregate_id: str = "exec_1",
+    session_id: str | None = None,
+    execution_id: str | None = None,
+    tool_name: str = "Bash",
+    result_preview: str | None = None,
+    child_ac_id: str | None = None,
+    event_id: str | None = None,
+    when: datetime,
+) -> BaseEvent:
+    return BaseEvent(
+        id=event_id or f"evt_returned_{call_id}",
+        type="tool.call.returned",
+        timestamp=when,
+        aggregate_type="execution",
+        aggregate_id=aggregate_id,
+        data={
+            key: value
+            for key, value in {
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "ac_id": ac_id,
+                "is_error": False,
+                "duration_ms": 7,
+                "result_preview": result_preview,
+                "extra": {"child_ac_id": child_ac_id} if child_ac_id is not None else None,
+                "session_id": session_id,
+                "execution_id": execution_id,
+            }.items()
+            if value is not None
+        },
+    )
+
+
+class _FakeEventStore:
+    def __init__(self, events: list[BaseEvent]) -> None:
+        self.events = events
+        self.execution_queries: list[dict[str, object]] = []
+        self.session_queries: list[dict[str, object]] = []
+
+    async def query_execution_related_events(
+        self,
+        execution_id: str,
+        event_type: str | None = None,
+        limit: int | None = 50,
+        offset: int = 0,
+    ) -> list[BaseEvent]:
+        self.execution_queries.append(
+            {
+                "execution_id": execution_id,
+                "event_type": event_type,
+                "limit": limit,
+                "offset": offset,
+            }
+        )
+        return self.events
+
+    async def query_session_related_events(
+        self,
+        session_id: str,
+        execution_id: str | None = None,
+        event_type: str | None = None,
+        limit: int | None = 50,
+        offset: int = 0,
+    ) -> list[BaseEvent]:
+        self.session_queries.append(
+            {
+                "session_id": session_id,
+                "execution_id": execution_id,
+                "event_type": event_type,
+                "limit": limit,
+                "offset": offset,
+            }
+        )
+        return self.events
+
+
+class _TraceGuardClaim:
+    def __init__(self, *, fact_id: str | None, chunk_id: str | None) -> None:
+        self.fact_id = fact_id
+        self.chunk_id = chunk_id
+
+
+class _TraceGuardRejection:
+    def __init__(self, *, reason: str, claim: _TraceGuardClaim, detail: str) -> None:
+        self.reason = reason
+        self.claim = claim
+        self.detail = detail
+
+
+class _TraceGuardResult:
+    def __init__(
+        self,
+        *,
+        accepted: bool,
+        accepted_claims: tuple[_TraceGuardClaim, ...] = (),
+        rejected_claims: tuple[_TraceGuardRejection, ...] = (),
+        allowed_fact_ids: object | None = None,
+        allowed_chunk_ids: object | None = None,
+    ) -> None:
+        self.accepted = accepted
+        self.accepted_claims = accepted_claims
+        self.rejected_claims = rejected_claims
+        self.allowed_fact_ids = allowed_fact_ids or tuple(
+            claim.fact_id for claim in accepted_claims if claim.fact_id is not None
+        )
+        self.allowed_chunk_ids = allowed_chunk_ids or tuple(
+            claim.chunk_id for claim in accepted_claims if claim.chunk_id is not None
+        )
+
+    @property
+    def unsupported_claim_rate(self) -> float:
+        total = len(self.accepted_claims) + len(self.rejected_claims)
+        if total == 0:
+            return 0.0
+        return len(self.rejected_claims) / total
+
+
+class _RecordingTraceGuardValidator:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(
+        self,
+        *,
+        evidence_manifest: tuple[TraceGuardEvidenceInput, ...],
+        parent_synthesis: dict[str, Any],
+    ) -> _TraceGuardResult:
+        self.calls.append(
+            {
+                "evidence_manifest": evidence_manifest,
+                "parent_synthesis": parent_synthesis,
+            }
+        )
+        allowed = {entry.fact_id: entry for entry in evidence_manifest}
+        accepted: list[_TraceGuardClaim] = []
+        rejected: list[_TraceGuardRejection] = []
+        for item in parent_synthesis["result"]["observed_facts"]:
+            fact_id = item.get("fact_id")
+            chunk_id = item.get("chunk_id")
+            expected = allowed.get(fact_id)
+            if expected is None:
+                rejected.append(
+                    _TraceGuardRejection(
+                        reason="unsupported_fact_id",
+                        claim=_TraceGuardClaim(fact_id=fact_id, chunk_id=chunk_id),
+                        detail="fact is not present in manifest",
+                    )
+                )
+                continue
+            if chunk_id != expected.chunk_id:
+                rejected.append(
+                    _TraceGuardRejection(
+                        reason="evidence_handle_mismatch",
+                        claim=_TraceGuardClaim(fact_id=fact_id, chunk_id=chunk_id),
+                        detail="claim cited the wrong evidence handle",
+                    )
+                )
+                continue
+            accepted.append(_TraceGuardClaim(fact_id=fact_id, chunk_id=chunk_id))
+        return _TraceGuardResult(
+            accepted=not rejected,
+            accepted_claims=tuple(accepted),
+            rejected_claims=tuple(rejected),
+        )
+
+
+def _manifest_entry(
+    *,
+    handle: str,
+    ok: bool | None,
+    source_event_ids: tuple[str, ...],
+    kind: EvidenceKind = EvidenceKind.COMMAND_EXECUTED,
+    payload: dict[str, Any] | None = None,
+) -> EvidenceEntry:
+    return EvidenceEntry(
+        handle=handle,
+        kind=kind,
+        ok=ok,
+        started_at=datetime.now(UTC),
+        payload=payload or {"tool_name": "Bash", "result_preview": f"result for {handle}"},
+        source_event_ids=source_event_ids,
+    )
+
+
+class TestLoadAcEvidenceManifest:
+    @pytest.mark.asyncio
+    async def test_execution_tool_start_is_admitted_only_by_explicit_accepted_leaf_mode(
+        self, tmp_path
+    ) -> None:
+        started = BaseEvent(
+            id="evt_execution_tool",
+            type="execution.tool.started",
+            aggregate_type="execution",
+            aggregate_id="ac_1",
+            data={
+                "ac_id": "ac_1",
+                "execution_id": "exec_1",
+                "tool_name": "Write",
+                "tool_call_id": "call_write_1",
+                "tool_input": {"file_path": str(tmp_path / "src" / "app.py")},
+                "runtime": {"cwd": str(tmp_path)},
+            },
+        )
+        completed = BaseEvent(
+            id="evt_execution_tool_completed",
+            type="execution.tool.completed",
+            aggregate_type="execution",
+            aggregate_id="ac_1",
+            data={
+                "ac_id": "ac_1",
+                "execution_id": "exec_1",
+                "tool_name": "Write",
+                "tool_call_id": "call_write_1",
+                "tool_result": {"is_error": False},
+            },
+        )
+        store = _FakeEventStore([started, completed])
+
+        ordinary = await load_ac_evidence_manifest(
+            store,
+            ac_id="ac_1",
+            execution_id="exec_1",
+        )
+        admitted = await load_ac_evidence_manifest(
+            store,
+            ac_id="ac_1",
+            execution_id="exec_1",
+            admit_accepted_tool_starts=True,
+        )
+
+        assert ordinary.entries == ()
+        assert len(admitted.entries) == 1
+        entry = admitted.entries[0]
+        assert entry.ok is True
+        assert entry.kind is EvidenceKind.TOOL_INVOCATION
+        assert entry.payload["workspace_relative_path"] == "src/app.py"
+        assert entry.source_event_ids == (
+            "evt_execution_tool",
+            "evt_execution_tool_completed",
+        )
+        assert admitted.metadata["accepted_tool_starts_admitted"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("completion_error", [True, None])
+    async def test_failed_or_missing_write_completion_is_not_admitted(
+        self,
+        tmp_path,
+        completion_error: bool | None,
+    ) -> None:
+        events = [
+            BaseEvent(
+                id="evt_write_started",
+                type="execution.tool.started",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data={
+                    "ac_id": "ac_1",
+                    "execution_id": "exec_1",
+                    "tool_name": "Write",
+                    "tool_call_id": "call_write_1",
+                    "tool_input": {"file_path": str(tmp_path / "src" / "app.py")},
+                    "runtime": {"cwd": str(tmp_path)},
+                },
+            )
+        ]
+        if completion_error is not None:
+            events.append(
+                BaseEvent(
+                    id="evt_write_completed",
+                    type="execution.tool.completed",
+                    aggregate_type="execution",
+                    aggregate_id="ac_1",
+                    data={
+                        "ac_id": "ac_1",
+                        "execution_id": "exec_1",
+                        "tool_name": "Write",
+                        "tool_call_id": "call_write_1",
+                        "tool_result": {"is_error": completion_error},
+                    },
+                )
+            )
+
+        manifest = await load_ac_evidence_manifest(
+            _FakeEventStore(events),
+            ac_id="ac_1",
+            execution_id="exec_1",
+            admit_accepted_tool_starts=True,
+        )
+
+        assert manifest.entries == ()
+
+        assert "accepted_tool_starts_admitted" not in manifest.metadata
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("completion_error", "admitted"), [(False, True), (True, False)])
+    async def test_bash_start_requires_its_own_successful_completion(
+        self,
+        completion_error: bool,
+        admitted: bool,
+    ) -> None:
+        events = [
+            BaseEvent(
+                id="evt_bash_started",
+                type="execution.tool.started",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data={
+                    "ac_id": "ac_1",
+                    "execution_id": "exec_1",
+                    "tool_name": "Bash",
+                    "tool_call_id": "call_bash_1",
+                    "tool_input": {"command": "pytest tests/test_app.py"},
+                },
+            ),
+            BaseEvent(
+                id="evt_bash_completed",
+                type="execution.tool.completed",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data={
+                    "ac_id": "ac_1",
+                    "execution_id": "exec_1",
+                    "tool_name": "Bash",
+                    "tool_call_id": "call_bash_1",
+                    "tool_result": {"is_error": completion_error},
+                },
+            ),
+        ]
+
+        manifest = await load_ac_evidence_manifest(
+            _FakeEventStore(events),
+            ac_id="ac_1",
+            execution_id="exec_1",
+            admit_accepted_tool_starts=True,
+        )
+
+        if admitted:
+            assert len(manifest.entries) == 1
+            assert manifest.entries[0].source_event_ids == (
+                "evt_bash_started",
+                "evt_bash_completed",
+            )
+        else:
+            assert manifest.entries == ()
+
+    @pytest.mark.asyncio
+    async def test_same_timestamp_execution_completion_is_ordered_after_start(self) -> None:
+        when = datetime.now(UTC)
+        started = BaseEvent(
+            id="evt_bash_started",
+            type="execution.tool.started",
+            timestamp=when,
+            aggregate_type="execution",
+            aggregate_id="ac_1",
+            data={
+                "ac_id": "ac_1",
+                "execution_id": "exec_1",
+                "tool_name": "Bash",
+                "tool_call_id": "call_bash_1",
+                "tool_input": {"command": "pytest tests/test_app.py"},
+            },
+        )
+        completed = BaseEvent(
+            id="evt_bash_completed",
+            type="execution.tool.completed",
+            timestamp=when,
+            aggregate_type="execution",
+            aggregate_id="ac_1",
+            data={
+                "ac_id": "ac_1",
+                "execution_id": "exec_1",
+                "tool_name": "Bash",
+                "tool_call_id": "call_bash_1",
+                "tool_result": {"is_error": False},
+                "output": "1 passed in 0.01s",
+            },
+        )
+
+        manifest = await load_ac_evidence_manifest(
+            _FakeEventStore([completed, started]),
+            ac_id="ac_1",
+            execution_id="exec_1",
+            admit_accepted_tool_starts=True,
+        )
+
+        assert len(manifest.entries) == 1
+        assert manifest.entries[0].source_event_ids == (
+            "evt_bash_started",
+            "evt_bash_completed",
+        )
+
+    @pytest.mark.asyncio
+    async def test_bash_start_without_completion_is_not_admitted(self) -> None:
+        started = BaseEvent(
+            id="evt_bash_started",
+            type="execution.tool.started",
+            aggregate_type="execution",
+            aggregate_id="ac_1",
+            data={
+                "ac_id": "ac_1",
+                "execution_id": "exec_1",
+                "tool_name": "Bash",
+                "tool_call_id": "call_bash_1",
+                "tool_input": {"command": "pytest tests/test_app.py"},
+            },
+        )
+
+        manifest = await load_ac_evidence_manifest(
+            _FakeEventStore([started]),
+            ac_id="ac_1",
+            execution_id="exec_1",
+            admit_accepted_tool_starts=True,
+        )
+
+        assert manifest.entries == ()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "lifecycle_success",
+        (
+            {"status": "completed"},
+            {"subtype": "success"},
+            {"runtime_event_type": "tool.completed"},
+        ),
+    )
+    async def test_bash_lifecycle_completion_without_command_verdict_is_not_admitted(
+        self,
+        lifecycle_success: dict[str, str],
+    ) -> None:
+        events = [
+            BaseEvent(
+                id="evt_bash_started",
+                type="execution.tool.started",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data={
+                    "ac_id": "ac_1",
+                    "execution_id": "exec_1",
+                    "tool_name": "Bash",
+                    "tool_call_id": "call_bash_1",
+                    "tool_input": {"command": "pytest tests/test_app.py"},
+                },
+            ),
+            BaseEvent(
+                id="evt_bash_completed",
+                type="execution.tool.completed",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data={
+                    "ac_id": "ac_1",
+                    "execution_id": "exec_1",
+                    "tool_name": "Bash",
+                    "tool_call_id": "call_bash_1",
+                    **lifecycle_success,
+                },
+            ),
+        ]
+
+        manifest = await load_ac_evidence_manifest(
+            _FakeEventStore(events),
+            ac_id="ac_1",
+            execution_id="exec_1",
+            admit_accepted_tool_starts=True,
+        )
+
+        assert manifest.entries == ()
+
+    @pytest.mark.asyncio
+    async def test_bash_correlated_failure_vetoes_start_side_success(self) -> None:
+        events = [
+            BaseEvent(
+                id="evt_bash_started",
+                type="execution.tool.started",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data={
+                    "ac_id": "ac_1",
+                    "execution_id": "exec_1",
+                    "tool_name": "Bash",
+                    "tool_call_id": "call_bash_1",
+                    "tool_input": {"command": "pytest tests/test_app.py"},
+                    "exit_code": 0,
+                },
+            ),
+            BaseEvent(
+                id="evt_bash_completed",
+                type="execution.tool.completed",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data={
+                    "ac_id": "ac_1",
+                    "execution_id": "exec_1",
+                    "tool_name": "Bash",
+                    "tool_call_id": "call_bash_1",
+                    "tool_result": {"is_error": True},
+                    "exit_code": 1,
+                },
+            ),
+        ]
+
+        manifest = await load_ac_evidence_manifest(
+            _FakeEventStore(events),
+            ac_id="ac_1",
+            execution_id="exec_1",
+            admit_accepted_tool_starts=True,
+        )
+
+        assert manifest.entries == ()
+
+    @pytest.mark.asyncio
+    async def test_write_completion_with_different_call_id_is_not_admitted(self, tmp_path) -> None:
+        events = [
+            BaseEvent(
+                id="evt_write_started",
+                type="execution.tool.started",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data={
+                    "ac_id": "ac_1",
+                    "execution_id": "exec_1",
+                    "tool_name": "Write",
+                    "tool_call_id": "call_write_1",
+                    "tool_input": {"file_path": str(tmp_path / "src" / "app.py")},
+                    "runtime": {"cwd": str(tmp_path)},
+                },
+            ),
+            BaseEvent(
+                id="evt_other_completed",
+                type="execution.tool.completed",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data={
+                    "ac_id": "ac_1",
+                    "execution_id": "exec_1",
+                    "tool_name": "Write",
+                    "tool_call_id": "call_write_2",
+                    "tool_result": {"is_error": False},
+                },
+            ),
+        ]
+
+        manifest = await load_ac_evidence_manifest(
+            _FakeEventStore(events),
+            ac_id="ac_1",
+            execution_id="exec_1",
+            admit_accepted_tool_starts=True,
+        )
+
+        assert manifest.entries == ()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_write_starts_cannot_share_one_successful_completion(
+        self, tmp_path
+    ) -> None:
+        started_data = {
+            "ac_id": "ac_1",
+            "execution_id": "exec_1",
+            "tool_name": "Write",
+            "tool_call_id": "call_write_1",
+            "tool_input": {"file_path": str(tmp_path / "src" / "app.py")},
+            "runtime": {"cwd": str(tmp_path)},
+        }
+        events = [
+            BaseEvent(
+                id="evt_write_started_1",
+                type="execution.tool.started",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data=started_data,
+            ),
+            BaseEvent(
+                id="evt_write_started_2",
+                type="execution.tool.started",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data=started_data,
+            ),
+            BaseEvent(
+                id="evt_write_completed",
+                type="execution.tool.completed",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data={
+                    "ac_id": "ac_1",
+                    "execution_id": "exec_1",
+                    "tool_name": "Write",
+                    "tool_call_id": "call_write_1",
+                    "tool_result": {"is_error": False},
+                },
+            ),
+        ]
+
+        manifest = await load_ac_evidence_manifest(
+            _FakeEventStore(events),
+            ac_id="ac_1",
+            execution_id="exec_1",
+            admit_accepted_tool_starts=True,
+        )
+
+        assert manifest.entries == ()
+
+        self_completed_events = [
+            event.model_copy(
+                update={
+                    "data": {
+                        **event.data,
+                        "subtype": "success",
+                        "runtime_event_type": "tool.completed",
+                    }
+                }
+            )
+            for event in events[:2]
+        ]
+        self_completed_manifest = await load_ac_evidence_manifest(
+            _FakeEventStore(self_completed_events),
+            ac_id="ac_1",
+            execution_id="exec_1",
+            admit_accepted_tool_starts=True,
+        )
+        assert self_completed_manifest.entries == ()
+
+    @pytest.mark.asyncio
+    async def test_malformed_completion_error_bit_cannot_be_laundered_by_completed_status(
+        self, tmp_path
+    ) -> None:
+        events = [
+            BaseEvent(
+                id="evt_write_started",
+                type="execution.tool.started",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data={
+                    "ac_id": "ac_1",
+                    "execution_id": "exec_1",
+                    "tool_name": "Write",
+                    "tool_call_id": "call_write_1",
+                    "tool_input": {"file_path": str(tmp_path / "src" / "app.py")},
+                    "runtime": {"cwd": str(tmp_path)},
+                },
+            ),
+            BaseEvent(
+                id="evt_write_completed",
+                type="execution.tool.completed",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data={
+                    "ac_id": "ac_1",
+                    "execution_id": "exec_1",
+                    "tool_name": "Write",
+                    "tool_call_id": "call_write_1",
+                    "tool_result": {"is_error": "true"},
+                    "runtime_event_type": "tool.completed",
+                },
+            ),
+        ]
+
+        manifest = await load_ac_evidence_manifest(
+            _FakeEventStore(events),
+            ac_id="ac_1",
+            execution_id="exec_1",
+            admit_accepted_tool_starts=True,
+        )
+
+        assert manifest.entries == ()
+
+    @pytest.mark.asyncio
+    async def test_projected_malformed_error_status_is_rejected_after_persistence(
+        self, tmp_path
+    ) -> None:
+        projected = project_runtime_message(
+            AgentMessage(
+                type="assistant",
+                content="unknown",
+                data={
+                    "subtype": "tool_result",
+                    "tool_name": "Write",
+                    "tool_call_id": "call_write_1",
+                    "runtime_event_type": "tool.completed",
+                    "is_error": "true",
+                    "tool_result": {"text_content": "unknown", "is_error": "true"},
+                },
+            )
+        )
+        events = [
+            BaseEvent(
+                id="evt_write_started",
+                type="execution.tool.started",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data={
+                    "ac_id": "ac_1",
+                    "execution_id": "exec_1",
+                    "tool_name": "Write",
+                    "tool_call_id": "call_write_1",
+                    "tool_input": {"file_path": str(tmp_path / "src" / "app.py")},
+                    "runtime": {"cwd": str(tmp_path)},
+                },
+            ),
+            BaseEvent(
+                id="evt_write_completed",
+                type="execution.tool.completed",
+                aggregate_type="execution",
+                aggregate_id="ac_1",
+                data={
+                    "ac_id": "ac_1",
+                    "execution_id": "exec_1",
+                    "tool_name": "Write",
+                    **projected.runtime_metadata,
+                },
+            ),
+        ]
+
+        manifest = await load_ac_evidence_manifest(
+            _FakeEventStore(events),
+            ac_id="ac_1",
+            execution_id="exec_1",
+            admit_accepted_tool_starts=True,
+        )
+
+        assert manifest.entries == ()
+
+    @pytest.mark.asyncio
+    async def test_execution_id_only_query_is_full_read_and_normalizes_chronologically(
+        self,
+    ) -> None:
+        now = datetime.now(UTC)
+        returned = _tool_returned(call_id="c1", when=now + timedelta(seconds=1))
+        started = _tool_started(call_id="c1", when=now)
+        store = _FakeEventStore([returned, started])
+
+        manifest = await load_ac_evidence_manifest(store, ac_id="ac_1", execution_id="exec_1")
+
+        assert store.execution_queries == [
+            {"execution_id": "exec_1", "event_type": None, "limit": None, "offset": 0}
+        ]
+        assert store.session_queries == []
+        assert len(manifest.entries) == 1
+        entry = manifest.entries[0]
+        assert entry.kind is EvidenceKind.COMMAND_EXECUTED
+        assert entry.ok is True
+        assert entry.source_event_ids == ("evt_started_c1", "evt_returned_c1")
+
+    @pytest.mark.asyncio
+    async def test_session_query_is_preferred_when_both_scope_anchors_exist(self) -> None:
+        now = datetime.now(UTC)
+        store = _FakeEventStore(
+            [_tool_started(call_id="c1", session_id="sess_1", execution_id="exec_1", when=now)]
+        )
+
+        manifest = await load_ac_evidence_manifest(
+            store,
+            ac_id="ac_1",
+            session_id="sess_1",
+            execution_id="exec_1",
+        )
+
+        assert store.execution_queries == []
+        assert store.session_queries == [
+            {
+                "session_id": "sess_1",
+                "execution_id": "exec_1",
+                "event_type": None,
+                "limit": None,
+                "offset": 0,
+            }
+        ]
+        assert manifest.entries[0].source_event_ids == ("evt_started_c1",)
+
+    @pytest.mark.asyncio
+    async def test_identical_timestamps_keep_started_before_returned(self) -> None:
+        when = datetime.now(UTC)
+        started = _tool_started(call_id="same", when=when)
+        returned = _tool_returned(call_id="same", when=when)
+        # EventStore query APIs return newest-first, and UUID/string ids do not
+        # encode causality. The loader must still feed start before return.
+        store = _FakeEventStore([returned, started])
+
+        manifest = await load_ac_evidence_manifest(store, ac_id="ac_1", execution_id="exec_1")
+
+        assert len(manifest.entries) == 1
+        assert manifest.entries[0].ok is True
+        assert manifest.entries[0].source_event_ids == (
+            "evt_started_same",
+            "evt_returned_same",
+        )
+
+    @pytest.mark.asyncio
+    async def test_mismatched_session_execution_events_are_post_filtered(self) -> None:
+        now = datetime.now(UTC)
+        store = _FakeEventStore(
+            [
+                _tool_started(
+                    call_id="wrong_exec",
+                    aggregate_id="other_exec",
+                    session_id="sess_1",
+                    execution_id="other_exec",
+                    when=now,
+                ),
+                _tool_started(
+                    call_id="wrong_session",
+                    aggregate_id="exec_1",
+                    session_id="other_sess",
+                    execution_id="exec_1",
+                    when=now + timedelta(seconds=1),
+                ),
+                _tool_started(
+                    call_id="target",
+                    session_id="sess_1",
+                    execution_id="exec_1",
+                    when=now + timedelta(seconds=2),
+                ),
+            ]
+        )
+
+        manifest = await load_ac_evidence_manifest(
+            store,
+            ac_id="ac_1",
+            session_id="sess_1",
+            execution_id="exec_1",
+        )
+
+        assert len(manifest.entries) == 1
+        assert manifest.entries[0].source_event_ids == ("evt_started_target",)
+
+    @pytest.mark.asyncio
+    async def test_execution_scoped_events_without_session_payload_are_retained(
+        self,
+    ) -> None:
+        now = datetime.now(UTC)
+        store = _FakeEventStore(
+            [
+                _tool_started(
+                    call_id="target",
+                    session_id=None,
+                    execution_id="exec_1",
+                    when=now,
+                ),
+                _tool_returned(
+                    call_id="target",
+                    session_id=None,
+                    execution_id="exec_1",
+                    when=now + timedelta(seconds=1),
+                ),
+            ]
+        )
+
+        manifest = await load_ac_evidence_manifest(
+            store,
+            ac_id="ac_1",
+            session_id="sess_1",
+            execution_id="exec_1",
+        )
+
+        assert len(manifest.entries) == 1
+        assert manifest.entries[0].source_event_ids == (
+            "evt_started_target",
+            "evt_returned_target",
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_aggregate_events_must_match_requested_session(self) -> None:
+        now = datetime.now(UTC)
+        store = _FakeEventStore(
+            [
+                BaseEvent(
+                    id="evt_started_wrong_session_aggregate",
+                    type="tool.call.started",
+                    timestamp=now,
+                    aggregate_type="session",
+                    aggregate_id="other_sess",
+                    data={
+                        "call_id": "wrong_session_aggregate",
+                        "tool_name": "Bash",
+                        "ac_id": "ac_1",
+                        "execution_id": "exec_1",
+                    },
+                ),
+                BaseEvent(
+                    id="evt_started_target_session_aggregate",
+                    type="tool.call.started",
+                    timestamp=now + timedelta(seconds=1),
+                    aggregate_type="session",
+                    aggregate_id="sess_1",
+                    data={
+                        "call_id": "target_session_aggregate",
+                        "tool_name": "Bash",
+                        "ac_id": "ac_1",
+                        "execution_id": "exec_1",
+                    },
+                ),
+            ]
+        )
+
+        manifest = await load_ac_evidence_manifest(
+            store,
+            ac_id="ac_1",
+            session_id="sess_1",
+            execution_id="exec_1",
+        )
+
+        assert len(manifest.entries) == 1
+        assert manifest.entries[0].source_event_ids == ("evt_started_target_session_aggregate",)
+
+    @pytest.mark.asyncio
+    async def test_scope_id_filters_production_shaped_events_without_ac_payload(self) -> None:
+        now = datetime.now(UTC)
+        store = _FakeEventStore(
+            [
+                _tool_started(
+                    call_id="target",
+                    ac_id=None,
+                    aggregate_id="ac_runtime_scope",
+                    session_id="sess_1",
+                    execution_id="exec_1",
+                    when=now,
+                ),
+                _tool_returned(
+                    call_id="target",
+                    ac_id=None,
+                    aggregate_id="ac_runtime_scope",
+                    session_id="sess_1",
+                    execution_id="exec_1",
+                    when=now + timedelta(seconds=1),
+                ),
+                _tool_started(
+                    call_id="other",
+                    ac_id=None,
+                    aggregate_id="other_runtime_scope",
+                    session_id="sess_1",
+                    execution_id="exec_1",
+                    when=now + timedelta(seconds=2),
+                ),
+            ]
+        )
+
+        manifest = await load_ac_evidence_manifest(
+            store,
+            ac_id="AC-1",
+            scope_id="ac_runtime_scope",
+            execution_id="exec_1",
+            session_id="sess_1",
+        )
+
+        assert manifest.ac_id == "AC-1"
+        assert len(manifest.entries) == 1
+        assert manifest.entries[0].source_event_ids == (
+            "evt_started_target",
+            "evt_returned_target",
+        )
+        assert (
+            manifest.manifest_id
+            == EvidenceManifest(
+                ac_id="AC-1",
+                entries=manifest.entries,
+                normalized_at=manifest.normalized_at,
+                metadata=manifest.metadata,
+            ).manifest_id
+        )
+
+    @pytest.mark.asyncio
+    async def test_rejects_session_only_query_to_avoid_mixed_execution_manifests(self) -> None:
+        store = _FakeEventStore([])
+
+        with pytest.raises(ValueError, match="requires execution_id"):
+            await load_ac_evidence_manifest(store, ac_id="ac_1", session_id="sess_1")
+
+        assert store.execution_queries == []
+        assert store.session_queries == []
+
+    @pytest.mark.asyncio
+    async def test_events_from_other_ac_are_filtered_by_normalizer(self) -> None:
+        now = datetime.now(UTC)
+        store = _FakeEventStore(
+            [
+                _tool_started(call_id="other", ac_id="ac_2", when=now),
+                _tool_started(call_id="target", ac_id="ac_1", when=now + timedelta(seconds=1)),
+            ]
+        )
+
+        manifest = await load_ac_evidence_manifest(store, ac_id="ac_1", execution_id="exec_1")
+
+        assert len(manifest.entries) == 1
+        assert manifest.entries[0].source_event_ids == ("evt_started_target",)
+
+    @pytest.mark.asyncio
+    async def test_requires_execution_anchor(self) -> None:
+        with pytest.raises(ValueError, match="requires execution_id"):
+            await load_ac_evidence_manifest(_FakeEventStore([]), ac_id="ac_1")
+
+    @pytest.mark.asyncio
+    async def test_rejects_blank_execution_id_instead_of_session_fallback(self) -> None:
+        store = _FakeEventStore([])
+
+        with pytest.raises(ValueError, match="blank execution_id"):
+            await load_ac_evidence_manifest(
+                store,
+                ac_id="ac_1",
+                execution_id="  ",
+                session_id="sess_1",
+            )
+
+        assert store.execution_queries == []
+        assert store.session_queries == []
+
+    @pytest.mark.asyncio
+    async def test_rejects_blank_session_id(self) -> None:
+        store = _FakeEventStore([])
+
+        with pytest.raises(ValueError, match="blank session_id"):
+            await load_ac_evidence_manifest(
+                store, ac_id="ac_1", execution_id="exec_1", session_id="  "
+            )
+
+        assert store.execution_queries == []
+        assert store.session_queries == []
+
+    @pytest.mark.asyncio
+    async def test_rejects_blank_ac_id_before_query(self) -> None:
+        store = _FakeEventStore([])
+
+        with pytest.raises(ValueError, match="non-blank ac_id"):
+            await load_ac_evidence_manifest(store, ac_id="  ", execution_id="exec_1")
+
+        assert store.execution_queries == []
+
+
+class TestEvaluateDeliverClaim:
+    def test_q4_fixture_file_modified_claim_uses_whole_file_path_scope(self) -> None:
+        """#978 Q4 fixture: file_modified claims cite a path-scoped edit handle.
+
+        The starter claim shape represents the brownfield boundary as a
+        whole-file path plus expected change. Diff-level validation belongs to a
+        later semantic/harness-check layer; this fixture pins the TraceGuard
+        structural surface that must exist before any C.4 default-flip work.
+        """
+        manifest = EvidenceManifest(
+            ac_id="AC-Q4",
+            entries=(
+                _manifest_entry(
+                    handle="ev_file_auth_middleware",
+                    ok=True,
+                    kind=EvidenceKind.FILE_MODIFIED,
+                    payload={
+                        "tool_name": "Edit",
+                        "args_preview": "path=src/middleware/auth.ts; scope=whole_file",
+                        "result_preview": "role_matrix_added",
+                    },
+                    source_event_ids=("evt_edit_start", "evt_edit_return"),
+                ),
+            ),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-Q4",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="file_modified:src/middleware/auth.ts:role_matrix_added",
+                    evidence_handle="ev_file_auth_middleware",
+                    statement=(
+                        "file_modified path=src/middleware/auth.ts "
+                        "scope=whole_file expected_change=role_matrix_added"
+                    ),
+                ),
+            ),
+        )
+        validator = _RecordingTraceGuardValidator()
+
+        verdict = evaluate_deliver_claim(
+            manifest,
+            claim,
+            traceguard_validator=validator,
+            claim_term_guard=deterministic_claim_term_guard,
+        )
+
+        assert verdict.accepted is True
+        assert verdict.accepted_fact_ids == (
+            "file_modified:src/middleware/auth.ts:role_matrix_added",
+        )
+        assert verdict.evidence_event_ids == ("evt_edit_start", "evt_edit_return")
+        assert validator.calls[0]["parent_synthesis"]["result"]["observed_facts"] == [
+            {
+                "fact_id": "file_modified:src/middleware/auth.ts:role_matrix_added",
+                "chunk_id": "ev_file_auth_middleware",
+                "statement": (
+                    "file_modified path=src/middleware/auth.ts "
+                    "scope=whole_file expected_change=role_matrix_added"
+                ),
+            }
+        ]
+        assert validator.calls[0]["evidence_manifest"] == (
+            TraceGuardEvidenceInput(
+                fact_id="file_modified:src/middleware/auth.ts:role_matrix_added",
+                chunk_id="ev_file_auth_middleware",
+                text="path=src/middleware/auth.ts; scope=whole_file; role_matrix_added",
+                child_call_id="evt_edit_start,evt_edit_return",
+            ),
+        )
+
+    def test_journal_bound_mode_never_copies_claim_fact_id_into_manifest(self) -> None:
+        manifest = EvidenceManifest(
+            ac_id="AC-STRICT",
+            entries=(
+                _manifest_entry(
+                    handle="ev_real",
+                    ok=True,
+                    payload={
+                        "tool_name": "Edit",
+                        "args_preview": "path=src/app.py",
+                        "result_preview": "file updated",
+                    },
+                    source_event_ids=("evt_real",),
+                ),
+                _manifest_entry(
+                    handle="ev_other",
+                    ok=True,
+                    payload={"tool_name": "Bash", "result_preview": "unrelated"},
+                    source_event_ids=("evt_other",),
+                ),
+            ),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-STRICT",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="claim_minted_fact_id",
+                    evidence_handle="ev_real",
+                    statement="file_modified path=src/app.py",
+                ),
+            ),
+        )
+        validator = _RecordingTraceGuardValidator()
+
+        verdict = evaluate_deliver_claim(
+            manifest,
+            claim,
+            traceguard_validator=validator,
+            claim_term_guard=strict_deterministic_claim_term_guard,
+            journal_bound=True,
+        )
+
+        assert verdict.accepted is True
+        assert verdict.accepted_fact_ids == ("claim_minted_fact_id",)
+        call = validator.calls[0]
+        assert call["parent_synthesis"]["result"]["observed_facts"][0]["fact_id"] == "ev_real"
+        assert [entry.fact_id for entry in call["evidence_manifest"]] == [
+            "ev_real",
+            "ev_other",
+        ]
+        assert all(entry.fact_id != "claim_minted_fact_id" for entry in call["evidence_manifest"])
+
+    def test_journal_bound_mode_requires_semantic_guard(self) -> None:
+        manifest = EvidenceManifest(
+            ac_id="AC-STRICT",
+            entries=(_manifest_entry(handle="ev_real", ok=True, source_event_ids=("evt_real",)),),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-STRICT",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="fact",
+                    evidence_handle="ev_real",
+                    statement="result=passed",
+                ),
+            ),
+        )
+
+        with pytest.raises(ValueError, match="requires a claim_term_guard"):
+            evaluate_deliver_claim(
+                manifest,
+                claim,
+                traceguard_validator=_RecordingTraceGuardValidator(),
+                journal_bound=True,
+            )
+
+    def test_journal_bound_accepted_result_without_handle_mapping_fails_closed(self) -> None:
+        manifest = EvidenceManifest(
+            ac_id="AC-STRICT",
+            entries=(
+                _manifest_entry(
+                    handle="ev_real",
+                    ok=True,
+                    payload={"tool_name": "Bash", "result_preview": "passed"},
+                    source_event_ids=("evt_real",),
+                ),
+            ),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-STRICT",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="fact",
+                    evidence_handle="ev_real",
+                    statement="result=passed",
+                ),
+            ),
+        )
+
+        verdict = evaluate_deliver_claim(
+            manifest,
+            claim,
+            traceguard_validator=lambda **_: _TraceGuardResult(accepted=True),
+            claim_term_guard=strict_deterministic_claim_term_guard,
+            journal_bound=True,
+        )
+
+        assert verdict.accepted is False
+        assert verdict.accepted_fact_ids == ()
+        assert verdict.rejected_reasons == (
+            "traceguard_mapping_missing: accepted result named no journal evidence handle",
+        )
+
+    def test_journal_bound_shared_handle_checks_every_claim_fact(self) -> None:
+        manifest = EvidenceManifest(
+            ac_id="AC-STRICT",
+            entries=(
+                _manifest_entry(
+                    handle="ev_shared",
+                    ok=True,
+                    payload={
+                        "tool_name": "Bash",
+                        "args_preview": "path=src/app.py",
+                        "result_preview": "pytest passed",
+                    },
+                    source_event_ids=("evt_shared",),
+                ),
+            ),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-STRICT",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="fact_file",
+                    evidence_handle="ev_shared",
+                    statement="file_checked path=src/app.py",
+                ),
+                DeliverEvidenceFact(
+                    fact_id="fact_admin",
+                    evidence_handle="ev_shared",
+                    statement="test_passed behavior=admin_delete_denied",
+                ),
+            ),
+        )
+
+        verdict = evaluate_deliver_claim(
+            manifest,
+            claim,
+            traceguard_validator=_RecordingTraceGuardValidator(),
+            claim_term_guard=strict_deterministic_claim_term_guard,
+            journal_bound=True,
+        )
+
+        assert verdict.accepted is False
+        assert verdict.accepted_fact_ids == ("fact_file",)
+        assert verdict.rejected_fact_ids == ("fact_admin",)
+        assert "behavior=admin_delete_denied" in verdict.rejected_reasons[0]
+
+    def test_q5_fixture_parent_synthesis_lifts_multiple_child_ac_facts(self) -> None:
+        """#978 Q5 fixture: parent synthesis can cite child AC evidence handles."""
+        base = datetime.now(UTC)
+        manifest = normalize_events(
+            [
+                _tool_started(
+                    call_id="ac1_test",
+                    ac_id="AC-PARENT",
+                    child_ac_id="AC-1",
+                    when=base,
+                ),
+                _tool_returned(
+                    call_id="ac1_test",
+                    ac_id="AC-PARENT",
+                    child_ac_id="AC-1",
+                    result_preview="tests passed",
+                    event_id="evt_ac1_test",
+                    when=base + timedelta(milliseconds=1),
+                ),
+                _tool_started(
+                    call_id="ac2_edit",
+                    ac_id="AC-PARENT",
+                    child_ac_id="AC-2",
+                    tool_name="Edit",
+                    args_preview="path=docs/ac2.md; scope=whole_file",
+                    when=base + timedelta(milliseconds=2),
+                ),
+                _tool_returned(
+                    call_id="ac2_edit",
+                    ac_id="AC-PARENT",
+                    child_ac_id="AC-2",
+                    tool_name="Edit",
+                    result_preview="docs updated",
+                    event_id="evt_ac2_edit",
+                    when=base + timedelta(milliseconds=3),
+                ),
+            ],
+            ac_id="AC-PARENT",
+        )
+        manifest = manifest.model_copy(
+            update={
+                "metadata": {"child_ac_ids": ("AC-1", "AC-2")},
+                "entries": (
+                    manifest.entries[0].model_copy(update={"handle": "ev_child_ac_1"}),
+                    manifest.entries[1].model_copy(update={"handle": "ev_child_ac_2"}),
+                ),
+            }
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-PARENT",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="child_ac:AC-1:test_passed",
+                    evidence_handle="ev_child_ac_1",
+                    statement="child_ac=AC-1 result=test_passed",
+                ),
+                DeliverEvidenceFact(
+                    fact_id="child_ac:AC-2:file_modified",
+                    evidence_handle="ev_child_ac_2",
+                    statement="child_ac=AC-2 result=file_modified",
+                ),
+            ),
+        )
+        validator = _RecordingTraceGuardValidator()
+
+        verdict = evaluate_deliver_claim(
+            manifest,
+            claim,
+            traceguard_validator=validator,
+            claim_term_guard=deterministic_claim_term_guard,
+        )
+
+        assert verdict.accepted is True
+        assert verdict.accepted_fact_ids == (
+            "child_ac:AC-1:test_passed",
+            "child_ac:AC-2:file_modified",
+        )
+        assert verdict.evidence_event_ids == (
+            "evt_started_ac1_test",
+            "evt_ac1_test",
+            "evt_started_ac2_edit",
+            "evt_ac2_edit",
+        )
+        assert validator.calls[0]["parent_synthesis"]["result"]["observed_facts"] == [
+            {
+                "fact_id": "child_ac:AC-1:test_passed",
+                "chunk_id": "ev_child_ac_1",
+                "statement": "child_ac=AC-1 result=test_passed",
+            },
+            {
+                "fact_id": "child_ac:AC-2:file_modified",
+                "chunk_id": "ev_child_ac_2",
+                "statement": "child_ac=AC-2 result=file_modified",
+            },
+        ]
+        assert validator.calls[0]["evidence_manifest"] == (
+            TraceGuardEvidenceInput(
+                fact_id="child_ac:AC-1:test_passed",
+                chunk_id="ev_child_ac_1",
+                text="child_ac_id=AC-1; tests passed",
+                child_call_id="evt_started_ac1_test,evt_ac1_test",
+            ),
+            TraceGuardEvidenceInput(
+                fact_id="child_ac:AC-2:file_modified",
+                chunk_id="ev_child_ac_2",
+                text="child_ac_id=AC-2; path=docs/ac2.md; scope=whole_file; docs updated",
+                child_call_id="evt_started_ac2_edit,evt_ac2_edit",
+            ),
+        )
+
+    def test_builds_traceguard_envelope_and_returns_accepted_verdict(self) -> None:
+        manifest = EvidenceManifest(
+            ac_id="AC-1",
+            entries=(
+                _manifest_entry(handle="ev_pass", ok=True, source_event_ids=("evt_1", "evt_2")),
+                _manifest_entry(handle="ev_failed", ok=False, source_event_ids=("evt_failed",)),
+            ),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-1",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="fact_admin_check",
+                    evidence_handle="ev_pass",
+                    statement="The AC passed because the command succeeded.",
+                ),
+            ),
+        )
+        validator = _RecordingTraceGuardValidator()
+
+        verdict = evaluate_deliver_claim(
+            manifest,
+            claim,
+            traceguard_validator=validator,
+        )
+
+        assert verdict.accepted is True
+        assert verdict.accepted_fact_ids == ("fact_admin_check",)
+        assert verdict.rejected_fact_ids == ()
+        assert verdict.evidence_event_ids == ("evt_1", "evt_2")
+        assert validator.calls == [
+            {
+                "evidence_manifest": (
+                    TraceGuardEvidenceInput(
+                        fact_id="fact_admin_check",
+                        chunk_id="ev_pass",
+                        text="result for ev_pass",
+                        child_call_id="evt_1,evt_2",
+                    ),
+                ),
+                "parent_synthesis": {
+                    "result": {
+                        "observed_facts": [
+                            {
+                                "fact_id": "fact_admin_check",
+                                "chunk_id": "ev_pass",
+                                "statement": ("The AC passed because the command succeeded."),
+                            }
+                        ]
+                    }
+                },
+            }
+        ]
+
+    def test_claim_term_guard_sees_non_edit_args_when_result_preview_exists(self) -> None:
+        manifest = EvidenceManifest(
+            ac_id="AC-1",
+            entries=(
+                _manifest_entry(
+                    handle="ev_test",
+                    ok=True,
+                    payload={
+                        "tool_name": "Bash",
+                        "args_preview": "uv run pytest -k admin_delete_denied",
+                        "result_preview": "pytest passed",
+                    },
+                    source_event_ids=("evt_test",),
+                ),
+            ),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-1",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="test_passed:admin_delete_denied",
+                    evidence_handle="ev_test",
+                    statement="test_passed behavior=admin_delete_denied",
+                ),
+            ),
+        )
+        validator = _RecordingTraceGuardValidator()
+
+        verdict = evaluate_deliver_claim(
+            manifest,
+            claim,
+            traceguard_validator=validator,
+            claim_term_guard=deterministic_claim_term_guard,
+        )
+
+        assert verdict.accepted is True
+        assert verdict.accepted_fact_ids == ("test_passed:admin_delete_denied",)
+        assert validator.calls[0]["evidence_manifest"] == (
+            TraceGuardEvidenceInput(
+                fact_id="test_passed:admin_delete_denied",
+                chunk_id="ev_test",
+                text="pytest passed; uv run pytest -k admin_delete_denied",
+                child_call_id="evt_test",
+            ),
+        )
+
+    def test_claim_term_guard_rejects_traceguard_accepted_semantic_miss(self) -> None:
+        manifest = EvidenceManifest(
+            ac_id="AC-1",
+            entries=(
+                _manifest_entry(
+                    handle="ev_test",
+                    ok=True,
+                    payload={
+                        "tool_name": "Bash",
+                        "result_preview": "pytest passed for user profile update",
+                    },
+                    source_event_ids=("evt_test",),
+                ),
+            ),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-1",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="test_passed:admin_delete_denied",
+                    evidence_handle="ev_test",
+                    statement="test_passed behavior=admin_delete_denied",
+                ),
+            ),
+        )
+
+        verdict = evaluate_deliver_claim(
+            manifest,
+            claim,
+            traceguard_validator=_RecordingTraceGuardValidator(),
+            claim_term_guard=deterministic_claim_term_guard,
+        )
+
+        assert verdict.accepted is False
+        assert verdict.unsupported_claim_rate == 0.0
+        assert verdict.accepted_fact_ids == ()
+        assert verdict.rejected_fact_ids == ("test_passed:admin_delete_denied",)
+        assert verdict.rejected_reasons == (
+            "semantic_miss: test_passed:admin_delete_denied cites ev_test but evidence text lacks "
+            "required term(s): behavior=admin_delete_denied",
+        )
+        assert verdict.evidence_event_ids == ()
+
+    def test_claim_term_guard_checks_mixed_traceguard_allowed_facts(self) -> None:
+        manifest = EvidenceManifest(
+            ac_id="AC-1",
+            entries=(
+                _manifest_entry(
+                    handle="ev_actual",
+                    ok=True,
+                    payload={
+                        "tool_name": "Bash",
+                        "result_preview": "pytest passed for user profile update",
+                    },
+                    source_event_ids=("evt_1",),
+                ),
+            ),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-1",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="fact_actual",
+                    evidence_handle="ev_actual",
+                    statement="test_passed behavior=admin_delete_denied",
+                ),
+                DeliverEvidenceFact(
+                    fact_id="fact_missing",
+                    evidence_handle="ev_missing",
+                    statement="Unsupported claim.",
+                ),
+            ),
+        )
+
+        verdict = evaluate_deliver_claim(
+            manifest,
+            claim,
+            traceguard_validator=lambda **_: _TraceGuardResult(
+                accepted=False,
+                allowed_fact_ids=("fact_actual",),
+                allowed_chunk_ids=("ev_actual",),
+                rejected_claims=(
+                    _TraceGuardRejection(
+                        reason="unsupported_fact_id",
+                        claim=_TraceGuardClaim(fact_id="fact_missing", chunk_id="ev_missing"),
+                        detail="fact is not present in manifest",
+                    ),
+                ),
+            ),
+            claim_term_guard=deterministic_claim_term_guard,
+        )
+
+        assert verdict.accepted is False
+        assert verdict.unsupported_claim_rate == 0.5
+        assert verdict.accepted_fact_ids == ()
+        assert verdict.rejected_fact_ids == ("fact_missing", "fact_actual")
+        assert verdict.rejected_reasons == (
+            "missing_evidence_handle: ev_missing is not present in manifest",
+            "unsupported_fact_id: fact is not present in manifest",
+            "semantic_miss: fact_actual cites ev_actual but evidence text lacks "
+            "required term(s): behavior=admin_delete_denied",
+        )
+        assert verdict.evidence_event_ids == ()
+
+    def test_claim_term_guard_skips_chunk_only_fallback_for_mixed_rejection(self) -> None:
+        manifest = EvidenceManifest(
+            ac_id="AC-1",
+            entries=(
+                _manifest_entry(
+                    handle="ev_shared",
+                    ok=True,
+                    payload={
+                        "tool_name": "Bash",
+                        "result_preview": "pytest passed for behavior=supported_update",
+                    },
+                    source_event_ids=("evt_shared",),
+                ),
+            ),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-1",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="fact_supported",
+                    evidence_handle="ev_shared",
+                    statement="test_passed behavior=supported_update",
+                ),
+                DeliverEvidenceFact(
+                    fact_id="fact_unsupported",
+                    evidence_handle="ev_shared",
+                    statement="test_passed behavior=unsupported_delete",
+                ),
+            ),
+        )
+
+        verdict = evaluate_deliver_claim(
+            manifest,
+            claim,
+            traceguard_validator=lambda **_: _TraceGuardResult(
+                accepted=False,
+                allowed_fact_ids=(),
+                allowed_chunk_ids=("ev_shared",),
+                rejected_claims=(
+                    _TraceGuardRejection(
+                        reason="unsupported_fact_id",
+                        claim=_TraceGuardClaim(
+                            fact_id="fact_unsupported",
+                            chunk_id="ev_shared",
+                        ),
+                        detail="fact was not structurally accepted",
+                    ),
+                ),
+            ),
+            claim_term_guard=deterministic_claim_term_guard,
+        )
+
+        assert verdict.accepted is False
+        assert verdict.unsupported_claim_rate == 0.5
+        assert verdict.accepted_fact_ids == ()
+        assert verdict.rejected_fact_ids == ("fact_unsupported",)
+        assert verdict.rejected_reasons == (
+            "unsupported_fact_id: fact was not structurally accepted",
+        )
+        assert verdict.evidence_event_ids == ("evt_shared",)
+
+    def test_rejected_traceguard_result_is_preserved_for_routing(self) -> None:
+        manifest = EvidenceManifest(
+            ac_id="AC-1",
+            entries=(_manifest_entry(handle="ev_actual", ok=True, source_event_ids=("evt_1",)),),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-1",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="ev_missing",
+                    evidence_handle="ev_missing",
+                    statement="Unsupported claim.",
+                ),
+            ),
+        )
+        validator = _RecordingTraceGuardValidator()
+
+        verdict = evaluate_deliver_claim(
+            manifest,
+            claim,
+            traceguard_validator=validator,
+        )
+
+        assert verdict.accepted is False
+        assert verdict.unsupported_claim_rate == 1.0
+        assert verdict.accepted_fact_ids == ()
+        assert verdict.rejected_fact_ids == ("ev_missing",)
+        assert verdict.rejected_reasons == (
+            "missing_evidence_handle: ev_missing is not present in manifest",
+            "unsupported_fact_id: fact is not present in manifest",
+        )
+        assert verdict.evidence_event_ids == ()
+
+    def test_accepted_verdict_can_use_allowed_ids_without_claim_objects(self) -> None:
+        manifest = EvidenceManifest(
+            ac_id="AC-1",
+            entries=(_manifest_entry(handle="ev_actual", ok=True, source_event_ids=("evt_1",)),),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-1",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="fact_actual",
+                    evidence_handle="ev_actual",
+                    statement="Supported claim.",
+                ),
+            ),
+        )
+
+        verdict = evaluate_deliver_claim(
+            manifest,
+            claim,
+            traceguard_validator=lambda **_: _TraceGuardResult(
+                accepted=True,
+                allowed_fact_ids=("fact_actual",),
+                allowed_chunk_ids=("ev_actual",),
+            ),
+        )
+
+        assert verdict.accepted is True
+        assert verdict.accepted_fact_ids == ("fact_actual",)
+        assert verdict.evidence_event_ids == ("evt_1",)
+
+    def test_rejected_verdict_preserves_allowed_id_provenance_without_claim_objects(self) -> None:
+        manifest = EvidenceManifest(
+            ac_id="AC-1",
+            entries=(_manifest_entry(handle="ev_actual", ok=True, source_event_ids=("evt_1",)),),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-1",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="fact_actual",
+                    evidence_handle="ev_actual",
+                    statement="Supported claim.",
+                ),
+                DeliverEvidenceFact(
+                    fact_id="fact_missing",
+                    evidence_handle="ev_missing",
+                    statement="Unsupported claim.",
+                ),
+            ),
+        )
+
+        verdict = evaluate_deliver_claim(
+            manifest,
+            claim,
+            traceguard_validator=lambda **_: _TraceGuardResult(
+                accepted=False,
+                allowed_fact_ids=frozenset({"fact_actual"}),
+                allowed_chunk_ids=frozenset({"ev_actual"}),
+                rejected_claims=(
+                    _TraceGuardRejection(
+                        reason="unsupported_fact_id",
+                        claim=_TraceGuardClaim(fact_id="fact_missing", chunk_id="ev_missing"),
+                        detail="fact is not present in manifest",
+                    ),
+                ),
+            ),
+        )
+
+        assert verdict.accepted is False
+        assert verdict.accepted_fact_ids == ("fact_actual",)
+        assert verdict.rejected_fact_ids == ("fact_missing",)
+        assert verdict.evidence_event_ids == ("evt_1",)
+
+    def test_missing_evidence_recomputes_unsupported_claim_rate(self) -> None:
+        manifest = EvidenceManifest(
+            ac_id="AC-1",
+            entries=(_manifest_entry(handle="ev_actual", ok=True, source_event_ids=("evt_1",)),),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-1",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="fact_actual",
+                    evidence_handle="ev_actual",
+                    statement="Supported claim.",
+                ),
+                DeliverEvidenceFact(
+                    fact_id="fact_missing",
+                    evidence_handle="ev_missing",
+                    statement="Missing claim.",
+                ),
+            ),
+        )
+
+        verdict = evaluate_deliver_claim(
+            manifest,
+            claim,
+            traceguard_validator=lambda **_: _TraceGuardResult(
+                accepted=False,
+                allowed_fact_ids=("fact_actual",),
+                allowed_chunk_ids=("ev_actual",),
+                rejected_claims=(
+                    _TraceGuardRejection(
+                        reason="unsupported_fact_id",
+                        claim=_TraceGuardClaim(fact_id="fact_missing", chunk_id="ev_missing"),
+                        detail="fact is not present in manifest",
+                    ),
+                ),
+            ),
+        )
+
+        assert verdict.accepted is False
+        assert verdict.unsupported_claim_rate == 0.5
+        assert verdict.accepted_fact_ids == ("fact_actual",)
+        assert verdict.rejected_fact_ids == ("fact_missing",)
+        assert verdict.rejected_reasons == (
+            "missing_evidence_handle: ev_missing is not present in manifest",
+            "unsupported_fact_id: fact is not present in manifest",
+        )
+
+    def test_unsupported_claim_rate_counts_factless_rejections(self) -> None:
+        manifest = EvidenceManifest(
+            ac_id="AC-1",
+            entries=(_manifest_entry(handle="ev_actual", ok=True, source_event_ids=("evt_1",)),),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-1",
+            facts=(
+                DeliverEvidenceFact(
+                    fact_id="fact_actual",
+                    evidence_handle="ev_actual",
+                    statement="Supported claim.",
+                ),
+                DeliverEvidenceFact(
+                    fact_id="fact_missing",
+                    evidence_handle="ev_missing",
+                    statement="Missing claim.",
+                ),
+            ),
+        )
+
+        verdict = evaluate_deliver_claim(
+            manifest,
+            claim,
+            traceguard_validator=lambda **_: _TraceGuardResult(
+                accepted=False,
+                allowed_fact_ids=("fact_actual",),
+                allowed_chunk_ids=("ev_actual",),
+                rejected_claims=(
+                    _TraceGuardRejection(
+                        reason="chunk_handle_without_fact",
+                        claim=_TraceGuardClaim(fact_id=None, chunk_id="ev_orphan"),
+                        detail="chunk was cited without a supported fact",
+                    ),
+                ),
+            ),
+        )
+
+        assert verdict.unsupported_claim_rate == 1.0
+        assert verdict.rejected_fact_ids == ("fact_missing",)
+        assert verdict.rejected_reasons == (
+            "missing_evidence_handle: ev_missing is not present in manifest",
+            "chunk_handle_without_fact: chunk was cited without a supported fact",
+        )
+
+    def test_claim_ac_id_must_match_manifest_scope(self) -> None:
+        manifest = EvidenceManifest(
+            ac_id="AC-1",
+            entries=(_manifest_entry(handle="ev_pass", ok=True, source_event_ids=("evt_1",)),),
+        )
+        claim = DeliverEvidenceClaim(
+            ac_id="AC-2",
+            facts=(DeliverEvidenceFact(fact_id="ev_pass", evidence_handle="ev_pass"),),
+        )
+
+        with pytest.raises(ValueError, match="must match EvidenceManifest.ac_id"):
+            evaluate_deliver_claim(
+                manifest,
+                claim,
+                traceguard_validator=_RecordingTraceGuardValidator(),
+            )
+
+    def test_claim_requires_at_least_one_fact(self) -> None:
+        with pytest.raises(ValueError, match="requires at least one fact"):
+            DeliverEvidenceClaim(ac_id="AC-1", facts=())

@@ -1,0 +1,1 @@
+export { offBackend } from "./resolve";

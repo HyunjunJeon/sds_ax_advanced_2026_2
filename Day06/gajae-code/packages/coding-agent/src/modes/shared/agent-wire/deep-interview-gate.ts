@@ -1,0 +1,305 @@
+/**
+ * Deep-interview gate mapping (#316).
+ *
+ * Converts deep-interview `ask`-tool questions into machine-addressable
+ * `workflow_gate` { kind: "question" } events (option set + free-text shape
+ * encoded in `schema`/`options`) and decodes a `workflow_gate_response` answer
+ * back into the exact QuestionResult shape the human path produces, so ambiguity
+ * scoring/state updates proceed identically whether a human or an agent answers.
+ *
+ * This is the pure mapping primitive used by SDK-native workflow gate emitters.
+ */
+
+import { isDeepInterviewAskQuestion } from "../../../deep-interview/render-middleware";
+import {
+	assertDeepInterviewInputWithinLimit,
+	MAX_USER_RESPONSE_LENGTH,
+} from "../../../gjc-runtime/deep-interview-state";
+import type { OpenGateInput } from "./workflow-gate-broker";
+import {
+	type AskGateDeepInterviewState,
+	buildAskGateAnswerSchema,
+	buildAskGateStageState as buildCanonicalAskGateStageState,
+	type WorkflowGateKind,
+	type WorkflowStage,
+} from "./workflow-gate-types";
+
+export {
+	type AskGateDeepInterviewState,
+	buildAskGateAnswerSchema,
+	GATE_OTHER_OPTION,
+	validateAskGateStageState,
+} from "./workflow-gate-types";
+
+export interface AskGateWorkflowGateMeta {
+	stage: WorkflowStage;
+	kind: WorkflowGateKind;
+}
+
+export interface AskGateQuestion {
+	id: string;
+	question: string;
+	options: Array<{ label: string }>;
+	multi?: boolean;
+	recommended?: number;
+	/**
+	 * Structured round metadata. When present it is the authoritative source for gate
+	 * `stage_state`; when absent, the question text is regex-parsed as a fallback.
+	 */
+	deepInterview?: AskGateDeepInterviewState;
+	/** Override the emitted workflow gate address for non-deep-interview ask prompts. */
+	workflowGate?: AskGateWorkflowGateMeta;
+	allowEmpty?: boolean;
+	navigationLabel?: "Next" | "Done";
+}
+
+export interface AskGateResult {
+	id: string;
+	question: string;
+	options: string[];
+	multi: boolean;
+	selectedOptions: string[];
+	customInput?: string;
+	clarificationQuestion?: string;
+}
+
+/**
+ * The answer shape an agent returns for a deep-interview question gate.
+ *
+ * `selected` are picked option labels; free text is conveyed by `other: true`
+ * plus `custom`, encoded separately from `selected` so a real option whose label
+ * happens to equal the display sentinel can never collide with the free-text path.
+ *
+ * `action: "clarify"` is a non-answer. It lets a Deep Interview user ask about
+ * the presented choices without advancing the round, scoring ambiguity, or
+ * recording selection state.
+ */
+export type DeepInterviewGateAnswer =
+	| { selected: string[]; other?: false; custom?: undefined; action?: "answer" }
+	| { selected: string[]; other: true; custom: string; action?: "answer" }
+	| { action: "clarify"; question: string };
+
+export class DeepInterviewGateError extends Error {
+	constructor(
+		readonly code:
+			| "invalid_answer_shape"
+			| "unknown_option"
+			| "multi_not_allowed"
+			| "missing_custom"
+			| "missing_clarification"
+			| "empty_selection"
+			| "duplicate_selection",
+		message: string,
+	) {
+		super(message);
+		this.name = "DeepInterviewGateError";
+	}
+}
+
+function deepInterviewQuestionState(questionText: string): Record<string, unknown> {
+	const roundMatch = /^Round\s+(\d+)\s+\|\s+([^|]+?)\s+\|\s+Ambiguity:\s*(.+?)\s*$/im.exec(questionText);
+	const state: Record<string, unknown> = {};
+	if (roundMatch) {
+		const round = Number(roundMatch[1]);
+		if (Number.isSafeInteger(round) && round >= 0) state.round = round;
+		const mode = roundMatch[2]?.trim();
+		if (mode) {
+			state.mode = mode;
+			const normalized = mode.toLowerCase();
+			if (normalized.includes("topology")) state.topology_gate = true;
+			if (/(contrarian|simplifier|ontologist)/u.test(normalized)) state.challenge_mode = normalized;
+		}
+		const rawAmbiguity = roundMatch[3]?.trim();
+		const ambiguity = rawAmbiguity === "" || rawAmbiguity === undefined ? Number.NaN : Number(rawAmbiguity);
+		if (Number.isFinite(ambiguity) && ambiguity >= 0 && ambiguity <= 1) state.ambiguity = ambiguity;
+	}
+	if (/Round\s+0\s+\|\s+Topology confirmation/im.test(questionText)) {
+		state.round = 0;
+		state.mode = "Topology confirmation";
+		state.topology_gate = true;
+	}
+	return state;
+}
+
+/** Build and validate exact producer-compatible `stage_state` metadata for one ask question. */
+export function buildAskGateStageState(question: AskGateQuestion, labels: string[]): Record<string, unknown> {
+	return buildCanonicalAskGateStageState(
+		{
+			id: question.id,
+			multi: question.multi,
+			allowEmpty: question.allowEmpty,
+			navigationLabel: question.navigationLabel,
+			deepInterview: question.deepInterview,
+			fallbackState: deepInterviewQuestionState(question.question),
+		},
+		labels,
+	);
+}
+
+/** Build the `workflow_gate` open-input for one ask question. */
+export function questionToGate(question: AskGateQuestion): OpenGateInput {
+	const labels = question.options.map(o => o.label);
+	const schema = buildAskGateAnswerSchema(
+		{
+			multi: question.multi,
+			allowEmpty: question.allowEmpty,
+			customMaxLength:
+				question.deepInterview || isDeepInterviewAskQuestion(question.question)
+					? MAX_USER_RESPONSE_LENGTH
+					: undefined,
+		},
+		labels,
+	);
+	return {
+		stage: question.workflowGate?.stage ?? "deep-interview",
+		kind: question.workflowGate?.kind ?? "question",
+		schema,
+		options: question.options.map((o, i) => ({
+			value: o.label,
+			label: o.label,
+			description: i === question.recommended ? "recommended" : undefined,
+		})),
+		context: {
+			title: question.question,
+			prompt: question.question,
+			stage_state: buildAskGateStageState(question, labels),
+		},
+	};
+}
+
+function isAnswer(value: unknown): value is DeepInterviewGateAnswer {
+	if (typeof value !== "object" || value === null) return false;
+	const v = value as Record<string, unknown>;
+	if (v.action === "clarify") {
+		return (
+			typeof v.question === "string" && v.selected === undefined && v.other === undefined && v.custom === undefined
+		);
+	}
+	return (
+		(v.action === undefined || v.action === "answer") &&
+		Array.isArray(v.selected) &&
+		v.selected.every(s => typeof s === "string") &&
+		(v.other === undefined || typeof v.other === "boolean") &&
+		(v.custom === undefined || typeof v.custom === "string")
+	);
+}
+
+/**
+ * Decode a gate answer into the QuestionResult the interactive path produces.
+ * Selections are de-duplicated (the interactive UI stores them in a Set), and
+ * free text is taken from `other`/`custom`. Throws DeepInterviewGateError on a
+ * semantically invalid answer.
+ */
+export function gateAnswerToResult(question: AskGateQuestion, answer: unknown): AskGateResult {
+	if (!isAnswer(answer)) {
+		throw new DeepInterviewGateError(
+			"invalid_answer_shape",
+			'answer must be an answer ({ selected: string[]; other?: boolean; custom?: string }) or clarification ({ action: "clarify"; question: string })',
+		);
+	}
+	const labels = question.options.map(o => o.label);
+	const multi = question.multi ?? false;
+	if (answer.action === "clarify") {
+		if (answer.question.trim() === "") {
+			throw new DeepInterviewGateError("missing_clarification", "clarification question is required");
+		}
+		return {
+			id: question.id,
+			question: question.question,
+			options: labels,
+			multi,
+			selectedOptions: [],
+			clarificationQuestion: answer.question,
+		};
+	}
+	const valid = new Set(labels);
+	for (const sel of answer.selected) {
+		if (!valid.has(sel)) throw new DeepInterviewGateError("unknown_option", `unknown option: ${sel}`);
+	}
+	// Mirror the interactive UI, which stores selections in a Set (no duplicates).
+	const deduped = [...new Set(answer.selected)];
+	if (deduped.length !== answer.selected.length) {
+		throw new DeepInterviewGateError("duplicate_selection", "selected options must be unique");
+	}
+	const other = answer.other === true;
+	const totalPicks = deduped.length + (other ? 1 : 0);
+	if (totalPicks === 0 && !question.allowEmpty) {
+		throw new DeepInterviewGateError(
+			"empty_selection",
+			"at least one option (or the free-text other) must be selected",
+		);
+	}
+	if (totalPicks === 0) {
+		return {
+			id: question.id,
+			question: question.question,
+			options: labels,
+			multi,
+			selectedOptions: [],
+		};
+	}
+	if (!multi && totalPicks > 1) {
+		throw new DeepInterviewGateError("multi_not_allowed", "this question accepts a single selection");
+	}
+	if (other && (answer.custom === undefined || answer.custom.trim() === "")) {
+		throw new DeepInterviewGateError("missing_custom", "custom text is required when `other` is true");
+	}
+	if (
+		other &&
+		(question.deepInterview || isDeepInterviewAskQuestion(question.question)) &&
+		answer.custom !== undefined
+	)
+		assertDeepInterviewInputWithinLimit(answer.custom, MAX_USER_RESPONSE_LENGTH, "user_response");
+	return {
+		id: question.id,
+		question: question.question,
+		options: labels,
+		multi,
+		selectedOptions: deduped,
+		customInput: other ? answer.custom : undefined,
+	};
+}
+
+/**
+ * Classify an accepted ask-domain gate answer independently of its transport.
+ * Schema-invalid and semantically invalid answers throw, so callers leave the
+ * durable gate pending rather than treating them as a non-committing answer.
+ */
+export function classifyAskGateDisposition(
+	gate: Pick<OpenGateInput, "context" | "options">,
+	answer: unknown,
+): "commit" | "resolve_without_commit" {
+	const state = gate.context?.stage_state;
+	if (typeof state !== "object" || state === null) return "commit";
+	const questionId = (state as Record<string, unknown>).question_id;
+	if (typeof questionId !== "string") return "commit";
+	const question: AskGateQuestion = {
+		id: questionId,
+		question: typeof gate.context?.prompt === "string" ? gate.context.prompt : questionId,
+		options: (gate.options ?? []).map(option => ({
+			label: typeof option.value === "string" ? option.value : option.label,
+		})),
+		multi: (state as Record<string, unknown>).multi === true,
+		allowEmpty: (state as Record<string, unknown>).allow_empty === true,
+	};
+	if (
+		(state as Record<string, unknown>).deep_interview_metadata === true &&
+		typeof (answer as Record<string, unknown>)?.custom === "string"
+	)
+		assertDeepInterviewInputWithinLimit(
+			(answer as Record<string, unknown>).custom as string,
+			MAX_USER_RESPONSE_LENGTH,
+			"user_response",
+		);
+	if (typeof answer === "object" && answer !== null && (answer as Record<string, unknown>).action === "clarify") {
+		gateAnswerToResult(question, answer);
+		return "resolve_without_commit";
+	}
+	const result = gateAnswerToResult(question, answer);
+	return result.selectedOptions.length === 0 && result.customInput === undefined ? "resolve_without_commit" : "commit";
+}
+
+/** Convenience: map a batch of ask questions to gate open-inputs. */
+export function questionsToGates(questions: AskGateQuestion[]): OpenGateInput[] {
+	return questions.map(questionToGate);
+}

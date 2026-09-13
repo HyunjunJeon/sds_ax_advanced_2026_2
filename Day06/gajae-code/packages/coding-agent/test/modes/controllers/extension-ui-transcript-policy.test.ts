@@ -1,0 +1,227 @@
+import { describe, expect, it, type Mock, vi } from "bun:test";
+import { Container } from "@gajae-code/tui";
+import type {
+	ExtensionActions,
+	ExtensionCommandContextActions,
+	ExtensionContextActions,
+	ExtensionUIContext,
+} from "../../../src/extensibility/extensions";
+import { ExtensionUiController } from "../../../src/modes/controllers/extension-ui-controller";
+import type { InteractiveModeContext, TranscriptRebuildPolicy } from "../../../src/modes/types";
+
+type Fixture = {
+	controller: ExtensionUiController;
+	ctx: InteractiveModeContext;
+	getActions: () => ExtensionActions;
+	getCommandActions: () => ExtensionCommandContextActions;
+	setNextSessionId: (id: string) => void;
+	getUiContext: () => ExtensionUIContext;
+	setStopped: (stopped: boolean) => void;
+	emitError: () => void;
+	rebuildInitialMessages: Mock<(policy: TranscriptRebuildPolicy) => void>;
+	rebuildChatFromMessages: Mock<(policy: TranscriptRebuildPolicy) => void>;
+	resetIrcSidebarSession: Mock<() => void>;
+};
+
+function createFixture(initialSessionId = "session-a"): Fixture {
+	let actions: ExtensionActions | undefined;
+	let commandActions: ExtensionCommandContextActions | undefined;
+	let uiContext: ExtensionUIContext | undefined;
+	let stopped = false;
+	let errorListener: ((error: { extensionPath: string; error: string }) => void) | undefined;
+	let sessionId = initialSessionId;
+	let nextSessionId = initialSessionId;
+	const rebuildInitialMessages = vi.fn<(policy: TranscriptRebuildPolicy) => void>();
+	const rebuildChatFromMessages = vi.fn<(policy: TranscriptRebuildPolicy) => void>();
+	const resetIrcSidebarSession = vi.fn<() => void>();
+	const extensionRunner = {
+		initialize(
+			capturedActions: ExtensionActions,
+			_contextActions: ExtensionContextActions,
+			capturedCommandActions?: ExtensionCommandContextActions,
+			capturedUiContext?: ExtensionUIContext,
+		): void {
+			actions = capturedActions;
+			commandActions = capturedCommandActions;
+			uiContext = capturedUiContext;
+		},
+		onError: (listener: (error: { extensionPath: string; error: string }) => void) => {
+			errorListener = listener;
+			return () => {
+				errorListener = undefined;
+			};
+		},
+		emit: vi.fn(async () => undefined),
+	};
+	const ctx = {
+		isBackgrounded: false,
+		isStopped: () => stopped,
+		session: {
+			extensionRunner,
+			isStreaming: false,
+			sendCustomMessage: vi.fn(async () => undefined),
+			sendUserMessage: vi.fn(async () => undefined),
+			navigateTree: vi.fn(async () => ({ cancelled: false })),
+			switchSession: vi.fn(async () => {
+				sessionId = nextSessionId;
+				return true;
+			}),
+			reload: vi.fn(async () => {
+				sessionId = nextSessionId;
+			}),
+		},
+		sessionManager: {
+			getSessionId: () => sessionId,
+			getSessionName: () => "Session",
+			getCwd: () => "/tmp/project",
+		},
+		hookWidgetContainerAbove: new Container(),
+		hookWidgetContainerBelow: new Container(),
+		ui: { requestRender: vi.fn() },
+		editor: { setText: vi.fn(), handleInput: vi.fn(), getText: () => "" },
+		setToolUIContext: vi.fn(),
+		setWorkingMessage: vi.fn(),
+		setEditorComponent: vi.fn(),
+		toolOutputExpanded: false,
+		setToolsExpanded: vi.fn(),
+		rebuildInitialMessages,
+		rebuildChatFromMessages,
+		resetIrcSidebarSession,
+		reloadTodos: vi.fn(async () => undefined),
+		showStatus: vi.fn(),
+		showError: vi.fn(),
+	} as unknown as InteractiveModeContext;
+	const controller = new ExtensionUiController(ctx);
+	return {
+		controller,
+		ctx,
+		getActions: () => {
+			if (!actions) throw new Error("Extension actions were not initialized");
+			return actions;
+		},
+		getCommandActions: () => {
+			if (!commandActions) throw new Error("Extension command actions were not initialized");
+			return commandActions;
+		},
+		getUiContext: () => {
+			if (!uiContext) throw new Error("Extension UI context was not initialized");
+			return uiContext;
+		},
+		setStopped: value => {
+			stopped = value;
+		},
+		emitError: () => errorListener?.({ extensionPath: "/tmp/late.ts", error: "late failure" }),
+		setNextSessionId: id => {
+			nextSessionId = id;
+		},
+		rebuildInitialMessages,
+		rebuildChatFromMessages,
+		resetIrcSidebarSession,
+	};
+}
+
+describe("ExtensionUiController transcript rebuild policy", () => {
+	it("rejects extension-owned session switches through the Broker lifecycle boundary", async () => {
+		const fixture = createFixture();
+		await fixture.controller.initHooksAndCustomTools();
+
+		await expect(fixture.getCommandActions().switchSession("/tmp/project/session.jsonl")).rejects.toMatchObject({
+			code: "operation_prohibited",
+		});
+		expect(fixture.ctx.session.switchSession).not.toHaveBeenCalled();
+		expect(fixture.resetIrcSidebarSession).not.toHaveBeenCalled();
+		expect(fixture.rebuildInitialMessages).not.toHaveBeenCalled();
+	});
+	it("keeps extension tree navigation local in both interactive initialization paths", async () => {
+		const fixture = createFixture();
+		await fixture.controller.initHooksAndCustomTools();
+
+		await expect(fixture.getCommandActions().navigateTree("entry-from-hooks", { summarize: true })).resolves.toEqual({
+			cancelled: false,
+		});
+		expect(fixture.ctx.session.navigateTree).toHaveBeenLastCalledWith("entry-from-hooks", { summarize: true });
+
+		fixture.controller.initializeHookRunner({} as ExtensionUIContext, false);
+		await expect(
+			fixture.getCommandActions().navigateTree("entry-from-runner", { summarize: false }),
+		).resolves.toEqual({
+			cancelled: false,
+		});
+		expect(fixture.ctx.session.navigateTree).toHaveBeenLastCalledWith("entry-from-runner", { summarize: false });
+	});
+	it("resets identity when hook-runner reload replaces the logical session", async () => {
+		const fixture = createFixture();
+		fixture.setNextSessionId("session-b");
+		fixture.controller.initializeHookRunner({} as ExtensionUIContext, false);
+
+		await fixture.getCommandActions().reload();
+
+		expect(fixture.resetIrcSidebarSession).toHaveBeenCalledTimes(1);
+		expect(fixture.rebuildInitialMessages).toHaveBeenCalledWith("replace-identity");
+	});
+
+	it("reconciles reload when the foreground extension keeps the same logical session", async () => {
+		const fixture = createFixture();
+		await fixture.controller.initHooksAndCustomTools();
+
+		await fixture.getCommandActions().reload();
+
+		expect(fixture.resetIrcSidebarSession).not.toHaveBeenCalled();
+		expect(fixture.rebuildInitialMessages).toHaveBeenCalledWith("reconcile-same-transcript");
+	});
+
+	it("classifies idle custom-message display rebuilds as same-transcript reconciliation", async () => {
+		const fixture = createFixture();
+		fixture.controller.initializeHookRunner({} as ExtensionUIContext, false);
+
+		fixture.getActions().sendMessage({ customType: "test", content: "visible", display: true });
+		await Bun.sleep(0);
+
+		expect(fixture.rebuildChatFromMessages).toHaveBeenCalledWith("reconcile-same-transcript");
+	});
+	it("routes extension fold choices through the interactive context", async () => {
+		const fixture = createFixture();
+		await fixture.controller.initHooksAndCustomTools();
+
+		const setToolUIContext = fixture.ctx.setToolUIContext as Mock<
+			(context: ExtensionUIContext, interactive: boolean) => void
+		>;
+		const uiContext = setToolUIContext.mock.calls[0]?.[0] as ExtensionUIContext;
+		uiContext.setToolsExpanded(true);
+
+		expect(fixture.ctx.setToolsExpanded).toHaveBeenCalledWith(true);
+	});
+	it("makes captured extension UI callbacks inert after final stop", async () => {
+		const fixture = createFixture();
+		await fixture.controller.initHooksAndCustomTools();
+		const ui = fixture.getUiContext();
+		fixture.setStopped(true);
+
+		ui.setWorkingMessage("late");
+		ui.setEditorText("late");
+		ui.pasteToEditor("late");
+		ui.setToolsExpanded(true);
+		ui.setStatus("late", "value");
+		ui.setWidget("late", ["value"]);
+		ui.notify("late");
+		ui.onTerminalInput(() => {});
+		expect(() => fixture.getActions().sendUserMessage("late")).toThrow("Interactive mode stopped");
+		expect(() => fixture.getActions().appendEntry("late", {})).toThrow("Interactive mode stopped");
+		fixture.emitError();
+
+		expect(await ui.select("late", ["value"])).toBeUndefined();
+		expect(await ui.confirm("late", "value")).toBe(false);
+		expect(await ui.input("late")).toBeUndefined();
+		expect(await ui.editor("late")).toBeUndefined();
+		expect(await ui.custom(() => new Container())).toBeUndefined();
+		expect(await ui.setTheme("dark")).toEqual({ success: false, error: "Interactive mode stopped" });
+		expect(fixture.ctx.setWorkingMessage).not.toHaveBeenCalled();
+		expect(fixture.ctx.editor.setText).not.toHaveBeenCalled();
+		expect(fixture.ctx.editor.handleInput).not.toHaveBeenCalled();
+		expect(fixture.ctx.setToolsExpanded).not.toHaveBeenCalled();
+		expect(fixture.ctx.session.sendUserMessage).not.toHaveBeenCalled();
+		expect(fixture.ctx.ui.requestRender).not.toHaveBeenCalled();
+		fixture.controller.dispose();
+		fixture.emitError();
+	});
+});

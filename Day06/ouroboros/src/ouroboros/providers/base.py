@@ -1,0 +1,165 @@
+"""Base protocol and models for LLM provider adapters.
+
+This module defines the LLMAdapter protocol and associated data models for
+communicating with LLM providers in a unified way.
+"""
+
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Literal, Protocol
+
+from ouroboros.core.errors import ProviderError
+from ouroboros.core.types import Result
+
+
+class MessageRole(StrEnum):
+    """Role of a message in the conversation."""
+
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+
+
+@dataclass(frozen=True, slots=True)
+class Message:
+    """A single message in a conversation.
+
+    Attributes:
+        role: The role of the message sender.
+        content: The text content of the message.
+    """
+
+    role: MessageRole
+    content: str
+
+    def to_dict(self) -> dict[str, str]:
+        """Convert message to dict format for LLM API calls.
+
+        Returns:
+            Dictionary with 'role' and 'content' keys.
+        """
+        return {"role": self.role.value, "content": self.content}
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionConfig:
+    """Configuration for LLM completion requests.
+
+    Attributes:
+        model: The model identifier (e.g., 'openrouter/openai/gpt-4').
+        temperature: Sampling temperature (0.0-2.0). Default 0.7.
+        max_tokens: Maximum tokens to generate. Default 4096.
+        stop: Optional stop sequences.
+        top_p: Nucleus sampling parameter. Default 1.0.
+        response_format: Optional response format constraint.
+            Use {"type": "json_object"} to force JSON output.
+            Use {"type": "json_schema", "json_schema": {...}} for strict schema.
+        role: Optional logical Ouroboros task role used to resolve llm_profiles.
+        profile: Optional explicit Ouroboros llm_profiles key.
+        max_turns: Optional per-request agent turn budget for CLI-backed providers.
+        reasoning_effort: Optional reasoning-effort dial
+            ("low"/"medium"/"high"/"xhigh"). ``xhigh`` is available only
+            through a Codex provider profile; backends that do not accept it
+            continue to ignore or validate it at their own boundary.
+            The effort-first investment lever (RFC #1405). Adapters with a native
+            effort knob translate it: LiteLLM forwards a ``reasoning_effort`` kwarg
+            (provider-agnostic), and the Anthropic-direct adapter maps it to
+            ``output_config.effort`` plus adaptive thinking where required (the
+            GA effort parameter — NOT the removed ``thinking.budget_tokens``,
+            which 400s on current Claude models).
+            Adapters without an effort knob ignore it. ``None`` preserves prior
+            behavior everywhere.
+        model_is_explicit: True when ``model`` is a request-level pin that must
+            not be replaced by role-based profile resolution.
+    """
+
+    model: str
+    temperature: float = 0.7
+    max_tokens: int = 4096
+    stop: list[str] | None = None
+    top_p: float = 1.0
+    response_format: dict[str, object] | None = None
+    role: str | None = None
+    profile: str | None = None
+    max_turns: int | None = None
+    reasoning_effort: Literal["low", "medium", "high", "xhigh"] | None = None
+    model_is_explicit: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class UsageInfo:
+    """Token usage information from a completion.
+
+    Attributes:
+        prompt_tokens: Number of tokens in the prompt.
+        completion_tokens: Number of tokens in the completion.
+        total_tokens: Total tokens used (prompt + completion).
+        unallocated_tokens: Authoritative provider-reported tokens that cannot
+            be truthfully assigned to prompt or completion.  This includes a
+            total-only report and additive cache counters when the public
+            prompt/completion fields exclude them.  Accounted spend is
+            ``total_tokens + unallocated_tokens``.
+    """
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    unallocated_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionResponse:
+    """Response from an LLM completion request.
+
+    Attributes:
+        content: The generated text content.
+        model: The model that generated the response.
+        usage: Token usage information.
+        finish_reason: Why the generation stopped (e.g., 'stop', 'length').
+        raw_response: Optional raw response from the provider for debugging.
+    """
+
+    content: str
+    model: str
+    usage: UsageInfo
+    finish_reason: str = "stop"
+    raw_response: dict[str, object] = field(default_factory=dict)
+
+
+class LLMAdapter(Protocol):
+    """Protocol for LLM provider adapters.
+
+    All LLM adapters must implement this protocol to provide a unified
+    interface for making completion requests.
+
+    Example:
+        adapter: LLMAdapter = LiteLLMAdapter(api_key="...")
+        result = await adapter.complete(
+            messages=[Message(role=MessageRole.USER, content="Hello!")],
+            config=CompletionConfig(model="openrouter/openai/gpt-4"),
+        )
+        if result.is_ok:
+            print(result.value.content)
+        else:
+            log.error("LLM call failed", error=result.error)
+    """
+
+    async def complete(
+        self,
+        messages: list[Message],
+        config: CompletionConfig,
+    ) -> Result[CompletionResponse, ProviderError]:
+        """Make a completion request to the LLM provider.
+
+        This method handles retries internally and converts all expected
+        failures to Result.err(ProviderError). Exceptions should only
+        occur for programming errors (bugs).
+
+        Args:
+            messages: The conversation messages to send.
+            config: Configuration for the completion request.
+
+        Returns:
+            Result containing either the completion response or a ProviderError.
+        """
+        ...

@@ -1,0 +1,272 @@
+[project]
+name = "ouroboros-ai"
+dynamic = ["version"]
+description = "Pins an acceptance spec and omits any verify command or expected output from the worker's contract. Works with Claude Code, Codex CLI, OpenCode and 10 more runtimes."
+readme = "README.md"
+authors = [
+    { name = "Q00", email = "jqyu.lee@gmail.com" }
+]
+requires-python = ">=3.12"
+keywords = [
+    "agent-os",
+    "agentic-loop",
+    "ai-agent",
+    "ai-coding-agent",
+    "claude-code",
+    "cli",
+    "developer-tools",
+    "llm-orchestration",
+    "loop-engineering",
+    "mcp",
+    "prompt-engineering",
+    "socratic-method",
+    "spec-driven-development",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Code Generators",
+]
+dependencies = [
+    "aiosqlite>=0.20.0,<1.0.0",
+    "anyio>=4.0.0,<5.0.0",
+    "click>=8.1.0,<9.0.0",
+    "jsonschema>=4.21.0,<5.0.0",
+    "pydantic>=2.0.0,<3.0.0",
+    "prompt-toolkit>=3.0.0,<4.0.0",
+    # Ceiling is deliberately tighter than the major-version bounds around it:
+    # this parses `.env`, a documented trust boundary (see
+    # `UNTRUSTED_ENV_DENYLIST` in config/untrusted_env.py), so only patch releases
+    # flow without review. An exact pin would be tighter still, but
+    # `test_runtime_and_optional_dependencies_have_upper_bounds` reserves
+    # `==` for the optional extras; core runtime deps stay bounded ranges.
+    # uv.lock pins the exact version for reproducible installs regardless.
+    "python-dotenv>=1.2.2,<1.3.0",
+    "pyyaml>=6.0.0,<7.0.0",
+    "rich>=13.0.0,<16.0.0",
+    "sqlalchemy[asyncio]>=2.0.0,<3.0.0",
+    "structlog>=24.0.0,<27.0.0",
+    "typer>=0.12.0,<0.28.0",
+]
+
+[project.urls]
+Homepage = "https://ouroboros.page/"
+Repository = "https://github.com/Q00/ouroboros"
+"Bug Tracker" = "https://github.com/Q00/ouroboros/issues"
+Sponsor = "https://github.com/sponsors/Q00"
+
+[project.optional-dependencies]
+# Exact-pinned (not ranges) on purpose: a future compromised "latest" must not
+# be auto-pulled on a fresh PyPI install (pipx / uv tool / pip resolve from
+# this metadata, NOT from uv.lock). Motivated by the 2026-03 litellm
+# 1.82.7/1.82.8 supply-chain incident. Updates land via reviewed Dependabot
+# PRs; uv.lock additionally hash-pins the full transitive graph for repo/CI.
+# Claude's default runtime preserves the Agent SDK and its MCP 1.x graph. The
+# MCP 2 server runs in a separate process/profile; these extras must never be
+# selected in one interpreter.
+# claude-agent-sdk 0.2.144 dropped its own MCP 1.x ceiling; the profile
+# contract (MCP 1.x graph) is preserved by pinning it here explicitly.
+claude = ["claude-agent-sdk==0.2.144", "anthropic==0.122.0", "mcp==1.28.1"]
+claude-cli = []
+# Explicit alias for automation and migrations that want to spell out the SDK
+# transport rather than rely on the historical `[claude]` name.
+claude-sdk = ["claude-agent-sdk==0.2.144", "anthropic==0.122.0", "mcp==1.28.1"]
+copilot = []
+litellm = ["litellm==1.91.0; python_version < '3.14'"]
+dashboard = []
+mcp = ["mcp==2.0.0"]
+tui = ["textual==8.2.8", "textual-serve==1.1.3"]
+# `[all]` remains the MCP 1.x application bundle. The MCP 2 server profile is
+# explicit and isolated; `[all,mcp]` is intentionally unsupported.
+all = ["ouroboros-ai[claude,copilot,litellm,tui,dashboard]"]
+
+[project.scripts]
+ooo = "ouroboros.cli.main:app"
+ouroboros = "ouroboros.cli.main:app"
+ozo = "ouroboros.cli.commands.zcode:app"
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+version_scheme = "guess-next-dev"
+local_scheme = "no-local-version"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/ouroboros/_version.py"
+
+[tool.hatch.build]
+exclude = [
+    "/.smoke-home",
+    "**/node_modules",
+    "**/target",
+    "**/__pycache__",
+    "/.mypy_cache",
+    "/.pytest_cache",
+    "/.ruff_cache",
+    "/.venv",
+    "/coverage.xml",
+    "/.coverage",
+    # Keep docs (esp. the 7.5MB docs/images/ouroboros.png) out of the sdist —
+    # they are never imported and the wheel already excludes them via
+    # packages=["src/ouroboros"]. Shipping them re-bloated every dev build and
+    # pushed the PyPI project past its 10GB storage cap.
+    "/docs",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ouroboros"]
+# Scoped to wheel only: prevent the `packages=` sweep from shipping these
+# assets, so the force-include below is the single source of truth and we
+# avoid duplicate ZIP local headers (PyPI rejects those). The sdist keeps
+# the files at their natural source path so rebuilds from sdist reproduce
+# the same wheel via this same config.
+exclude = [
+    "src/ouroboros/opencode/plugin/**",
+    "src/ouroboros/interview_adapters/packs/**",
+    "src/ouroboros/plugin/schemas/**",
+    "src/ouroboros/profiles/**",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"skills" = "ouroboros/skills"
+# Explicit inclusion so `importlib.resources.files("ouroboros.opencode.plugin")`
+# reliably finds ouroboros-bridge.ts / package.json / tsconfig.json in the
+# installed wheel, independent of hatchling's implicit asset handling.
+"src/ouroboros/opencode/plugin" = "ouroboros/opencode/plugin"
+# Same pattern for the vendored UserLevel plugin schemas — `_load_schema`
+# in `ouroboros.plugin.manifest` resolves them via `importlib.resources`,
+# so they must reach the installed wheel as package data, not just the
+# source tree.
+"src/ouroboros/plugin/schemas" = "ouroboros/plugin/schemas"
+# Built-in interview glossary packs. The loader resolves these through
+# importlib.resources, so the wheel must include them as package data exactly
+# once.
+"src/ouroboros/interview_adapters/packs" = "ouroboros/interview_adapters/packs"
+# Execution profile YAMLs (RFC v2 #830). The loader resolves them via
+# Path(__file__).parent.parent / "profiles", so they must ship with the wheel.
+"src/ouroboros/profiles" = "ouroboros/profiles"
+
+[dependency-groups]
+dev = [
+    "ouroboros-ai[tui]",
+    "mypy>=1.19.1",
+    "pre-commit>=4.5.1",
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.0.0",
+    "pytest-xdist>=3.6",
+    "ruff>=0.14.11",
+    "types-pyyaml>=6.0.12.20250915",
+]
+litellm-test = [
+    "ouroboros-ai[litellm]",
+]
+mcp-test = [
+    "mcp==2.0.0",
+]
+claude-sdk-test = [
+    "ouroboros-ai[claude-sdk]",
+]
+
+[tool.uv.dependency-groups]
+litellm-test = { requires-python = ">=3.12,<3.14" }
+
+[tool.uv]
+# The official Claude Agent SDK still embeds MCP 1.x internals. Declare every
+# SDK spelling incompatible with the MCP 2 profile and test group. The
+# dependency-free `[claude-cli]` profile remains compatible with `[mcp]`.
+conflicts = [
+    [{ extra = "claude" }, { extra = "mcp" }],
+    [{ extra = "claude" }, { group = "mcp-test" }],
+    [{ extra = "claude-sdk" }, { extra = "mcp" }],
+    [{ extra = "claude-sdk" }, { group = "mcp-test" }],
+    [{ extra = "all" }, { extra = "mcp" }],
+    [{ extra = "all" }, { group = "mcp-test" }],
+]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+disable_error_code = [
+    "union-attr",
+    "arg-type",
+    "return-value",
+    "assignment",
+    "attr-defined",
+    "misc",
+    "call-arg",
+    "override",
+    "list-item",
+    "dict-item",
+    "operator",
+    "str-bytes-safe",
+    "no-any-return",
+    "import-untyped",
+]
+
+[tool.pytest.ini_options]
+# asyncio_mode = "auto" per project-context.md
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "integration: integration tests that exercise cross-component behavior",
+    "slow: integration tests that build artifacts or call subprocesses",
+    "performance: isolated performance budgets; exclude from parallel correctness suites",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = ["src/ouroboros/_version.py"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # Pyflakes
+    "I",     # isort
+    "B",     # flake8-bugbear
+    "C4",    # flake8-comprehensions
+    "UP",    # pyupgrade
+    "ARG",   # flake8-unused-arguments
+    "SIM",   # flake8-simplify
+]
+ignore = [
+    "E501",    # Line too long (handled by formatter)
+    "ARG002",  # Unused method argument (common in interfaces/overrides)
+    "B017",    # assert-raises-exception
+    "B023",    # function-uses-loop-variable
+    "B904",    # raise-without-from-inside-except
+    "SIM102",  # collapsible-if
+    "SIM105",  # suppressible-exception
+    "SIM108",  # if-else-block-instead-of-if-exp
+    "SIM117",  # multiple-with-statements
+]
+
+[tool.ruff.lint.isort]
+force-single-line = false
+force-sort-within-sections = true
+known-first-party = ["ouroboros"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ARG001", "ARG002", "E402"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

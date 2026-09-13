@@ -1,0 +1,3096 @@
+"""EventStore implementation for event sourcing.
+
+Provides async methods for appending and replaying events using SQLAlchemy Core
+with aiosqlite backend.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable, Coroutine, Mapping
+from dataclasses import dataclass
+from datetime import datetime
+import hashlib
+import json
+import logging
+from pathlib import Path
+import sqlite3
+from typing import TYPE_CHECKING, Any
+from urllib.parse import quote, unquote
+
+from sqlalchemy import and_, case, event, func, or_, select, text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError, OperationalError
+
+if TYPE_CHECKING:
+    from ouroboros.orchestrator.workflow_lifecycle import WorkflowLifecycleEvent
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+
+from ouroboros.core.errors import PersistenceError
+from ouroboros.events.base import BaseEvent
+from ouroboros.persistence.backend_contract import require_sqlite_event_store_url
+from ouroboros.persistence.picker_projection_updates import (
+    insert_event_with_picker_projection as _insert_event,
+)
+from ouroboros.persistence.picker_projection_updates import (
+    insert_events_with_picker_projection as _insert_events,
+)
+from ouroboros.persistence.schema import (
+    ac_acceptance_guards_table,
+    events_table,
+    initialize_event_store_schema,
+    session_start_guards_table,
+    session_terminal_guards_table,
+)
+from ouroboros.persistence.sqlite_connection import configure_writable_sqlite_connection
+from ouroboros.persistence.sqlite_memory import (
+    canonicalize_named_memory_sqlite_url,
+    configure_anonymous_memory_engine,
+    configure_named_memory_engine,
+    is_anonymous_in_memory_sqlite_url,
+    is_named_memory_sqlite_url,
+    sqlite_uri_is_enabled,
+    validate_canonical_named_memdb_sqlite_url,
+    validate_external_named_memory_sqlite_url,
+    validate_standard_shared_memory_sqlite_url,
+)
+from ouroboros.persistence.write_lifecycle import run_with_write_lifecycle
+from ouroboros.persistence.write_settlement import (
+    append_with_sqlite_deadline,
+)
+from ouroboros.persistence.write_settlement import (
+    run_to_settlement as _run_to_settlement,
+)
+
+logger = logging.getLogger(__name__)
+
+_PYTHON_STRIP_WHITESPACE = (
+    "\t\n\v\f\r \x1c\x1d\x1e\x1f\x85\xa0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
+
+
+def sqlite_database_url(path: str | Path) -> str:
+    """Build an aiosqlite file URI without treating path characters as URI syntax."""
+    encoded_path = quote(str(Path(path).expanduser()), safe="/:")
+    return f"sqlite+aiosqlite:///file:{encoded_path}?uri=true"
+
+
+_RAW_SUBSCRIBED_EVENT_TYPE_KEYS = frozenset({"type", "event", "kind", "name"})
+_RAW_SUBSCRIBED_EVENT_SIGNAL_KEYS = frozenset(
+    {
+        "args",
+        "arguments",
+        "command",
+        "content",
+        "delta",
+        "error",
+        "input",
+        "message",
+        "params",
+        "path",
+        "payload",
+        "result",
+        "run_id",
+        "server_run_id",
+        "server_session_id",
+        "session",
+        "session_id",
+        "summary",
+        "text",
+        "thread_id",
+        "tool",
+        "tool_name",
+    }
+)
+_SESSION_TERMINAL_EVENT_TYPES = frozenset(
+    {
+        "orchestrator.session.completed",
+        "orchestrator.session.failed",
+        "orchestrator.session.cancelled",
+    }
+)
+
+_AC_ACCEPTANCE_FINALIZED_EVENT_TYPE = "execution.ac.acceptance_finalized"
+_ACCEPTANCE_ROOT_INDICES_KEY = "acceptance_root_indices"
+_AC_ACCEPTANCE_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_AC_ACCEPTANCE_OUTCOMES = frozenset(
+    {"succeeded", "satisfied_externally", "failed", "blocked", "invalid", "cancelled"}
+)
+
+
+_AC_ACCEPTANCE_DISPOSITIONS = frozenset(
+    {
+        "accepted",
+        "rejected",
+        "cancelled",
+        "failed",
+        "blocked",
+        "invalid",
+    }
+)
+
+
+def acceptance_generation_id_for_session(session_id: str, execution_id: str) -> str:
+    """Return a durable B generation independent of A's live correlation."""
+    if (
+        not isinstance(session_id, str)
+        or not session_id.strip()
+        or not isinstance(execution_id, str)
+        or not execution_id.strip()
+    ):
+        raise PersistenceError(
+            "Acceptance generation requires non-empty session and execution IDs.",
+            operation="acceptance_generation_id_for_session",
+        )
+    digest = hashlib.sha256(f"{session_id.strip()}\x00{execution_id.strip()}".encode()).hexdigest()
+    return f"foundation-b/v1:{digest}"
+
+
+def _is_session_terminal_event(event: object) -> bool:
+    """Return whether one event must use the durable terminal transition CAS."""
+    return (
+        isinstance(event, BaseEvent)
+        and event.aggregate_type == "session"
+        and event.type in _SESSION_TERMINAL_EVENT_TYPES
+    )
+
+
+def _is_session_start_event(event: object) -> bool:
+    """Return whether one event publishes immutable session identity."""
+    return (
+        isinstance(event, BaseEvent)
+        and event.aggregate_type == "session"
+        and event.type == "orchestrator.session.started"
+    )
+
+
+def _is_ac_acceptance_finalized_event(event: object) -> bool:
+    """Return whether ``event`` requires the Foundation B acceptance CAS."""
+    return (
+        isinstance(event, BaseEvent)
+        and event.aggregate_type == "execution"
+        and event.type == _AC_ACCEPTANCE_FINALIZED_EVENT_TYPE
+    )
+
+
+def _is_ac_acceptance_finalized_type(event: object) -> bool:
+    """Return whether a value uses the reserved final-acceptance event type."""
+    return isinstance(event, BaseEvent) and event.type == _AC_ACCEPTANCE_FINALIZED_EVENT_TYPE
+
+
+def _acceptance_payload_digest(event: BaseEvent) -> str:
+    """Hash the complete canonical payload for idempotent replay.
+
+    The authority/root guard is only idempotent for an equivalent final event.
+    Hashing a hand-picked subset silently treats a payload with additional
+    semantics as a duplicate, which is unsafe for fail-closed replay.
+    """
+    payload = {
+        "event_version": event.event_version,
+        "data": event.data,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _acceptance_key_fields(event: BaseEvent) -> tuple[str, int]:
+    """Validate and return the durable Foundation B acceptance key."""
+    data = event.data
+    generation = data.get("acceptance_generation_id")
+    root_index = data.get("root_ac_index")
+    if isinstance(root_index, bool) or not isinstance(root_index, int) or root_index < 0:
+        raise PersistenceError(
+            "Final acceptance requires a non-negative root AC index.",
+            operation="append_ac_acceptance_finalized_if_absent",
+            details={"event_type": event.type, "event_id": event.id},
+        )
+    required_strings = (
+        "execution_id",
+        "session_id",
+        "disposition",
+        "outcome",
+        "terminal_status",
+    )
+    for key in required_strings:
+        value = data.get(key)
+        if not isinstance(value, str) or not value.strip() or value != value.strip():
+            raise PersistenceError(
+                f"Final acceptance requires a non-empty {key}.",
+                operation="append_ac_acceptance_finalized_if_absent",
+                details={"event_type": event.type, "event_id": event.id, "field": key},
+            )
+    execution_id = data["execution_id"]
+    if event.aggregate_id != execution_id:
+        raise PersistenceError(
+            "Final acceptance aggregate_id must match payload execution_id.",
+            operation="append_ac_acceptance_finalized_if_absent",
+            details={
+                "event_type": event.type,
+                "event_id": event.id,
+                "aggregate_id": event.aggregate_id,
+                "execution_id": execution_id,
+            },
+        )
+    expected_generation = acceptance_generation_id_for_session(
+        data["session_id"],
+        execution_id,
+    )
+    if not isinstance(generation, str) or not generation.strip():
+        raise PersistenceError(
+            "Final acceptance requires a non-empty acceptance generation ID.",
+            operation="validate_acceptance_finalization",
+            details={"event_type": event.type, "event_id": event.id},
+        )
+    if generation != expected_generation:
+        raise PersistenceError(
+            "Final acceptance generation does not match the session/execution identity.",
+            operation="validate_acceptance_finalization",
+            details={"event_type": event.type, "event_id": event.id},
+        )
+    accepted = data.get("accepted")
+    if not isinstance(accepted, bool):
+        raise PersistenceError(
+            "Final acceptance requires a boolean accepted field.",
+            operation="append_ac_acceptance_finalized_if_absent",
+            details={"event_type": event.type, "event_id": event.id},
+        )
+    disposition = data.get("disposition")
+    outcome = data.get("outcome")
+    terminal_status = data.get("terminal_status")
+    if terminal_status not in _AC_ACCEPTANCE_TERMINAL_STATUSES:
+        raise PersistenceError(
+            "Final acceptance requires a canonical terminal status.",
+            operation="append_ac_acceptance_finalized_if_absent",
+            details={"event_type": event.type, "event_id": event.id},
+        )
+    if disposition not in _AC_ACCEPTANCE_DISPOSITIONS:
+        raise PersistenceError(
+            "Final acceptance requires a canonical disposition.",
+            operation="append_ac_acceptance_finalized_if_absent",
+            details={"event_type": event.type, "event_id": event.id},
+        )
+    if outcome not in _AC_ACCEPTANCE_OUTCOMES:
+        raise PersistenceError(
+            "Final acceptance requires a canonical outcome.",
+            operation="append_ac_acceptance_finalized_if_absent",
+            details={"event_type": event.type, "event_id": event.id},
+        )
+    if accepted and (disposition != "accepted" or terminal_status != "completed"):
+        raise PersistenceError(
+            "Accepted final acceptance requires accepted disposition and completed terminal status.",
+            operation="append_ac_acceptance_finalized_if_absent",
+            details={"event_type": event.type, "event_id": event.id},
+        )
+    if accepted and outcome not in {"succeeded", "satisfied_externally"}:
+        raise PersistenceError(
+            "Accepted final acceptance requires a successful outcome.",
+            operation="append_ac_acceptance_finalized_if_absent",
+            details={"event_type": event.type, "event_id": event.id},
+        )
+    if terminal_status == "completed" and not accepted:
+        raise PersistenceError(
+            "Completed final acceptance must be accepted.",
+            operation="append_ac_acceptance_finalized_if_absent",
+            details={"event_type": event.type, "event_id": event.id},
+        )
+    expected_disposition = (
+        "accepted"
+        if accepted
+        else (
+            "cancelled"
+            if terminal_status == "cancelled"
+            else ("rejected" if outcome in {"succeeded", "satisfied_externally"} else outcome)
+        )
+    )
+    if disposition != expected_disposition:
+        raise PersistenceError(
+            "Final acceptance disposition is inconsistent with its outcome and terminal status.",
+            operation="append_ac_acceptance_finalized_if_absent",
+            details={"event_type": event.type, "event_id": event.id},
+        )
+    if terminal_status == "failed" and accepted:
+        raise PersistenceError(
+            "Failed final acceptance cannot be accepted.",
+            operation="append_ac_acceptance_finalized_if_absent",
+            details={"event_type": event.type, "event_id": event.id},
+        )
+    retry_attempt = data.get("final_retry_attempt")
+    if isinstance(retry_attempt, bool) or not isinstance(retry_attempt, int) or retry_attempt < 0:
+        raise PersistenceError(
+            "Final acceptance requires a non-negative final retry attempt.",
+            operation="append_ac_acceptance_finalized_if_absent",
+            details={"event_type": event.type, "event_id": event.id},
+        )
+    return generation, root_index
+
+
+def validate_acceptance_finalization_payload(
+    data: Mapping[str, Any],
+    *,
+    aggregate_id: str | None = None,
+) -> tuple[str, int]:
+    """Validate a finalization payload with the same rules used at write time."""
+    execution_id = data.get("execution_id")
+    event = BaseEvent(
+        type=_AC_ACCEPTANCE_FINALIZED_EVENT_TYPE,
+        aggregate_type="execution",
+        aggregate_id=(
+            aggregate_id
+            if isinstance(aggregate_id, str)
+            else (execution_id if isinstance(execution_id, str) else "")
+        ),
+        data=dict(data),
+    )
+    return _acceptance_key_fields(event)
+
+
+def _acceptance_event_from_terminal_payload(payload: object) -> BaseEvent:
+    """Reconstruct one acceptance event carried by a terminalization plan."""
+    if not isinstance(payload, Mapping):
+        raise PersistenceError(
+            "Terminal acceptance plan entries must be mappings.",
+            operation="append_session_terminal_if_active",
+            details={"acceptance_plan_invalid": True},
+        )
+    data = dict(payload)
+    execution_id = data.get("execution_id")
+    if not isinstance(execution_id, str) or not execution_id.strip():
+        raise PersistenceError(
+            "Terminal acceptance plan requires an execution_id.",
+            operation="append_session_terminal_if_active",
+            details={"acceptance_plan_invalid": True},
+        )
+    return BaseEvent(
+        type=_AC_ACCEPTANCE_FINALIZED_EVENT_TYPE,
+        aggregate_type="execution",
+        aggregate_id=execution_id,
+        data=data,
+    )
+
+
+def _validated_terminal_acceptance_events(event: BaseEvent) -> tuple[BaseEvent, ...]:
+    """Validate a terminal envelope before acquiring either durable CAS guard."""
+    acceptance_plan = event.data.get("acceptance_finalizations", ())
+    if acceptance_plan is None:
+        acceptance_plan = ()
+    if not isinstance(acceptance_plan, (list, tuple)):
+        raise PersistenceError(
+            "Terminal acceptance plan must be a list.",
+            operation="append_session_terminal_if_active",
+            details={"acceptance_plan_invalid": True},
+        )
+    expected_terminal_status = {
+        "orchestrator.session.completed": "completed",
+        "orchestrator.session.failed": "failed",
+        "orchestrator.session.cancelled": "cancelled",
+    }[event.type]
+    validated: list[BaseEvent] = []
+    for payload in acceptance_plan:
+        if not isinstance(payload, Mapping):
+            raise PersistenceError(
+                "Terminal acceptance plan entries must be mappings.",
+                operation="append_session_terminal_if_active",
+                details={"acceptance_plan_invalid": True},
+            )
+        if payload.get("session_id") != event.aggregate_id:
+            raise PersistenceError(
+                "Terminal acceptance plan session_id must match the terminal session.",
+                operation="append_session_terminal_if_active",
+                details={"acceptance_plan_invalid": True},
+            )
+        if payload.get("terminal_status") != expected_terminal_status:
+            raise PersistenceError(
+                "Terminal acceptance plan status must match the terminal session event.",
+                operation="append_session_terminal_if_active",
+                details={"acceptance_plan_invalid": True},
+            )
+        acceptance_event = _acceptance_event_from_terminal_payload(payload)
+        _acceptance_key_fields(acceptance_event)
+        validated.append(acceptance_event)
+    return tuple(validated)
+
+
+def _normalize_durable_acceptance_root_indices(
+    value: object,
+    *,
+    session_id: str,
+    operation: str,
+) -> frozenset[int]:
+    """Validate the immutable root set stored by a current-format session."""
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, (list, tuple)):
+        raise PersistenceError(
+            "Durable acceptance root set must be a list of non-negative integers.",
+            operation=operation,
+            details={"session_id": session_id, "acceptance_root_set_invalid": True},
+        )
+    normalized: set[int] = set()
+    for raw_root in value:
+        if isinstance(raw_root, bool) or not isinstance(raw_root, int) or raw_root < 0:
+            raise PersistenceError(
+                "Durable acceptance root set contains an invalid root index.",
+                operation=operation,
+                details={
+                    "session_id": session_id,
+                    "root_ac_index": raw_root,
+                    "acceptance_root_set_invalid": True,
+                },
+            )
+        normalized.add(raw_root)
+    if len(normalized) != len(value):
+        raise PersistenceError(
+            "Durable acceptance root set contains duplicate root indices.",
+            operation=operation,
+            details={"session_id": session_id, "acceptance_root_set_invalid": True},
+        )
+    return frozenset(normalized)
+
+
+def _normalized_mapping_keys(value: Mapping[object, object]) -> set[str]:
+    """Return normalized string keys for mapping inspection."""
+    return {str(key).strip().lower().replace("-", "_") for key in value}
+
+
+def _looks_like_raw_subscribed_event_payload(value: object) -> bool:
+    """Return True when the value resembles a subscribed runtime stream event."""
+    if not isinstance(value, Mapping):
+        return False
+
+    normalized_keys = _normalized_mapping_keys(value)
+    if {"aggregate_type", "aggregate_id", "data"} <= normalized_keys:
+        return False
+
+    if not (_RAW_SUBSCRIBED_EVENT_TYPE_KEYS & normalized_keys):
+        return False
+
+    return bool(_RAW_SUBSCRIBED_EVENT_SIGNAL_KEYS & normalized_keys)
+
+
+def _session_related_event_conditions(
+    session_id: str,
+    execution_id: str | None,
+) -> list[Any]:
+    """Build aggregate-id predicates for a session and its execution scopes.
+
+    An empty ``session_id`` contributes no session predicate: matching
+    ``json_extract(payload,'$.session_id') == ''`` would pull unrelated rows
+    that happen to persist a blank session field. Callers with only an
+    execution scope (e.g. a TUI poll whose context has no session yet) still
+    match worker-scoped events through the ``execution_id`` predicates below.
+    """
+    conditions: list[Any] = []
+    if session_id:
+        conditions.append(events_table.c.aggregate_id == session_id)
+        conditions.append(func.json_extract(events_table.c.payload, "$.session_id") == session_id)
+    if not execution_id:
+        return conditions
+
+    conditions.append(events_table.c.aggregate_id == execution_id)
+    conditions.append(func.json_extract(events_table.c.payload, "$.execution_id") == execution_id)
+    conditions.append(
+        func.json_extract(events_table.c.payload, "$.parent_execution_id") == execution_id
+    )
+
+    return conditions
+
+
+class EventStore:
+    """Event store for persisting and replaying events.
+
+    Uses SQLAlchemy Core with aiosqlite for async database operations.
+    All operations are transactional for atomicity.
+
+    Usage:
+        store = EventStore("sqlite+aiosqlite:///ouroboros.db")
+        await store.initialize()
+
+        # Append event
+        await store.append(event)
+
+        # Replay events for an aggregate
+        events = await store.replay("seed", "seed-123")
+
+        # Close when done
+        await store.close()
+    """
+
+    _settling_writes: set[asyncio.Future[Any]]
+
+    def __init__(
+        self,
+        database_url: str | None = None,
+        *,
+        read_only: bool = False,
+    ) -> None:
+        """Initialize EventStore with database URL.
+
+        Args:
+            database_url: SQLAlchemy database URL — SQLite-only, else ValueError
+                         (#1832). For async SQLite: "sqlite+aiosqlite:///path/to/db.sqlite"
+                         If not provided, uses the configured EventStore path
+                         with the legacy ~/.ouroboros/ouroboros.db fallback.
+            read_only: When True, open the underlying SQLite database in true
+                read-only mode by rewriting the URL into the ``file:<path>?mode=ro&uri=true``
+                form and passing ``connect_args={"uri": True}`` to aiosqlite.
+                This enforces the read-only contract at the connection layer
+                so *any* accidental write path (including library/future code
+                paths we don't control) fails fast with
+                ``sqlite3.OperationalError: attempt to write a readonly database``.
+                Callers that opt in should also skip schema creation by calling
+                ``initialize(create_schema=False)`` — this is the default when
+                ``read_only=True``.
+        """
+        self._configuration_error: ValueError | None = None
+        if database_url is None:
+            from ouroboros.config.models import get_config_dir, resolve_event_store_path
+
+            try:
+                db_path = resolve_event_store_path()
+            except ValueError as exc:
+                self._configuration_error = exc
+                db_path = get_config_dir() / "ouroboros.db"
+            if not read_only and self._configuration_error is None:
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+            database_url = sqlite_database_url(db_path)
+
+        self._read_only = read_only
+        self._picker_projection_ready = False
+        self._settling_writes = set()
+        self._closing = False
+        self._initialized = False
+        self._lifecycle_lock = asyncio.Lock()
+        validate_standard_shared_memory_sqlite_url(database_url)
+        validate_canonical_named_memdb_sqlite_url(database_url)
+        validate_external_named_memory_sqlite_url(database_url)
+        if read_only:
+            if is_named_memory_sqlite_url(database_url):
+                raise ValueError(
+                    "Read-only named in-memory EventStore URLs are unsupported; "
+                    "they cannot be reopened as the same process-local database."
+                )
+            database_url = self._coerce_to_readonly_url(database_url)
+        else:
+            database_url = canonicalize_named_memory_sqlite_url(database_url)
+        require_sqlite_event_store_url(database_url)
+        self._database_url = database_url
+        self._engine: AsyncEngine | None = None
+        # Anchor connection for process-shared in-memory databases (memdb VFS):
+        # the database lives as long as at least one connection holds it open.
+        self._memory_keepalive: sqlite3.Connection | None = None
+
+    @staticmethod
+    def _coerce_to_readonly_url(database_url: str) -> str:
+        """Rewrite a plain aiosqlite URL into a ``mode=ro`` URI form.
+
+        Leaves non-SQLite URLs untouched. Existing ``file:`` URI forms are
+        rebuilt so caller-supplied query parameters cannot weaken read-only mode.
+        """
+        if is_anonymous_in_memory_sqlite_url(database_url):
+            return database_url
+
+        prefix = "sqlite+aiosqlite:///"
+        if not database_url.startswith(prefix):
+            return database_url
+
+        path_part = database_url[len(prefix) :]
+        if path_part.startswith("file:"):
+            raw_path, _separator, _raw_query = path_part.partition("?")
+            if sqlite_uri_is_enabled(database_url):
+                raw_path = raw_path[len("file:") :]
+                path_part = unquote(raw_path.split("#", 1)[0])
+            else:
+                # With URI processing disabled, ``file:`` is part of the literal
+                # filename.  Preserve it when rebuilding a true read-only URI;
+                # otherwise ``file:ordinary?uri=false`` silently targets
+                # ``ordinary`` instead of the durable ``file:ordinary`` database.
+                path_part = raw_path
+
+        # ``:memory:`` has no filesystem and cannot be opened read-only
+        # meaningfully; leave it alone.
+        if path_part in (":memory:", ""):
+            return database_url
+
+        encoded_path = quote(path_part, safe="/:")
+        return f"{prefix}file:{encoded_path}?mode=ro&uri=true"
+
+    @staticmethod
+    def _sqlite_path_from_url(database_url: str) -> str | None:
+        """Filesystem path of the SQLite file this URL points at, else ``None``.
+
+        Returns ``None`` for in-memory or non-SQLite backends. Parsed
+        structurally, so a query string on any accepted form — plain,
+        ``:memory:``, or ``file:`` URIs (``mode=ro``/``mode=memory``) —
+        never masquerades as part of a filesystem path.
+        """
+        try:
+            parsed = make_url(database_url)
+        except Exception:
+            return None
+        is_memory_mode = is_named_memory_sqlite_url(database_url)
+        if parsed.get_backend_name() != "sqlite" or is_memory_mode:
+            return None
+        database = parsed.database or ""
+        if database.startswith("file:") and sqlite_uri_is_enabled(database_url):
+            database = unquote(database[len("file:") :])
+        return None if database in (":memory:", "") else database
+
+    def sqlite_path(self) -> str | None:
+        """Filesystem path of the backing SQLite file, or ``None``.
+
+        The dashboard daemon is DB-scoped: it must tail the *same* file this store
+        writes to. Custom-path stores (``ooo mcp --db-path``) otherwise get a
+        dashboard for the home-directory default. Returns ``None`` for in-memory /
+        non-SQLite backends, where there is no local file to point the daemon at.
+        """
+        return self._sqlite_path_from_url(self._database_url)
+
+    @property
+    def database_url(self) -> str:
+        """Canonical database URL used by this store.
+
+        Detached job workers must open the exact same event stream as the MCP
+        process that accepted the request.  Exposing the already-normalized URL
+        avoids reaching into private engine state and also preserves custom
+        ``--db-path`` deployments.
+        """
+        return self._database_url
+
+    @property
+    def supports_cross_process_workers(self) -> bool:
+        """Whether another process can observe this store's event stream."""
+        return self.sqlite_path() is not None
+
+    def _raise_invalid_append_input(
+        self,
+        event: object,
+        *,
+        operation: str,
+        index: int | None = None,
+    ) -> None:
+        """Raise a persistence error for invalid append inputs."""
+        details = {"received_type": type(event).__name__}
+        if index is not None:
+            details["event_index"] = index
+
+        if isinstance(event, Mapping):
+            details["received_keys"] = sorted(_normalized_mapping_keys(event))[:12]
+            if _looks_like_raw_subscribed_event_payload(event):
+                raise PersistenceError(
+                    "EventStore rejects raw subscribed event stream payloads. "
+                    "Normalize them into BaseEvent records before persistence.",
+                    operation=operation,
+                    details=details,
+                )
+
+        raise PersistenceError(
+            "EventStore only persists BaseEvent instances.",
+            operation=operation,
+            details=details,
+        )
+
+    async def initialize(self, *, create_schema: bool | None = None) -> None:
+        """Initialize the database connection and create tables if needed.
+
+        This idempotent method is also the in-process retry for deferred picker provisioning.
+
+        Args:
+            create_schema: When True run ``metadata.create_all`` so missing
+                tables are created. Read-only consumers can pass ``False`` to
+                skip schema creation. When ``None``, writable stores create it.
+
+        Pathless and ``:memory:`` URLs use SQLite's process-shared ``memdb`` VFS;
+        a keepalive connection anchors their lifetime.
+        """
+        # Serialize with close; once work starts, settle it before surfacing cancellation.
+        async with self._lifecycle_lock:
+            self._closing = False
+            await _run_to_settlement(
+                self._initialize_locked(create_schema=create_schema),
+                operation="initialize",
+            )
+            self._initialized = True
+
+    async def _initialize_locked(self, *, create_schema: bool | None = None) -> None:
+        if self._configuration_error is not None:
+            raise PersistenceError(
+                "Invalid EventStore configuration.",
+                operation="initialize",
+            ) from self._configuration_error
+        if create_schema is None:
+            create_schema = not self._read_only
+
+        if self._read_only and create_schema:
+            raise PersistenceError(
+                "Cannot create schema on a read-only EventStore.",
+                operation="initialize",
+                details={"read_only": True},
+            )
+
+        if self._engine is None:
+            connect_args: dict[str, object] = {"timeout": 30}
+            if self._read_only:
+                # aiosqlite forwards unknown kwargs to sqlite3.connect — the
+                # ``uri=True`` flag is what turns the ``file:...?mode=ro`` form
+                # into a real read-only connection.
+                connect_args["uri"] = True
+
+            engine_kwargs: dict[str, Any] = {
+                "echo": False,
+                "connect_args": connect_args,
+            }
+            engine_url = self._database_url
+            if is_anonymous_in_memory_sqlite_url(self._database_url):
+                engine_url, self._memory_keepalive = configure_anonymous_memory_engine(
+                    self._database_url, engine_kwargs
+                )
+            else:
+                # Named in-memory URIs intentionally share one database across
+                # EventStore instances in this process. Keep that caller-chosen
+                # identity, but use distinct pooled connections so concurrent
+                # transaction scopes cannot interleave on one DB-API handle.
+                self._memory_keepalive = configure_named_memory_engine(
+                    self._database_url, engine_kwargs
+                )
+
+            self._engine = create_async_engine(
+                engine_url,
+                **engine_kwargs,
+            )
+
+            # Enable WAL mode and set busy timeout on every new connection.
+            # Skipped for read-only consumers: ``PRAGMA journal_mode=WAL`` is
+            # itself a write and would trip SQLite's read-only guard.
+            if not self._read_only:
+
+                @event.listens_for(self._engine.sync_engine, "connect")
+                def _set_sqlite_pragmas(dbapi_conn, _connection_record):
+                    configure_writable_sqlite_connection(dbapi_conn)
+
+        if create_schema:
+            self._picker_projection_ready = await initialize_event_store_schema(
+                self._engine, logger
+            )
+            # Drain writers admitted before readiness, then backfill any transition gap.
+            if self._picker_projection_ready and (writes := tuple(self._settling_writes)):
+                await asyncio.gather(*writes, return_exceptions=True)
+                self._picker_projection_ready = await initialize_event_store_schema(
+                    self._engine, logger
+                )
+
+    async def append(
+        self,
+        event: BaseEvent,
+        *,
+        _skip_workflow_ir_guard: bool = False,
+    ) -> bool | None:
+        """Append an event to the store.
+
+        The operation is wrapped in a transaction for atomicity.
+        If the insert fails, the transaction is rolled back.
+
+        Returns:
+            ``True`` when a terminal session event wins its conditional
+            transition, ``False`` when an existing terminal event already won,
+            and ``None`` for ordinary append-only events.
+
+        Args:
+            event: The event to append.
+
+        Raises:
+            PersistenceError: If the append operation fails.
+        """
+        if _is_session_start_event(event):
+            await self.append_session_start_if_absent(event)
+            return None
+        # Terminal session lifecycle is a one-winner transition, not a generic
+        # append-only observation.  Keep this guard at the public EventStore
+        # boundary so event factories and older SessionRepository callers
+        # cannot accidentally bypass the conditional terminal CAS.
+        if _is_session_terminal_event(event):
+            return await self.append_session_terminal_if_active(event)
+        if _is_ac_acceptance_finalized_type(event):
+            raise PersistenceError(
+                "Final acceptance events must be carried by a terminal session plan; "
+                "use append_session_terminal_if_active().",
+                operation="append",
+                details={"event_type": event.type, "aggregate_id": event.aggregate_id},
+            )
+        await self.append_with_rowid(event, _skip_workflow_ir_guard=_skip_workflow_ir_guard)
+        return None
+
+    async def append_durable(self, event: BaseEvent, *, timeout: float) -> None:
+        """Append one ordinary event within a cancellation-atomic deadline.
+
+        Caller-side ``wait_for()`` cannot bound :func:`_run_to_settlement`:
+        cancellation intentionally waits for the transaction's final commit
+        or rollback.  This entry point moves the deadline into persistence.
+        SQLite receives both a deadline-sized ``busy_timeout`` and a progress
+        handler/interrupt, while a small part of the advertised budget is
+        reserved for rollback and connection cleanup.  ``TimeoutError`` is
+        raised only after that settlement, so returning never leaves an
+        ambiguous transaction running in the background.
+
+        Agent-process lifecycle events are ordinary append-only events.  The
+        guarded session/workflow event families keep their specialized APIs
+        and are deliberately rejected here rather than silently weakening
+        their conditional transition contracts.
+        """
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+            raise ValueError("append_durable timeout must be a positive number")
+        if not isinstance(event, BaseEvent):
+            self._raise_invalid_append_input(event, operation="append_durable")
+        if (
+            _is_session_start_event(event)
+            or _is_session_terminal_event(event)
+            or _is_ac_acceptance_finalized_type(event)
+            or event.aggregate_type == "workflow_ir"
+        ):
+            raise PersistenceError(
+                "append_durable only accepts ordinary append-only events.",
+                operation="append_durable",
+                details={"event_type": event.type, "aggregate_type": event.aggregate_type},
+            )
+
+        loop = asyncio.get_running_loop()
+        overall_deadline = loop.time() + float(timeout)
+
+        # Schema initialization has its own cancellation-atomic settlement
+        # contract and cannot honestly be folded into a hard append deadline.
+        # Production EventStores initialize during service startup; refusing
+        # lazy initialization here is the bounded, ambiguity-free contract.
+        engine = self._engine
+        if not self._initialized or engine is None:
+            raise PersistenceError(
+                "Durable append requires an initialized EventStore; initialize it "
+                "during startup before beginning the bounded lifecycle write.",
+                operation="append_durable",
+            )
+
+        await _run_to_settlement(
+            append_with_sqlite_deadline(
+                engine,
+                event,
+                overall_deadline=overall_deadline,
+                picker_projection_ready=self._picker_projection_ready,
+                insert_event=_insert_event,
+            ),
+            registry=self._settling_writes,
+            refuse_when=lambda: self._closing,
+            operation="append_durable",
+        )
+
+    async def append_session_start_if_absent(self, event: BaseEvent) -> None:
+        """Fenced wrapper: admission + settlement for the CAS below.
+
+        Session lifecycle appends dispatch above append()'s settlement
+        path, so they carry their own closing fence and registry entry —
+        a lifecycle event can neither start during close() nor commit
+        after it (review round six).
+        """
+        return await _run_to_settlement(
+            self._append_session_start_if_absent_unfenced(event),
+            registry=self._settling_writes,
+            refuse_when=lambda: self._closing,
+            operation="append_session_start_if_absent",
+        )
+
+    async def _append_session_start_if_absent_unfenced(self, event: BaseEvent) -> None:
+        """Publish exactly one immutable start identity for a session ID."""
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="append_session_start_if_absent",
+            )
+        if not _is_session_start_event(event):
+            raise PersistenceError(
+                "Conditional session start append requires an explicit started event.",
+                operation="append_session_start_if_absent",
+                table="events",
+                details={
+                    "aggregate_type": getattr(event, "aggregate_type", None),
+                    "event_type": getattr(event, "type", None),
+                },
+            )
+        raw_execution_id = event.data.get("execution_id")
+        execution_id = raw_execution_id.strip() if isinstance(raw_execution_id, str) else ""
+
+        for attempt in range(3):
+            try:
+                async with self._engine.connect() as conn:
+                    sqlite = conn.dialect.name == "sqlite"
+                    if sqlite:
+                        await conn.exec_driver_sql("BEGIN IMMEDIATE")
+                        transaction = None
+                    else:
+                        transaction = await conn.begin()
+                    try:
+                        existing_lifecycle = await conn.execute(
+                            select(events_table.c.id, events_table.c.event_type)
+                            .where(
+                                events_table.c.aggregate_type == "session",
+                                events_table.c.aggregate_id == event.aggregate_id,
+                            )
+                            .limit(1)
+                        )
+                        existing_row = existing_lifecycle.first()
+                        if existing_row is not None:
+                            if conn.in_transaction():
+                                await conn.rollback()
+                            raise PersistenceError(
+                                "Session ID already has durable lifecycle history.",
+                                operation="append_session_start_if_absent",
+                                table="events",
+                                details={
+                                    "session_id": event.aggregate_id,
+                                    "execution_id": execution_id,
+                                    "existing_event_id": existing_row.id,
+                                    "existing_event_type": existing_row.event_type,
+                                    "session_start_conflict": True,
+                                },
+                            )
+                        try:
+                            async with conn.begin_nested():
+                                await conn.execute(
+                                    session_start_guards_table.insert().values(
+                                        session_id=event.aggregate_id,
+                                        start_event_id=event.id,
+                                        execution_id=execution_id,
+                                    )
+                                )
+                        except IntegrityError as exc:
+                            if conn.in_transaction():
+                                await conn.rollback()
+                            raise PersistenceError(
+                                "Session ID already has an immutable start identity.",
+                                operation="append_session_start_if_absent",
+                                table="events",
+                                details={
+                                    "session_id": event.aggregate_id,
+                                    "execution_id": execution_id,
+                                    "session_start_conflict": True,
+                                },
+                            ) from exc
+                        await _insert_event(conn, event, self._picker_projection_ready)
+                        if sqlite:
+                            await conn.commit()
+                        elif transaction is not None:
+                            await transaction.commit()
+                        return
+                    except BaseException:
+                        if conn.in_transaction():
+                            await conn.rollback()
+                        raise
+            except PersistenceError:
+                raise
+            except Exception as exc:
+                if "database is locked" in str(exc) and attempt < 2:
+                    logger.warning(
+                        "event_store.append_session_start_if_absent.retry",
+                        extra={"attempt": attempt + 1, "event_id": event.id},
+                    )
+                    await asyncio.sleep(0.1 * (2**attempt))
+                    continue
+                raise PersistenceError(
+                    f"Failed to conditionally append session start event: {exc}",
+                    operation="append_session_start_if_absent",
+                    table="events",
+                    details={"event_id": event.id, "event_type": event.type},
+                ) from exc
+        raise PersistenceError(
+            "Failed to conditionally append session start event after retries.",
+            operation="append_session_start_if_absent",
+            table="events",
+            details={"event_id": event.id, "event_type": event.type},
+        )
+
+    async def append_session_terminal_if_active(self, event: BaseEvent) -> bool:
+        """Fenced wrapper: admission + settlement for the CAS below.
+
+        Session lifecycle appends dispatch above append()'s settlement
+        path, so they carry their own closing fence and registry entry —
+        a lifecycle event can neither start during close() nor commit
+        after it (review round six).
+        """
+        return await _run_to_settlement(
+            self._append_session_terminal_if_active_unfenced(event),
+            registry=self._settling_writes,
+            refuse_when=lambda: self._closing,
+            operation="append_session_terminal_if_active",
+        )
+
+    async def _append_session_terminal_if_active_unfenced(self, event: BaseEvent) -> bool:
+        """Append one terminal session event only while no terminal event exists.
+
+        Returns ``True`` when ``event`` was inserted and ``False`` when another
+        terminal session event already won.  The check and append share one
+        transaction so a stale in-memory ``PAUSED`` tracker cannot overwrite a
+        concurrent durable cancellation with a later ``FAILED`` event.
+
+        This intentionally protects only the explicit session lifecycle event
+        family.  Callers that need a terminal transition must use a matching
+        ``orchestrator.session.*`` event; ordinary progress events remain
+        append-only observations.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="append_session_terminal_if_active",
+            )
+        if not isinstance(event, BaseEvent):
+            self._raise_invalid_append_input(
+                event,
+                operation="append_session_terminal_if_active",
+            )
+        if event.aggregate_type != "session" or event.type not in _SESSION_TERMINAL_EVENT_TYPES:
+            raise PersistenceError(
+                "Conditional session terminal append requires an explicit terminal session event.",
+                operation="append_session_terminal_if_active",
+                table="events",
+                details={
+                    "aggregate_type": event.aggregate_type,
+                    "event_type": event.type,
+                },
+            )
+
+        # Validate the complete plan before taking the terminal guard.  A
+        # malformed envelope must not even transiently acquire a terminal or
+        # acceptance winner that a caller could mistake for a committed CAS.
+        acceptance_events = _validated_terminal_acceptance_events(event)
+        durable_root_indices = await self._resolve_acceptance_root_indices_for_session(
+            event.aggregate_id
+        )
+        if durable_root_indices is not None:
+            if (
+                "acceptance_finalizations" not in event.data
+                or event.data.get("acceptance_finalizations") is None
+            ):
+                raise PersistenceError(
+                    "Current-format terminal sessions require an explicit acceptance plan.",
+                    operation="append_session_terminal_if_active",
+                    details={
+                        "session_id": event.aggregate_id,
+                        "acceptance_plan_missing": True,
+                    },
+                )
+            plan_root_indices = {
+                int(acceptance_event.data["root_ac_index"])
+                for acceptance_event in acceptance_events
+            }
+            if plan_root_indices != durable_root_indices:
+                raise PersistenceError(
+                    "Terminal acceptance plan must exactly match the durable session root set.",
+                    operation="append_session_terminal_if_active",
+                    details={
+                        "session_id": event.aggregate_id,
+                        "durable_root_indices": sorted(durable_root_indices),
+                        "plan_root_indices": sorted(plan_root_indices),
+                        "acceptance_root_set_conflict": True,
+                    },
+                )
+        if acceptance_events:
+            # The payload's self-consistent session/execution pair is not
+            # sufficient: bind it to the immutable durable session-start
+            # identity before either CAS can win.  Without this check a caller
+            # could finalize ``exec_other`` under a session that started
+            # ``exec_real`` and permanently consume the wrong root guard.
+            started_execution_id = await self._resolve_execution_id_for_session(event.aggregate_id)
+            if started_execution_id is None:
+                raise PersistenceError(
+                    "Final acceptance requires a durable session-start execution identity.",
+                    operation="append_session_terminal_if_active",
+                    details={
+                        "session_id": event.aggregate_id,
+                        "acceptance_identity_missing": True,
+                    },
+                )
+            mismatched = next(
+                (
+                    acceptance_event.data.get("execution_id")
+                    for acceptance_event in acceptance_events
+                    if acceptance_event.data.get("execution_id") != started_execution_id
+                ),
+                None,
+            )
+            if mismatched is not None:
+                raise PersistenceError(
+                    "Final acceptance execution_id does not match the durable session start.",
+                    operation="append_session_terminal_if_active",
+                    details={
+                        "session_id": event.aggregate_id,
+                        "started_execution_id": started_execution_id,
+                        "acceptance_execution_id": mismatched,
+                        "acceptance_identity_conflict": True,
+                    },
+                )
+
+        for attempt in range(3):
+            try:
+                async with self._engine.connect() as conn:
+                    # SQLite needs an immediate write transaction here. A
+                    # deferred SELECT followed by INSERT leaves a gap in which
+                    # another connection can commit the competing terminal
+                    # event. The unique guard below closes the same absent-row
+                    # race on every supported database backend.
+                    sqlite = conn.dialect.name == "sqlite"
+                    if sqlite:
+                        await conn.exec_driver_sql("BEGIN IMMEDIATE")
+                        transaction = None
+                    else:
+                        transaction = await conn.begin()
+
+                    try:
+                        terminal_query = (
+                            select(events_table.c.id)
+                            .where(
+                                events_table.c.aggregate_type == "session",
+                                events_table.c.aggregate_id == event.aggregate_id,
+                                events_table.c.event_type.in_(_SESSION_TERMINAL_EVENT_TYPES),
+                            )
+                            .limit(1)
+                        )
+                        existing_terminal = await conn.scalar(terminal_query)
+                        if existing_terminal is not None:
+                            if sqlite:
+                                await conn.rollback()
+                            elif transaction is not None:
+                                await transaction.rollback()
+                            return False
+
+                        try:
+                            async with conn.begin_nested():
+                                await conn.execute(
+                                    session_terminal_guards_table.insert().values(
+                                        session_id=event.aggregate_id,
+                                        terminal_event_id=event.id,
+                                        terminal_event_type=event.type,
+                                    )
+                                )
+                        except IntegrityError:
+                            # A concurrent conditional terminal transition won
+                            # the per-session unique guard. Roll back this
+                            # outer transaction before returning the successful
+                            # no-op result; the winner's event remains durable.
+                            if conn.in_transaction():
+                                await conn.rollback()
+                            return False
+
+                        for acceptance_event in acceptance_events:
+                            await self._append_ac_acceptance_in_transaction(conn, acceptance_event)
+
+                        await _insert_event(conn, event, self._picker_projection_ready)
+                        if sqlite:
+                            await conn.commit()
+                        elif transaction is not None:
+                            await transaction.commit()
+                        return True
+                    except BaseException:
+                        if conn.in_transaction():
+                            await conn.rollback()
+                        raise
+            except Exception as e:
+                if "database is locked" in str(e) and attempt < 2:
+                    logger.warning(
+                        "event_store.append_session_terminal_if_active.retry",
+                        extra={"attempt": attempt + 1, "event_id": event.id},
+                    )
+                    await asyncio.sleep(0.1 * (2**attempt))
+                    continue
+                raise PersistenceError(
+                    f"Failed to conditionally append terminal session event: {e}",
+                    operation="append_session_terminal_if_active",
+                    table="events",
+                    details={"event_id": event.id, "event_type": event.type},
+                ) from e
+        raise PersistenceError(
+            "Failed to conditionally append terminal session event after retries.",
+            operation="append_session_terminal_if_active",
+            table="events",
+            details={"event_id": event.id, "event_type": event.type},
+        )
+
+    async def _append_ac_acceptance_in_transaction(
+        self,
+        conn: Any,
+        event: BaseEvent,
+    ) -> bool:
+        """Append one acceptance event using an already-open transaction."""
+        acceptance_generation_id, root_ac_index = _acceptance_key_fields(event)
+        payload_digest = _acceptance_payload_digest(event)
+        existing = await conn.execute(
+            select(ac_acceptance_guards_table.c.payload_digest).where(
+                ac_acceptance_guards_table.c.acceptance_generation_id == acceptance_generation_id,
+                ac_acceptance_guards_table.c.root_ac_index == root_ac_index,
+            )
+        )
+        existing_digest = existing.scalar_one_or_none()
+        if existing_digest is not None:
+            if existing_digest != payload_digest:
+                raise PersistenceError(
+                    "Conflicting final acceptance already exists for authority/root.",
+                    operation="append_ac_acceptance_finalized_if_absent",
+                    table="ac_acceptance_guards",
+                    details={
+                        "acceptance_generation_id": acceptance_generation_id,
+                        "root_ac_index": root_ac_index,
+                        "acceptance_conflict": True,
+                    },
+                )
+            return False
+
+        try:
+            async with conn.begin_nested():
+                await conn.execute(
+                    ac_acceptance_guards_table.insert().values(
+                        acceptance_generation_id=acceptance_generation_id,
+                        root_ac_index=root_ac_index,
+                        final_event_id=event.id,
+                        payload_digest=payload_digest,
+                    )
+                )
+        except IntegrityError:
+            existing = await conn.execute(
+                select(ac_acceptance_guards_table.c.payload_digest).where(
+                    ac_acceptance_guards_table.c.acceptance_generation_id
+                    == acceptance_generation_id,
+                    ac_acceptance_guards_table.c.root_ac_index == root_ac_index,
+                )
+            )
+            existing_digest = existing.scalar_one_or_none()
+            if existing_digest == payload_digest:
+                return False
+            raise PersistenceError(
+                "Conflicting concurrent final acceptance exists for authority/root.",
+                operation="append_ac_acceptance_finalized_if_absent",
+                table="ac_acceptance_guards",
+                details={
+                    "acceptance_generation_id": acceptance_generation_id,
+                    "root_ac_index": root_ac_index,
+                    "acceptance_conflict": True,
+                },
+            )
+
+        await _insert_event(conn, event, self._picker_projection_ready)
+        return True
+
+    async def append_session_pause_if_active(self, event: BaseEvent) -> bool:
+        """Fenced wrapper: admission + settlement for the CAS below.
+
+        Session lifecycle appends dispatch above append()'s settlement
+        path, so they carry their own closing fence and registry entry —
+        a lifecycle event can neither start during close() nor commit
+        after it (review round six).
+        """
+        return await _run_to_settlement(
+            self._append_session_pause_if_active_unfenced(event),
+            registry=self._settling_writes,
+            refuse_when=lambda: self._closing,
+            operation="append_session_pause_if_active",
+        )
+
+    async def _append_session_pause_if_active_unfenced(self, event: BaseEvent) -> bool:
+        """Append PAUSED only while no explicit terminal session event exists.
+
+        Returns ``True`` when the pause event was inserted and ``False`` when
+        a completed, failed, or cancelled event already won.  The terminal
+        check and pause append share one write transaction so a runner cannot
+        preserve live resumable authority beside an already-terminal session.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="append_session_pause_if_active",
+            )
+        if not isinstance(event, BaseEvent):
+            self._raise_invalid_append_input(
+                event,
+                operation="append_session_pause_if_active",
+            )
+        if event.aggregate_type != "session" or event.type != "orchestrator.session.paused":
+            raise PersistenceError(
+                "Conditional session pause append requires an explicit paused session event.",
+                operation="append_session_pause_if_active",
+                table="events",
+                details={
+                    "aggregate_type": event.aggregate_type,
+                    "event_type": event.type,
+                },
+            )
+
+        for attempt in range(3):
+            try:
+                async with self._engine.connect() as conn:
+                    sqlite = conn.dialect.name == "sqlite"
+                    if sqlite:
+                        await conn.exec_driver_sql("BEGIN IMMEDIATE")
+                        transaction = None
+                    else:
+                        transaction = await conn.begin()
+
+                    try:
+                        terminal_query = (
+                            select(events_table.c.id)
+                            .where(
+                                events_table.c.aggregate_type == "session",
+                                events_table.c.aggregate_id == event.aggregate_id,
+                                events_table.c.event_type.in_(_SESSION_TERMINAL_EVENT_TYPES),
+                            )
+                            .limit(1)
+                        )
+                        if await conn.scalar(terminal_query) is not None:
+                            if sqlite:
+                                await conn.rollback()
+                            elif transaction is not None:
+                                await transaction.rollback()
+                            return False
+
+                        await _insert_event(conn, event, self._picker_projection_ready)
+                        if sqlite:
+                            await conn.commit()
+                        elif transaction is not None:
+                            await transaction.commit()
+                        return True
+                    except BaseException:
+                        if conn.in_transaction():
+                            await conn.rollback()
+                        raise
+            except Exception as e:
+                if "database is locked" in str(e) and attempt < 2:
+                    logger.warning(
+                        "event_store.append_session_pause_if_active.retry",
+                        extra={"attempt": attempt + 1, "event_id": event.id},
+                    )
+                    await asyncio.sleep(0.1 * (2**attempt))
+                    continue
+                raise PersistenceError(
+                    f"Failed to conditionally append paused session event: {e}",
+                    operation="append_session_pause_if_active",
+                    table="events",
+                    details={"event_id": event.id, "event_type": event.type},
+                ) from e
+        raise PersistenceError(
+            "Failed to conditionally append paused session event after retries.",
+            operation="append_session_pause_if_active",
+            table="events",
+            details={"event_id": event.id, "event_type": event.type},
+        )
+
+    @staticmethod
+    def is_session_terminal_event(event: object) -> bool:
+        """Return whether ``event`` requires the terminal one-winner append."""
+        return _is_session_terminal_event(event)
+
+    @staticmethod
+    def is_session_start_event(event: object) -> bool:
+        """Return whether ``event`` publishes immutable session identity."""
+        return _is_session_start_event(event)
+
+    @staticmethod
+    def is_ac_acceptance_finalized_event(event: object) -> bool:
+        """Return whether ``event`` requires the Foundation B final gate CAS."""
+        return _is_ac_acceptance_finalized_event(event)
+
+    async def settle_transactional_write[T](
+        self,
+        transaction: Callable[[AsyncEngine], Coroutine[Any, Any, T]],
+        *,
+        operation: str,
+    ) -> T:
+        """Run an external transaction inside this store's write lifecycle.
+        Persistence helpers that need a custom atomic transaction must still
+        share close admission and draining with ordinary EventStore writes.
+        Accepting a factory keeps engine access behind that lifecycle fence,
+        including after the store has closed.
+        """
+        if self._closing:
+            raise PersistenceError(
+                "EventStore is closing; write refused.",
+                operation=operation,
+            )
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation=operation,
+            )
+        return await _run_to_settlement(
+            transaction(self._engine),
+            registry=self._settling_writes,
+            refuse_when=lambda: self._closing,
+            operation=operation,
+        )
+
+    async def append_with_rowid(
+        self,
+        event: BaseEvent,
+        *,
+        _skip_workflow_ir_guard: bool = False,
+    ) -> int:
+        """Append an event and return its exact SQLite rowid."""
+        return await run_with_write_lifecycle(
+            self._append_with_rowid_registered(
+                event,
+                _skip_workflow_ir_guard=_skip_workflow_ir_guard,
+            ),
+            registry=self._settling_writes,
+            refuse_when=lambda: self._closing,
+            operation="append_with_rowid",
+        )
+
+    async def _append_with_rowid_registered(
+        self,
+        event: BaseEvent,
+        *,
+        _skip_workflow_ir_guard: bool = False,
+    ) -> int:
+        """Implement one registered append, including all retries and backoff."""
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="append_with_rowid",
+            )
+        if not isinstance(event, BaseEvent):
+            self._raise_invalid_append_input(event, operation="append_with_rowid")
+        if _is_session_terminal_event(event):
+            raise PersistenceError(
+                "Terminal session lifecycle events must be persisted via append() "
+                "or append_session_terminal_if_active() to preserve the one-winner guard.",
+                operation="append_with_rowid",
+                details={"event_type": event.type, "aggregate_id": event.aggregate_id},
+            )
+        if _is_session_start_event(event):
+            raise PersistenceError(
+                "Session start lifecycle events must be persisted via append() "
+                "or append_session_start_if_absent() to preserve immutable identity.",
+                operation="append_with_rowid",
+                details={"event_type": event.type, "aggregate_id": event.aggregate_id},
+            )
+        if _is_ac_acceptance_finalized_type(event):
+            raise PersistenceError(
+                "Final acceptance events must be carried by a terminal session plan "
+                "to preserve the one-winner guard.",
+                operation="append_with_rowid",
+                details={"event_type": event.type, "aggregate_id": event.aggregate_id},
+            )
+
+        # Guard the workflow IR lifecycle family from direct raw appends:
+        # ``WorkflowLifecycleEvent`` enforces the replay-unsafe key blocklist
+        # at the Pydantic model boundary, so a caller that constructs a raw
+        # ``BaseEvent`` with ``aggregate_type="workflow_ir"`` would bypass
+        # that redaction. Route lifecycle persistence exclusively through
+        # :meth:`append_workflow_lifecycle_event`. The internal-only
+        # ``_skip_workflow_ir_guard`` flag is used by that helper after it has
+        # already validated the event via ``WorkflowLifecycleEvent``.
+        if event.aggregate_type == "workflow_ir" and not _skip_workflow_ir_guard:
+            raise PersistenceError(
+                "Workflow IR lifecycle events must be persisted via "
+                "append_workflow_lifecycle_event() to preserve the "
+                "WorkflowLifecycleEvent redaction guard.",
+                operation="append",
+                details={
+                    "aggregate_type": event.aggregate_type,
+                    "event_type": event.type,
+                },
+            )
+
+        engine = self._engine
+
+        async def _insert_once() -> int:
+            # Shielded by the caller: a transaction, once begun, must commit or
+            # roll back even when the awaiting task is cancelled mid-append.
+            # An abandoned in-flight transaction poisons the pooled connection
+            # and fails the next writer — e.g. a watchdog cancelling a
+            # generation mid-append could then lose its own decision events,
+            # violating the durable-replay contract (#1794).
+            async with engine.begin() as conn:
+                await _insert_event(conn, event, self._picker_projection_ready)
+                rowid = await conn.scalar(
+                    select(text("rowid"))
+                    .select_from(events_table)
+                    .where(events_table.c.id == event.id)
+                )
+                if not isinstance(rowid, int):
+                    raise PersistenceError(
+                        "Inserted event rowid was not returned.",
+                        operation="append_with_rowid",
+                        table="events",
+                        details={"event_id": event.id, "event_type": event.type},
+                    )
+                return rowid
+
+        for attempt in range(3):
+            try:
+                return await _run_to_settlement(
+                    _insert_once(),
+                    registry=self._settling_writes,
+                    refuse_when=lambda: self._closing,
+                    operation="append_with_rowid",
+                )
+            except PersistenceError:
+                raise
+            except Exception as e:
+                if "database is locked" in str(e) and attempt < 2:
+                    logger.warning(
+                        "event_store.append.retry",
+                        extra={"attempt": attempt + 1, "event_id": event.id},
+                    )
+                    await asyncio.sleep(0.1 * (2**attempt))
+                    continue
+                raise PersistenceError(
+                    f"Failed to append event: {e}",
+                    operation="insert",
+                    table="events",
+                    details={"event_id": event.id, "event_type": event.type},
+                ) from e
+        raise PersistenceError(
+            "Failed to append event after retries.",
+            operation="insert",
+            table="events",
+            details={"event_id": event.id, "event_type": event.type},
+        )
+
+    async def append_batch(self, events: list[BaseEvent]) -> None:
+        """Append multiple events atomically in a single transaction.
+
+        All events are inserted in a single transaction. If any insert fails,
+        the entire batch is rolled back, ensuring atomicity.
+
+        This is more efficient than calling append() multiple times and
+        guarantees that either all events are persisted or none are.
+
+        Args:
+            events: List of events to append.
+
+        Raises:
+            PersistenceError: If the batch operation fails. No events
+                             will be persisted if this is raised.
+        """
+        await run_with_write_lifecycle(
+            self._append_batch_registered(events),
+            registry=self._settling_writes,
+            refuse_when=lambda: self._closing,
+            operation="append_batch",
+        )
+
+    async def _append_batch_registered(self, events: list[BaseEvent]) -> None:
+        """Implement one registered batch, including all retries and backoff."""
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="append_batch",
+            )
+
+        if not events:
+            return  # Nothing to do
+        invalid_events = [
+            (index, event) for index, event in enumerate(events) if not isinstance(event, BaseEvent)
+        ]
+        if invalid_events:
+            invalid_index, invalid_event = invalid_events[0]
+            self._raise_invalid_append_input(
+                invalid_event,
+                operation="append_batch",
+                index=invalid_index,
+            )
+
+        session_start_events = [event for event in events if _is_session_start_event(event)]
+        if session_start_events:
+            raise PersistenceError(
+                "Session start lifecycle events cannot use append_batch; persist each "
+                "through append() to preserve immutable session identity.",
+                operation="append_batch",
+                details={
+                    "session_ids": sorted({event.aggregate_id for event in session_start_events})
+                },
+            )
+
+        # Mirror the ``append()`` workflow_ir guard so callers cannot bypass
+        # the ``WorkflowLifecycleEvent`` redaction blocklist by batching raw
+        # ``BaseEvent`` instances. Lifecycle persistence must go through
+        # :meth:`append_workflow_lifecycle_event`, which validates payloads
+        # at the Pydantic boundary before delegating to :meth:`append`.
+        # This check runs BEFORE any DB insert so a single bad row in the
+        # batch refuses the entire transaction.
+        from ouroboros.orchestrator.workflow_lifecycle import (
+            WORKFLOW_LIFECYCLE_AGGREGATE_TYPE,
+        )
+
+        workflow_ir_events = [
+            e for e in events if e.aggregate_type == WORKFLOW_LIFECYCLE_AGGREGATE_TYPE
+        ]
+        if workflow_ir_events:
+            raise PersistenceError(
+                "Workflow IR lifecycle events must be persisted via "
+                "append_workflow_lifecycle_event() and cannot be batched.",
+                operation="append_batch",
+                details={"count": len(workflow_ir_events)},
+            )
+
+        terminal_session_events = [event for event in events if _is_session_terminal_event(event)]
+        if terminal_session_events:
+            raise PersistenceError(
+                "Terminal session lifecycle events cannot be appended in a batch; "
+                "use append() so each session transition takes the one-winner guard.",
+                operation="append_batch",
+                details={"count": len(terminal_session_events)},
+            )
+
+        acceptance_events = [event for event in events if _is_ac_acceptance_finalized_type(event)]
+        if acceptance_events:
+            raise PersistenceError(
+                "Final acceptance events cannot be appended in a batch; carry them "
+                "inside a terminal session plan.",
+                operation="append_batch",
+                details={"count": len(acceptance_events)},
+            )
+
+        engine = self._engine
+
+        async def _insert_batch_once() -> None:
+            # Same cancellation-atomicity contract as append_with_rowid: the
+            # batch transaction must complete or roll back even if the caller
+            # is cancelled mid-append (#1794).
+            async with engine.begin() as conn:
+                await _insert_events(conn, events, self._picker_projection_ready)
+
+        for attempt in range(3):
+            try:
+                await _run_to_settlement(
+                    _insert_batch_once(),
+                    registry=self._settling_writes,
+                    refuse_when=lambda: self._closing,
+                    operation="append_batch",
+                )
+                return
+            except PersistenceError:
+                raise
+            except Exception as e:
+                if "database is locked" in str(e) and attempt < 2:
+                    logger.warning(
+                        "event_store.append_batch.retry",
+                        extra={"attempt": attempt + 1, "batch_size": len(events)},
+                    )
+                    await asyncio.sleep(0.1 * (2**attempt))
+                    continue
+                raise PersistenceError(
+                    f"Failed to append event batch: {e}",
+                    operation="insert_batch",
+                    table="events",
+                    details={
+                        "batch_size": len(events),
+                        "event_ids": [e.id for e in events[:5]],
+                    },
+                ) from e
+
+    async def replay(self, aggregate_type: str, aggregate_id: str) -> list[BaseEvent]:
+        """Replay all events for a specific aggregate.
+
+        The operation uses a transaction for read consistency.
+
+        Args:
+            aggregate_type: The type of aggregate (e.g., "seed", "execution").
+            aggregate_id: The unique identifier of the aggregate.
+
+        Returns:
+            List of events for the aggregate, ordered by timestamp.
+
+        Raises:
+            PersistenceError: If the replay operation fails.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="replay",
+            )
+
+        try:
+            async with self._engine.begin() as conn:
+                result = await conn.execute(
+                    select(events_table)
+                    .where(events_table.c.aggregate_type == aggregate_type)
+                    .where(events_table.c.aggregate_id == aggregate_id)
+                    # Order by timestamp + id for deterministic replay when
+                    # multiple events share the same timestamp resolution.
+                    .order_by(events_table.c.timestamp, events_table.c.id)
+                )
+                rows = result.mappings().all()
+                return [BaseEvent.from_db_row(dict(row)) for row in rows]
+        except Exception as e:
+            raise PersistenceError(
+                f"Failed to replay events: {e}",
+                operation="select",
+                table="events",
+                details={
+                    "aggregate_type": aggregate_type,
+                    "aggregate_id": aggregate_id,
+                },
+            ) from e
+
+    async def get_events_after(
+        self,
+        aggregate_type: str,
+        aggregate_id: str,
+        last_row_id: int = 0,
+        *,
+        limit: int | None = None,
+        max_row_id: int | None = None,
+    ) -> tuple[list[BaseEvent], int]:
+        """Incrementally fetch events for an aggregate after ``last_row_id``
+        (pass 0 for the beginning), returning ``(new events, max rowid seen)``;
+        feed the max rowid back as ``last_row_id`` on the next poll.
+
+        ``limit`` switches the page to rowid order (the cursor dimension) and
+        caps it, so the returned ``max(rowid)`` is a true boundary and a
+        follow-up poll resumes the remainder without skipping rows appended out
+        of timestamp order; ``None`` keeps the unbounded timestamp-ordered
+        fetch other callers rely on. ``max_row_id`` optionally bounds the page
+        inclusively so a caller can re-read exactly the rows at or before an
+        already-chosen global boundary. Raises :class:`PersistenceError` if the
+        query fails.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="get_events_after",
+            )
+
+        try:
+            async with self._engine.begin() as conn:
+                # Use SQLite's implicit rowid for efficient cursor-based pagination.
+                # This avoids deserializing all prior events just to slice the tail.
+                rowid_col = text("rowid")
+                query = (
+                    select(events_table, rowid_col)
+                    .where(events_table.c.aggregate_type == aggregate_type)
+                    .where(events_table.c.aggregate_id == aggregate_id)
+                    .where(text("rowid > :last_id").bindparams(last_id=last_row_id))
+                )
+                if max_row_id is not None:
+                    query = query.where(text("rowid <= :max_id").bindparams(max_id=max_row_id))
+                if limit is not None:
+                    # Page by rowid so max(rowid) is a contiguous boundary; ordering
+                    # a limited page by timestamp could advance the cursor past a
+                    # lower-rowid row appended out of order, skipping it forever.
+                    query = query.order_by(rowid_col).limit(limit)
+                else:
+                    query = query.order_by(events_table.c.timestamp, events_table.c.id)
+                result = await conn.execute(query)
+                rows = result.mappings().all()
+                if not rows:
+                    return [], last_row_id
+                events = [BaseEvent.from_db_row(dict(row)) for row in rows]
+                max_rowid = max(row["rowid"] for row in rows)
+                return events, max_rowid
+        except Exception as e:
+            raise PersistenceError(
+                f"Failed to get events after rowid {last_row_id}: {e}",
+                operation="select",
+                table="events",
+                details={
+                    "aggregate_type": aggregate_type,
+                    "aggregate_id": aggregate_id,
+                    "last_row_id": last_row_id,
+                },
+            ) from e
+
+    async def get_current_rowid(self) -> int:
+        """Return the current maximum event-store rowid.
+
+        Callers can use this as a global cursor baseline before starting work,
+        then query ``rowid > baseline`` across any aggregate discovered later.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="get_current_rowid",
+            )
+
+        try:
+            async with self._engine.begin() as conn:
+                result = await conn.execute(
+                    select(func.coalesce(func.max(text("rowid")), 0)).select_from(events_table)
+                )
+                return int(result.scalar_one() or 0)
+        except Exception as e:
+            raise PersistenceError(
+                f"Failed to get current rowid: {e}",
+                operation="select",
+                table="events",
+            ) from e
+
+    async def get_recent_aggregate_events(
+        self,
+        aggregate_type: str,
+        aggregate_id: str,
+        *,
+        event_types: set[str] | None = None,
+        max_row_id: int | None = None,
+        limit: int = 500,
+    ) -> tuple[list[BaseEvent], int]:
+        """Return the latest bounded rowid page for one aggregate.
+
+        ``get_events_after(..., limit=...)`` pages forward from an old cursor,
+        which is correct for replay but wrong for status rendering that needs
+        the latest visible progress from a long execution. This helper reads
+        the newest matching rowids first, then returns them in ascending cursor
+        order so callers can summarize a bounded recent window without
+        fabricating cursors.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="get_recent_aggregate_events",
+            )
+
+        try:
+            async with self._engine.begin() as conn:
+                rowid_col = text("rowid")
+                query = (
+                    select(events_table, rowid_col)
+                    .where(events_table.c.aggregate_type == aggregate_type)
+                    .where(events_table.c.aggregate_id == aggregate_id)
+                )
+                if event_types:
+                    query = query.where(events_table.c.event_type.in_(sorted(event_types)))
+                if max_row_id is not None:
+                    query = query.where(text("rowid <= :max_id").bindparams(max_id=max_row_id))
+                query = query.order_by(text("rowid DESC")).limit(limit)
+                result = await conn.execute(query)
+                rows = result.mappings().all()
+                if not rows:
+                    return [], max_row_id or 0
+                rows = list(reversed(rows))
+                events = [BaseEvent.from_db_row(dict(row)) for row in rows]
+                max_seen = max(row["rowid"] for row in rows)
+                return events, max_seen
+        except Exception as e:
+            raise PersistenceError(
+                f"Failed to get recent aggregate events: {e}",
+                operation="select",
+                table="events",
+                details={
+                    "aggregate_type": aggregate_type,
+                    "aggregate_id": aggregate_id,
+                    "event_types": sorted(event_types) if event_types else None,
+                    "max_row_id": max_row_id,
+                    "limit": limit,
+                },
+            ) from e
+
+    async def get_recent_events(
+        self, event_type: str | None = None, limit: int = 100
+    ) -> list[BaseEvent]:
+        """Get recent events, optionally filtered by type.
+
+        Args:
+            event_type: Optional event type to filter by.
+            limit: Maximum number of events to return.
+
+        Returns:
+            List of recent events, ordered by timestamp descending.
+
+        Raises:
+            PersistenceError: If the query fails.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="get_recent_events",
+            )
+
+        try:
+            async with self._engine.begin() as conn:
+                query = select(events_table).order_by(events_table.c.timestamp.desc()).limit(limit)
+
+                if event_type:
+                    query = query.where(events_table.c.event_type == event_type)
+
+                result = await conn.execute(query)
+                rows = result.mappings().all()
+                return [BaseEvent.from_db_row(dict(row)) for row in rows]
+        except Exception as e:
+            raise PersistenceError(
+                f"Failed to get recent events: {e}",
+                operation="select",
+                table="events",
+            ) from e
+
+    async def get_all_sessions(self) -> list[BaseEvent]:
+        """Get all session lifecycle events.
+
+        Returns all ``orchestrator.session.*`` events ordered by timestamp
+        ascending so callers can replay them to reconstruct current status.
+
+        Returns:
+            List of session events, ordered by timestamp ascending.
+
+        Raises:
+            PersistenceError: If the query fails.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="get_all_sessions",
+            )
+
+        # Pin the selective ix_events_event_type index. SQLite's planner
+        # otherwise satisfies ORDER BY timestamp by scanning *every* event row
+        # via ix_events_timestamp and filtering inline — a 30s+ query on large
+        # stores, even though session events are a tiny subset. SQLAlchemy/SQLite
+        # ignores with_hint(), so the hint is pinned via raw SQL.
+        # ``.columns(*events_table.c)`` re-attaches the ORM column types so the
+        # raw result gets the same processing as ``select(events_table)`` (notably
+        # JSON payload deserialization); without it from_db_row rejects the
+        # payload string.
+        indexed_query = (
+            text(
+                "SELECT id, aggregate_type, aggregate_id, event_type, payload, "
+                "timestamp, consensus_id FROM events INDEXED BY ix_events_event_type "
+                "WHERE event_type LIKE :pattern "
+                "ORDER BY timestamp ASC"
+            )
+            .bindparams(pattern="orchestrator.session.%")
+            .columns(*events_table.c)
+        )
+        fallback_query = (
+            select(events_table)
+            .where(events_table.c.event_type.like("orchestrator.session.%"))
+            .order_by(events_table.c.timestamp.asc())
+        )
+        try:
+            try:
+                async with self._engine.begin() as conn:
+                    result = await conn.execute(indexed_query)
+                    rows = result.mappings().all()
+                    return [BaseEvent.from_db_row(dict(row)) for row in rows]
+            except OperationalError:
+                # ``INDEXED BY`` makes ix_events_event_type mandatory; SQLite
+                # errors if it is absent (e.g. a store created outside the
+                # bundled schema/migrations). Fall back to the planner's choice
+                # on a fresh transaction so correctness never depends on a
+                # specific index name.
+                async with self._engine.begin() as conn:
+                    result = await conn.execute(fallback_query)
+                    rows = result.mappings().all()
+                    return [BaseEvent.from_db_row(dict(row)) for row in rows]
+        except Exception as e:
+            raise PersistenceError(
+                f"Failed to get all sessions: {e}",
+                operation="select",
+                table="events",
+                details={"event_type": "orchestrator.session.%"},
+            ) from e
+
+    async def get_session_activity_snapshots(self) -> list[SessionActivitySnapshot]:
+        """Return one session snapshot row per session aggregate.
+
+        The snapshot includes session identity from the start event, the most
+        recent session activity timestamp, and the latest status-bearing event
+        or runtime_status payload when present. This avoids replaying every
+        event for every session just to detect stale active sessions.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="get_session_activity_snapshots",
+            )
+
+        status_expr = func.coalesce(
+            func.json_extract(events_table.c.payload, "$.progress.runtime_status"),
+            func.json_extract(events_table.c.payload, "$.runtime_status"),
+        )
+
+        first_session_event_ranked = (
+            select(
+                events_table.c.aggregate_id.label("session_id"),
+                func.json_extract(events_table.c.payload, "$.execution_id").label("execution_id"),
+                func.json_extract(events_table.c.payload, "$.seed_id").label("seed_id"),
+                func.coalesce(
+                    func.json_extract(events_table.c.payload, "$.start_time"),
+                    events_table.c.timestamp,
+                ).label("start_time"),
+                func.row_number()
+                .over(
+                    partition_by=events_table.c.aggregate_id,
+                    order_by=(events_table.c.timestamp.asc(), events_table.c.id.asc()),
+                )
+                .label("rn"),
+            )
+            .where(events_table.c.aggregate_type == "session")
+            .subquery()
+        )
+
+        latest_activity_ranked = (
+            select(
+                events_table.c.aggregate_id.label("session_id"),
+                events_table.c.timestamp.label("last_activity"),
+                func.row_number()
+                .over(
+                    partition_by=events_table.c.aggregate_id,
+                    order_by=(events_table.c.timestamp.desc(), events_table.c.id.desc()),
+                )
+                .label("rn"),
+            )
+            .where(events_table.c.aggregate_type == "session")
+            .subquery()
+        )
+
+        latest_status_ranked = (
+            select(
+                events_table.c.aggregate_id.label("session_id"),
+                events_table.c.event_type.label("status_event_type"),
+                status_expr.label("runtime_status"),
+                func.row_number()
+                .over(
+                    partition_by=events_table.c.aggregate_id,
+                    order_by=(
+                        # Explicit terminal lifecycle is absorbing. A delayed
+                        # progress checkpoint may be newer in wall-clock order,
+                        # but it cannot revive a completed/failed/cancelled
+                        # session in the snapshot path used for orphan cleanup.
+                        case(
+                            (
+                                events_table.c.event_type.in_(_SESSION_TERMINAL_EVENT_TYPES),
+                                0,
+                            ),
+                            else_=1,
+                        ),
+                        events_table.c.timestamp.desc(),
+                        events_table.c.id.desc(),
+                    ),
+                )
+                .label("rn"),
+            )
+            .where(events_table.c.aggregate_type == "session")
+            .where(
+                or_(
+                    events_table.c.event_type.in_(
+                        (
+                            "orchestrator.session.completed",
+                            "orchestrator.session.failed",
+                            "orchestrator.session.paused",
+                            "orchestrator.session.cancelled",
+                        )
+                    ),
+                    and_(
+                        events_table.c.event_type.in_(
+                            (
+                                "orchestrator.progress.updated",
+                                "workflow.progress.updated",
+                            )
+                        ),
+                        status_expr.is_not(None),
+                    ),
+                )
+            )
+            .subquery()
+        )
+
+        try:
+            async with self._engine.begin() as conn:
+                query = (
+                    select(
+                        first_session_event_ranked.c.session_id,
+                        first_session_event_ranked.c.execution_id,
+                        first_session_event_ranked.c.seed_id,
+                        first_session_event_ranked.c.start_time,
+                        latest_activity_ranked.c.last_activity,
+                        latest_status_ranked.c.status_event_type,
+                        latest_status_ranked.c.runtime_status,
+                    )
+                    .select_from(first_session_event_ranked)
+                    .join(
+                        latest_activity_ranked,
+                        and_(
+                            latest_activity_ranked.c.session_id
+                            == first_session_event_ranked.c.session_id,
+                            latest_activity_ranked.c.rn == 1,
+                        ),
+                    )
+                    .outerjoin(
+                        latest_status_ranked,
+                        and_(
+                            latest_status_ranked.c.session_id
+                            == first_session_event_ranked.c.session_id,
+                            latest_status_ranked.c.rn == 1,
+                        ),
+                    )
+                    .where(first_session_event_ranked.c.rn == 1)
+                    .order_by(first_session_event_ranked.c.session_id.asc())
+                )
+
+                result = await conn.execute(query)
+                rows = result.mappings().all()
+                return [
+                    SessionActivitySnapshot(
+                        session_id=row["session_id"],
+                        execution_id=row.get("execution_id"),
+                        seed_id=row.get("seed_id"),
+                        start_time=row.get("start_time"),
+                        last_activity=row.get("last_activity"),
+                        status_event_type=row.get("status_event_type"),
+                        runtime_status=row.get("runtime_status"),
+                    )
+                    for row in rows
+                ]
+        except Exception as e:
+            raise PersistenceError(
+                f"Failed to fetch session activity snapshots: {e}",
+                operation="select",
+                table="events",
+            ) from e
+
+    async def query_events(
+        self,
+        aggregate_id: str | None = None,
+        event_type: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        *,
+        aggregate_type: str | None = None,
+    ) -> list[BaseEvent]:
+        """Query events (timestamp-descending) with optional aggregate-id,
+        event-type, and aggregate-type filters plus limit/offset pagination.
+
+        Raises :class:`PersistenceError` if the store is uninitialized or the
+        query fails.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="query_events",
+            )
+
+        try:
+            async with self._engine.begin() as conn:
+                query = select(events_table).order_by(
+                    events_table.c.timestamp.desc(),
+                    events_table.c.id.desc(),
+                )
+
+                if aggregate_id:
+                    query = query.where(events_table.c.aggregate_id == aggregate_id)
+
+                if event_type:
+                    query = query.where(events_table.c.event_type == event_type)
+
+                if aggregate_type:
+                    query = query.where(events_table.c.aggregate_type == aggregate_type)
+
+                query = query.limit(limit).offset(offset)
+
+                result = await conn.execute(query)
+                rows = result.mappings().all()
+                return [BaseEvent.from_db_row(dict(row)) for row in rows]
+        except Exception as e:
+            raise PersistenceError(
+                f"Failed to query events: {e}",
+                operation="select",
+                table="events",
+                details={
+                    "aggregate_id": aggregate_id,
+                    "aggregate_type": aggregate_type,
+                    "event_type": event_type,
+                    "limit": limit,
+                    "offset": offset,
+                },
+            ) from e
+
+    async def count_events(self) -> int:
+        """Count all persisted events; requires :meth:`initialize` first."""
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="count_events",
+            )
+        try:
+            async with self._engine.begin() as conn:
+                result = await conn.execute(select(func.count()).select_from(events_table))
+                return int(result.scalar_one())
+        except Exception as e:
+            raise PersistenceError(
+                f"Failed to count events: {e}",
+                operation="select",
+                table="events",
+            ) from e
+
+    async def query_latest_events_per_aggregate(
+        self,
+        *,
+        aggregate_type: str,
+        event_types: set[str],
+        preferred_event_type: str | None = None,
+        preferred_event_types: set[str] | None = None,
+        preferred_event_statuses: set[str] | None = None,
+        preserve_session_candidates: bool = False,
+        aggregate_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[BaseEvent]:
+        """Return deterministic latest aggregate or aggregate-session events."""
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="query_latest_events_per_aggregate",
+            )
+
+        preferred_conditions = []
+        preferred_types = set(preferred_event_types or ())
+        if preferred_types:
+            preferred_conditions.append(events_table.c.event_type.in_(sorted(preferred_types)))
+        if preferred_event_type is not None:
+            preferred_condition = events_table.c.event_type == preferred_event_type
+            if preferred_event_statuses:
+                preferred_condition = and_(
+                    preferred_condition,
+                    func.lower(
+                        func.trim(
+                            func.json_extract(events_table.c.payload, "$.status"),
+                            _PYTHON_STRIP_WHITESPACE,
+                        )
+                    ).in_(sorted(preferred_event_statuses)),
+                )
+            preferred_conditions.append(preferred_condition)
+        priority = case((or_(*preferred_conditions), 0), else_=1) if preferred_conditions else 0
+        raw_session_id = func.json_extract(events_table.c.payload, "$.session_id")
+        normalized_session_id = func.nullif(
+            func.trim(raw_session_id, _PYTHON_STRIP_WHITESPACE),
+            "",
+        )
+        session_key = func.coalesce(
+            case(
+                (
+                    func.json_type(events_table.c.payload, "$.session_id") == "text",
+                    normalized_session_id,
+                ),
+                else_=None,
+            ),
+            events_table.c.aggregate_id,
+        )
+        session_rank = (
+            func.row_number()
+            .over(
+                partition_by=(events_table.c.aggregate_id, session_key),
+                order_by=(priority, events_table.c.timestamp.desc(), events_table.c.id.desc()),
+            )
+            .label("session_rank")
+        )
+        ranked_sessions_query = (
+            select(*events_table.c, session_rank)
+            .where(events_table.c.aggregate_type == aggregate_type)
+            .where(events_table.c.event_type.in_(sorted(event_types)))
+        )
+        if aggregate_id is not None:
+            ranked_sessions_query = ranked_sessions_query.where(
+                events_table.c.aggregate_id == aggregate_id
+            )
+        ranked_sessions = ranked_sessions_query.subquery()
+        session_events = (
+            select(ranked_sessions).where(ranked_sessions.c.session_rank == 1).subquery()
+        )
+        if preserve_session_candidates:
+            query = select(session_events).order_by(
+                session_events.c.timestamp.desc(),
+                session_events.c.id.desc(),
+            )
+        else:
+            aggregate_rank = (
+                func.row_number()
+                .over(
+                    partition_by=session_events.c.aggregate_id,
+                    order_by=(session_events.c.timestamp.desc(), session_events.c.id.desc()),
+                )
+                .label("aggregate_rank")
+            )
+            ranked_aggregates = select(session_events, aggregate_rank).subquery()
+            query = (
+                select(ranked_aggregates)
+                .where(ranked_aggregates.c.aggregate_rank == 1)
+                .order_by(
+                    ranked_aggregates.c.timestamp.desc(),
+                    ranked_aggregates.c.id.desc(),
+                )
+            )
+        if limit is not None:
+            query = query.limit(limit)
+
+        try:
+            async with self._engine.begin() as conn:
+                result = await conn.execute(query)
+                return [BaseEvent.from_db_row(dict(row)) for row in result.mappings().all()]
+        except Exception as exc:
+            raise PersistenceError(
+                f"Failed to query latest aggregate events: {exc}",
+                operation="select",
+                table="events",
+                details={
+                    "aggregate_type": aggregate_type,
+                    "event_types": sorted(event_types),
+                    "preferred_event_type": preferred_event_type,
+                    "preferred_event_types": sorted(preferred_event_types or ()),
+                    "preferred_event_statuses": sorted(preferred_event_statuses or ()),
+                    "preserve_session_candidates": preserve_session_candidates,
+                    "aggregate_id": aggregate_id,
+                    "limit": limit,
+                },
+            ) from exc
+
+    async def query_session_related_events(
+        self,
+        session_id: str,
+        execution_id: str | None = None,
+        event_type: str | None = None,
+        limit: int | None = 50,
+        offset: int = 0,
+    ) -> list[BaseEvent]:
+        """Query events across the session aggregate and related parallel scopes.
+
+        Parallel execution stores activity in several aggregate families:
+        - ``session/<session_id>`` for top-level session state
+        - ``execution/<execution_id>`` for workflow progress
+        - ``execution/*`` runtime scopes whose payload references the session,
+          exact execution ID, or exact parent execution ID
+
+        Related execution scopes are matched through persisted ``session_id`` /
+        ``execution_id`` / ``parent_execution_id`` payload fields instead of
+        normalized aggregate-name prefixes. Runtime aggregate names intentionally
+        normalize dynamic IDs for filesystem/path safety, so using those lossy
+        names as join keys can collide across distinct executions.
+
+        Args:
+            session_id: Orchestrator session ID.
+            execution_id: Optional execution ID. If omitted, it is resolved from
+                the session's start event when possible.
+            event_type: Optional event-type filter.
+            limit: Maximum number of events to return. ``None`` returns all.
+            offset: Number of events to skip for pagination.
+
+        Returns:
+            Matching events ordered by timestamp descending.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="query_session_related_events",
+            )
+
+        resolved_execution_id = execution_id or await self._resolve_execution_id_for_session(
+            session_id,
+        )
+        session_started_at = await self._resolve_session_started_at(session_id)
+
+        conditions = _session_related_event_conditions(session_id, resolved_execution_id)
+        if not conditions:
+            # Fail closed: a blank session with no resolvable execution produces zero
+            # scope predicates, and ``or_()`` over an empty list emits NO WHERE clause
+            # — SQLAlchemy would then return the ENTIRE store. Select nothing instead.
+            return []
+
+        try:
+            async with self._engine.begin() as conn:
+                query = (
+                    select(events_table)
+                    .where(or_(*conditions))
+                    .order_by(events_table.c.timestamp.desc())
+                )
+                if session_started_at is not None:
+                    query = query.where(events_table.c.timestamp >= session_started_at)
+
+                if event_type:
+                    query = query.where(events_table.c.event_type == event_type)
+
+                if limit is not None:
+                    query = query.limit(limit).offset(offset)
+                elif offset:
+                    query = query.offset(offset)
+
+                result = await conn.execute(query)
+                rows = result.mappings().all()
+                return [BaseEvent.from_db_row(dict(row)) for row in rows]
+        except Exception as e:
+            raise PersistenceError(
+                f"Failed to query session-related events: {e}",
+                operation="select",
+                table="events",
+                details={
+                    "session_id": session_id,
+                    "execution_id": resolved_execution_id,
+                    "event_type": event_type,
+                    "limit": limit,
+                    "offset": offset,
+                },
+            ) from e
+
+    async def query_execution_related_events(
+        self,
+        execution_id: str,
+        event_type: str | None = None,
+        limit: int | None = 50,
+        offset: int = 0,
+        payload_equals: dict[str, str | int | float | bool | None] | None = None,
+        *,
+        chronological: bool = False,
+        cursor_after: tuple[datetime, str] | None = None,
+        cursor_through: tuple[datetime, str] | None = None,
+    ) -> list[BaseEvent]:
+        """Query events for an execution and its child/runtime scopes.
+
+        This is the execution-only counterpart to
+        :meth:`query_session_related_events`: it includes the root execution
+        aggregate plus events whose payload links back through ``execution_id``
+        or ``parent_execution_id``. Optional top-level payload equality filters
+        are applied in SQL before ordering, offset, and limit so a bounded query
+        cannot be crowded out by unrelated events of the same type. Set
+        ``chronological`` for deterministic oldest-first pagination; both orders
+        include the event ID as a tie-breaker so page boundaries cannot skip or
+        duplicate equal-timestamp events. ``cursor_after`` and
+        ``cursor_through`` provide an inclusive high-water snapshot with an
+        exclusive keyset cursor, avoiding both offset drift and unbounded
+        materialization for replay callers.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="query_execution_related_events",
+            )
+
+        conditions = [
+            events_table.c.aggregate_id == execution_id,
+            func.json_extract(events_table.c.payload, "$.execution_id") == execution_id,
+            func.json_extract(events_table.c.payload, "$.parent_execution_id") == execution_id,
+        ]
+
+        try:
+            async with self._engine.begin() as conn:
+                query = (
+                    select(events_table)
+                    .where(events_table.c.aggregate_type == "execution")
+                    .where(or_(*conditions))
+                )
+
+                query = query.order_by(
+                    *(
+                        (events_table.c.timestamp.asc(), events_table.c.id.asc())
+                        if chronological
+                        else (events_table.c.timestamp.desc(), events_table.c.id.desc())
+                    )
+                )
+
+                if event_type:
+                    query = query.where(events_table.c.event_type == event_type)
+
+                if cursor_after is not None or cursor_through is not None:
+                    if not chronological:
+                        raise ValueError("execution event cursors require chronological order")
+                    for cursor_name, cursor in (
+                        ("cursor_after", cursor_after),
+                        ("cursor_through", cursor_through),
+                    ):
+                        if cursor is not None and (
+                            type(cursor) is not tuple
+                            or len(cursor) != 2
+                            or not isinstance(cursor[0], datetime)
+                            or type(cursor[1]) is not str
+                            or not cursor[1]
+                        ):
+                            raise ValueError(f"{cursor_name} is invalid")
+                    if cursor_after is not None:
+                        after_timestamp, after_id = cursor_after
+                        query = query.where(
+                            or_(
+                                events_table.c.timestamp > after_timestamp,
+                                and_(
+                                    events_table.c.timestamp == after_timestamp,
+                                    events_table.c.id > after_id,
+                                ),
+                            )
+                        )
+                    if cursor_through is not None:
+                        through_timestamp, through_id = cursor_through
+                        query = query.where(
+                            or_(
+                                events_table.c.timestamp < through_timestamp,
+                                and_(
+                                    events_table.c.timestamp == through_timestamp,
+                                    events_table.c.id <= through_id,
+                                ),
+                            )
+                        )
+
+                if payload_equals:
+                    if type(payload_equals) is not dict or len(payload_equals) > 8:
+                        raise ValueError(
+                            "execution-related payload filters require a bounded built-in dict"
+                        )
+                    for field, value in payload_equals.items():
+                        if (
+                            type(field) is not str
+                            or not field
+                            or not field.isascii()
+                            or (not field[0].isalpha() and field[0] != "_")
+                            or not field.replace("_", "").isalnum()
+                            or (value is not None and type(value) not in {str, int, float, bool})
+                        ):
+                            raise ValueError(
+                                "execution-related payload filters require "
+                                "top-level ASCII identifier keys and JSON scalar values"
+                            )
+                        query = query.where(
+                            func.json_extract(events_table.c.payload, f"$.{field}") == value
+                        )
+
+                if limit is not None:
+                    query = query.limit(limit).offset(offset)
+                elif offset:
+                    query = query.offset(offset)
+
+                result = await conn.execute(query)
+                rows = result.mappings().all()
+                return [BaseEvent.from_db_row(dict(row)) for row in rows]
+        except Exception as e:
+            raise PersistenceError(
+                f"Failed to query execution-related events: {e}",
+                operation="select",
+                table="events",
+                details={
+                    "execution_id": execution_id,
+                    "event_type": event_type,
+                    "limit": limit,
+                    "offset": offset,
+                    "payload_equals": dict(payload_equals or {}),
+                    "chronological": chronological,
+                    "cursor_after": cursor_after,
+                    "cursor_through": cursor_through,
+                },
+            ) from e
+
+    async def get_latest_execution_job_status(self, execution_id: str) -> str | None:
+        """Return the latest background-job status linked to an execution.
+
+        AC runtime lifecycle rows can remain non-terminal when an stdio MCP host
+        shuts down and interrupts the owning job. Synapse discovery uses this
+        status as a fail-closed execution-generation guard so a later MCP process
+        never advertises those abandoned attempts as live targets.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="get_latest_execution_job_status",
+            )
+
+        try:
+            async with self._engine.begin() as conn:
+                created_query = (
+                    select(events_table.c.aggregate_id)
+                    .where(events_table.c.aggregate_type == "job")
+                    .where(events_table.c.event_type == "mcp.job.created")
+                    .where(
+                        func.json_extract(events_table.c.payload, "$.links.execution_id")
+                        == execution_id
+                    )
+                    .order_by(events_table.c.timestamp.desc())
+                    .limit(1)
+                )
+                created_result = await conn.execute(created_query)
+                row = created_result.first()
+                if row is None:
+                    return None
+
+                latest_query = (
+                    select(events_table.c.payload)
+                    .where(events_table.c.aggregate_type == "job")
+                    .where(events_table.c.aggregate_id == row[0])
+                    .order_by(events_table.c.timestamp.desc())
+                    .limit(1)
+                )
+                latest_result = await conn.execute(latest_query)
+                latest = latest_result.first()
+                if latest is None or not isinstance(latest[0], Mapping):
+                    return None
+                status = latest[0].get("status")
+                return status.strip() if isinstance(status, str) and status.strip() else None
+        except Exception as e:
+            raise PersistenceError(
+                f"Failed to resolve latest execution job status: {e}",
+                operation="select",
+                table="events",
+                details={"execution_id": execution_id},
+            ) from e
+
+    async def query_session_signal_events(
+        self,
+        *,
+        execution_id: str,
+        session_scope_id: str,
+        session_attempt_id: str,
+    ) -> list[BaseEvent]:
+        """Return one exact target's SessionSignal history in replay order."""
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="query_session_signal_events",
+            )
+        try:
+            async with self._engine.begin() as conn:
+                query = (
+                    select(events_table)
+                    .where(events_table.c.aggregate_type == "session_signal")
+                    .where(
+                        func.json_extract(events_table.c.payload, "$.expected_execution_id")
+                        == execution_id
+                    )
+                    .where(
+                        func.json_extract(
+                            events_table.c.payload,
+                            "$.target_session_scope_id",
+                        )
+                        == session_scope_id
+                    )
+                    .where(
+                        func.json_extract(
+                            events_table.c.payload,
+                            "$.target_session_attempt_id",
+                        )
+                        == session_attempt_id
+                    )
+                    .order_by(events_table.c.timestamp.asc())
+                )
+                result = await conn.execute(query)
+                return [BaseEvent.from_db_row(dict(row)) for row in result.mappings().all()]
+        except Exception as e:
+            raise PersistenceError(
+                f"Failed to query SessionSignal events: {e}",
+                operation="select",
+                table="events",
+                details={
+                    "execution_id": execution_id,
+                    "session_scope_id": session_scope_id,
+                    "session_attempt_id": session_attempt_id,
+                },
+            ) from e
+
+    async def query_session_related_events_after(
+        self,
+        session_id: str,
+        execution_id: str | None = None,
+        event_type: str | None = None,
+        last_row_id: int = 0,
+        *,
+        limit: int | None = None,
+        max_row_id: int | None = None,
+    ) -> tuple[list[BaseEvent], int]:
+        """Incrementally query events across a session and related execution scopes.
+
+        This is the multi-aggregate equivalent of ``get_events_after``. It uses
+        the same exact session/execution payload predicates as
+        ``query_session_related_events`` while advancing a single rowid cursor.
+
+        When ``limit`` is set the page is ordered by ``rowid`` and capped, so a
+        stale or first-time poll over a long-running session cannot load an
+        unbounded result set and the returned ``max(rowid)`` is a true boundary
+        a follow-up poll resumes from without skipping rows appended out of
+        timestamp order. ``max_row_id`` bounds the read to ``rowid <= max_row_id``
+        for callers that have already chosen a global page boundary. ``None``
+        for both keeps the unbounded timestamp-ordered fetch.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="query_session_related_events_after",
+            )
+
+        resolved_execution_id = execution_id or await self._resolve_execution_id_for_session(
+            session_id,
+        )
+        session_started_at = await self._resolve_session_started_at(session_id)
+        conditions = _session_related_event_conditions(session_id, resolved_execution_id)
+        if not conditions:
+            # Fail closed (see query_session_related_events): ``or_()`` over an empty
+            # list emits NO WHERE clause and would scan the whole store. A blank scope
+            # must yield no rows and leave the cursor unchanged so the poll is idempotent.
+            return [], last_row_id
+
+        try:
+            async with self._engine.begin() as conn:
+                rowid_col = text("rowid")
+                query = (
+                    select(events_table, rowid_col)
+                    .where(or_(*conditions))
+                    .where(text("rowid > :last_id").bindparams(last_id=last_row_id))
+                )
+                if max_row_id is not None:
+                    query = query.where(text("rowid <= :max_id").bindparams(max_id=max_row_id))
+                if session_started_at is not None:
+                    query = query.where(events_table.c.timestamp >= session_started_at)
+
+                if event_type:
+                    query = query.where(events_table.c.event_type == event_type)
+
+                if limit is not None:
+                    # Page by rowid (see get_events_after) so the cursor boundary
+                    # is skip-safe even when timestamp order diverges from rowid.
+                    query = query.order_by(rowid_col).limit(limit)
+                else:
+                    query = query.order_by(events_table.c.timestamp, events_table.c.id)
+
+                result = await conn.execute(query)
+                rows = result.mappings().all()
+                if not rows:
+                    return [], last_row_id
+
+                events = [BaseEvent.from_db_row(dict(row)) for row in rows]
+                max_rowid = max(row["rowid"] for row in rows)
+                return events, max_rowid
+        except Exception as e:
+            raise PersistenceError(
+                f"Failed to query session-related events after rowid {last_row_id}: {e}",
+                operation="select",
+                table="events",
+                details={
+                    "session_id": session_id,
+                    "execution_id": resolved_execution_id,
+                    "event_type": event_type,
+                    "last_row_id": last_row_id,
+                },
+            ) from e
+
+    async def _resolve_execution_id_for_session(self, session_id: str) -> str | None:
+        """Return the execution ID referenced by a session start event, if present."""
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="resolve_execution_id_for_session",
+            )
+
+        async with self._engine.begin() as conn:
+            query = (
+                select(events_table)
+                .where(events_table.c.aggregate_type == "session")
+                .where(events_table.c.aggregate_id == session_id)
+                .where(events_table.c.event_type == "orchestrator.session.started")
+                .order_by(events_table.c.timestamp.asc())
+                .limit(1)
+            )
+            result = await conn.execute(query)
+            row = result.mappings().first()
+            if row is None:
+                return None
+            payload = row.get("payload")
+            if isinstance(payload, Mapping):
+                execution_id = payload.get("execution_id")
+                if isinstance(execution_id, str) and execution_id:
+                    return execution_id
+            return None
+
+    async def _resolve_acceptance_root_indices_for_session(
+        self,
+        session_id: str,
+    ) -> set[int] | None:
+        """Return the immutable root set for current-format sessions.
+
+        A missing field is deliberately returned as ``None`` for historical
+        sessions.  Current sessions persist the field at publication time,
+        including an explicit empty set for a zero-AC execution; terminal CAS
+        then requires an exact plan match before it can win.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="resolve_acceptance_root_indices_for_session",
+            )
+
+        async with self._engine.begin() as conn:
+            query = (
+                select(events_table.c.payload)
+                .where(events_table.c.aggregate_type == "session")
+                .where(events_table.c.aggregate_id == session_id)
+                .where(events_table.c.event_type == "orchestrator.session.started")
+                .order_by(events_table.c.timestamp.asc())
+                .limit(1)
+            )
+            result = await conn.execute(query)
+            row = result.first()
+            if row is None:
+                return None
+            payload = row[0]
+            if not isinstance(payload, Mapping):
+                raise PersistenceError(
+                    "Durable session-start payload is malformed.",
+                    operation="resolve_acceptance_root_indices_for_session",
+                    details={"session_id": session_id},
+                )
+            if "acceptance_root_indices" not in payload:
+                return None
+            return set(
+                _normalize_durable_acceptance_root_indices(
+                    payload["acceptance_root_indices"],
+                    session_id=session_id,
+                    operation="resolve_acceptance_root_indices_for_session",
+                )
+            )
+
+    async def _resolve_session_started_at(self, session_id: str) -> Any | None:
+        """Return the persisted start timestamp for a session, if available."""
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="resolve_session_started_at",
+            )
+
+        async with self._engine.begin() as conn:
+            query = (
+                select(events_table.c.timestamp)
+                .where(events_table.c.aggregate_type == "session")
+                .where(events_table.c.aggregate_id == session_id)
+                .where(events_table.c.event_type == "orchestrator.session.started")
+                .order_by(events_table.c.timestamp.asc())
+                .limit(1)
+            )
+            result = await conn.execute(query)
+            row = result.first()
+            return row[0] if row is not None else None
+
+    async def get_all_lineages(self) -> list[BaseEvent]:
+        """Get all lineage creation events.
+
+        Retrieves all events of type 'lineage.created' to identify every
+        evolutionary lineage recorded in the event store.
+
+        Returns:
+            List of lineage creation events, ordered by timestamp descending.
+
+        Raises:
+            PersistenceError: If the query fails.
+        """
+        if self._engine is None:
+            raise PersistenceError(
+                "EventStore not initialized. Call initialize() first.",
+                operation="get_all_lineages",
+            )
+
+        try:
+            async with self._engine.begin() as conn:
+                query = (
+                    select(events_table)
+                    .where(events_table.c.event_type == "lineage.created")
+                    .order_by(events_table.c.timestamp.desc())
+                )
+
+                result = await conn.execute(query)
+                rows = result.mappings().all()
+                return [BaseEvent.from_db_row(dict(row)) for row in rows]
+        except Exception as e:
+            raise PersistenceError(
+                f"Failed to get all lineages: {e}",
+                operation="select",
+                table="events",
+                details={"event_type": "lineage.created"},
+            ) from e
+
+    async def append_workflow_lifecycle_event(
+        self,
+        lifecycle_event: WorkflowLifecycleEvent,
+    ) -> None:
+        """Append a workflow IR lifecycle event to the durable event family.
+
+        This is an additive registration of the #956 workflow lifecycle
+        event family. The helper accepts a
+        ``WorkflowLifecycleEvent`` and persists it through the existing
+        :meth:`append` path so no new database column or table is
+        introduced. The event is routed under the
+        ``WORKFLOW_LIFECYCLE_AGGREGATE_TYPE`` aggregate, leaving all other
+        event families untouched.
+
+        Args:
+            lifecycle_event: A
+                :class:`ouroboros.orchestrator.workflow_lifecycle.WorkflowLifecycleEvent`.
+                Imported lazily to avoid an import cycle between
+                ``persistence`` and ``orchestrator``.
+
+        Raises:
+            PersistenceError: If the append operation fails.
+        """
+        from ouroboros.orchestrator.workflow_lifecycle import (
+            WORKFLOW_LIFECYCLE_AGGREGATE_TYPE,
+            WORKFLOW_LIFECYCLE_EVENT_TYPES,
+            WorkflowLifecycleEvent,
+        )
+
+        if not isinstance(lifecycle_event, WorkflowLifecycleEvent):
+            raise PersistenceError(
+                "append_workflow_lifecycle_event requires a WorkflowLifecycleEvent.",
+                operation="append_workflow_lifecycle_event",
+                details={"received_type": type(lifecycle_event).__name__},
+            )
+
+        base_event = lifecycle_event.to_base_event()
+        # Defensive registration check: every persisted lifecycle row
+        # belongs to the workflow IR family and uses a registered event
+        # type. Foreign or unknown event types must be rejected before
+        # they reach the existing event-store sanitization layer.
+        if base_event.aggregate_type != WORKFLOW_LIFECYCLE_AGGREGATE_TYPE:
+            raise PersistenceError(
+                "Workflow lifecycle event has an unexpected aggregate_type.",
+                operation="append_workflow_lifecycle_event",
+                details={
+                    "expected": WORKFLOW_LIFECYCLE_AGGREGATE_TYPE,
+                    "received": base_event.aggregate_type,
+                },
+            )
+        if base_event.type not in WORKFLOW_LIFECYCLE_EVENT_TYPES:
+            raise PersistenceError(
+                "Workflow lifecycle event_type is not registered.",
+                operation="append_workflow_lifecycle_event",
+                details={"event_type": base_event.type},
+            )
+        # Bypass the ``workflow_ir`` guard in :meth:`append` because the
+        # caller-side ``WorkflowLifecycleEvent`` validation above is the
+        # authoritative redaction boundary. The guard exists to refuse
+        # *direct* raw appends; this helper has already enforced the
+        # equivalent invariants.
+        await self.append(base_event, _skip_workflow_ir_guard=True)
+
+    async def replay_workflow_lifecycle(
+        self,
+        workflow_id: str,
+    ) -> list[WorkflowLifecycleEvent]:
+        """Replay durable workflow lifecycle events for a workflow id.
+
+        Returns a list of
+        :class:`ouroboros.orchestrator.workflow_lifecycle.WorkflowLifecycleEvent`
+        instances rehydrated from persisted ``BaseEvent`` rows. Other
+        event families are not consulted.
+        """
+        from pydantic import ValidationError
+
+        from ouroboros.orchestrator.workflow_lifecycle import (
+            WORKFLOW_LIFECYCLE_AGGREGATE_TYPE,
+            WorkflowLifecycleEvent,
+        )
+
+        base_events = await self.replay(WORKFLOW_LIFECYCLE_AGGREGATE_TYPE, workflow_id)
+        rehydrated: list[WorkflowLifecycleEvent] = []
+        for base in base_events:
+            try:
+                rehydrated.append(WorkflowLifecycleEvent.from_base_event(base))
+            except (ValueError, ValidationError) as exc:
+                # A malformed row must not crash the entire replay. The
+                # :meth:`append` guard prevents new bypasses, but historical
+                # rows from before that guard (or rows inserted via direct
+                # SQL during recovery) can still fail strict rehydration —
+                # skip and log so the rest of the slice remains usable.
+                # The raw exception text can echo back replay-unsafe payload
+                # values when the malformed row was populated from a poisoned
+                # source, so emit only safe metadata and the exception class.
+                logger.warning(
+                    "event_store.replay_workflow_lifecycle.skip_malformed",
+                    extra={
+                        "event_id": getattr(base, "id", None),
+                        "event_type": getattr(base, "type", None),
+                        "aggregate_id": getattr(base, "aggregate_id", None),
+                        "error": type(exc).__name__,
+                    },
+                )
+                continue
+        return rehydrated
+
+    async def replay_lineage(self, lineage_id: str) -> list[BaseEvent]:
+        """Replay all events for a lineage aggregate.
+
+        Convenience method for evolutionary loop lineage reconstruction.
+
+        Args:
+            lineage_id: The unique identifier of the lineage.
+
+        Returns:
+            List of lineage events, ordered by timestamp.
+
+        Raises:
+            PersistenceError: If the replay operation fails.
+        """
+        return await self.replay("lineage", lineage_id)
+
+    async def checkpoint_wal(self) -> bool:
+        """Best-effort WAL TRUNCATE checkpoint without closing the store.
+
+        Collapses the WAL back into the main DB. Without an explicit TRUNCATE
+        checkpoint, long-lived multi-connection setups (many concurrent
+        MCP/TUI sessions) let the -wal file grow unbounded: passive
+        autocheckpoints cannot truncate while any other reader is active, so
+        the file only ever appends. Long-lived *idle* servers can call this
+        periodically so they stop pinning a growing WAL between requests.
+
+        Uses a short per-connection busy_timeout instead of the 30s default
+        (set in initialize()): the checkpoint needs the write lock, and a
+        peer process mid-write could otherwise stall the caller for up to
+        30s. A missed checkpoint is harmless — a later attempt retries — so
+        the wait is capped at ~2s. ``connect()`` (not ``begin()``) avoids an
+        upfront BEGIN IMMEDIATE; the checkpoint acquires its own lock under
+        the bounded timeout.
+
+        Returns:
+            True when the checkpoint ran, False when skipped or it failed
+            (read-only store, no engine, lock contention).
+        """
+        if self._engine is None or self._read_only:
+            return False
+        try:
+            async with self._engine.connect() as conn:
+                await conn.exec_driver_sql("PRAGMA busy_timeout=2000")
+                await conn.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            return False
+        return True
+
+    async def close(self) -> None:
+        """Close the database connection.
+
+        Drains settling writes first: a transaction that outlived a cancelled
+        caller must land before the WAL checkpoint and engine disposal, or
+        durable history could change after shutdown (review round four).
+        """
+        async with self._lifecycle_lock:
+            self._closing = True
+            try:
+                while self._settling_writes:
+                    done, _ = await asyncio.wait(tuple(self._settling_writes))
+                    for task in done:
+                        if not task.cancelled() and task.exception() is not None:
+                            logger.debug(
+                                "event_store.close.drained_failed_write",
+                                exc_info=task.exception(),
+                            )
+                if self._engine is not None:
+                    # Collapse the WAL before disposing so the -wal file does
+                    # not survive shutdown. Best effort — see checkpoint_wal().
+                    await self.checkpoint_wal()
+                    await self._engine.dispose()
+                    self._engine = None
+                    self._initialized = False
+                if self._memory_keepalive is not None:
+                    # Release the shared in-memory database anchor last so
+                    # pooled connections never observe the database
+                    # disappearing mid-dispose.
+                    try:
+                        self._memory_keepalive.close()
+                    finally:
+                        self._memory_keepalive = None
+            except asyncio.CancelledError:
+                # A cancelled close must leave a recoverable lifecycle, not a
+                # permanently closing store: writes drained so far are
+                # durable, and if the engine still exists the store stays
+                # usable (review round eight).
+                if self._engine is not None:
+                    self._closing = False
+                raise
+
+
+@dataclass(frozen=True, slots=True)
+class SessionActivitySnapshot:
+    """Session start/activity/status summary used by orphan detection."""
+
+    session_id: str
+    execution_id: str | None
+    seed_id: str | None
+    start_time: str | None
+    last_activity: object
+    status_event_type: str | None
+    runtime_status: str | None

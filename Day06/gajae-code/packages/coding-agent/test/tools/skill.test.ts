@@ -1,0 +1,965 @@
+import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { Model } from "@gajae-code/ai";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { clearPluginRootsAndCaches } from "@gajae-code/coding-agent/discovery/helpers";
+import type { Skill } from "@gajae-code/coding-agent/extensibility/skills";
+import { loadSkills } from "@gajae-code/coding-agent/extensibility/skills";
+import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
+import type { ToolSession } from "@gajae-code/coding-agent/tools";
+import { SkillTool } from "@gajae-code/coding-agent/tools/skill";
+import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
+import { safeRm } from "../../../../scripts/safe-cleanup";
+
+async function makeSkill(name: string, content: string): Promise<Skill> {
+	const dir = await mkdtemp(path.join(os.tmpdir(), `skill-tool-${name}-`));
+	const filePath = path.join(dir, "SKILL.md");
+	await writeFile(filePath, content, "utf8");
+	return {
+		name,
+		description: `${name} test skill`,
+		filePath,
+		baseDir: dir,
+		source: "test",
+		content,
+	};
+}
+
+interface CapturedSend {
+	message: { customType: string; content: unknown; details?: unknown; attribution?: string };
+	options?: { deliverAs?: string; triggerTurn?: boolean };
+}
+
+async function makeTempCwd(): Promise<string> {
+	return mkdtemp(path.join(os.tmpdir(), "skill-tool-cwd-"));
+}
+
+async function makeRuntimeSkill(root: string, name: string, description: string, body: string): Promise<string> {
+	const dir = path.join(root, name);
+	const filePath = path.join(dir, "SKILL.md");
+	await fs.mkdir(dir, { recursive: true });
+	await fs.writeFile(
+		filePath,
+		`---
+name: ${name}
+description: ${description}
+---
+
+${body}
+`,
+		"utf8",
+	);
+	return filePath;
+}
+
+function runtimeSkillSettings(): Settings {
+	return Settings.isolated({
+		"skill.enabled": true,
+		"skills.enabled": true,
+		"skills.enablePiProject": true,
+		"skills.enablePiUser": true,
+	});
+}
+
+function encodeSessionSegment(value: string): string {
+	return encodeURIComponent(value).replaceAll(".", "%2E");
+}
+
+function stateBaseDir(cwd: string, sessionId?: string): string {
+	if (!sessionId) return path.join(cwd, ".gjc", "_session-test", "state");
+	return path.join(cwd, ".gjc", `_session-${encodeSessionSegment(sessionId)}`, "state");
+}
+
+async function writeCallerModeState(
+	cwd: string,
+	skill: string,
+	currentPhase: string,
+	sessionId?: string,
+): Promise<void> {
+	const filePath = path.join(stateBaseDir(cwd, sessionId), `${skill}-state.json`);
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await fs.writeFile(
+		filePath,
+		JSON.stringify(
+			{
+				skill,
+				version: 1,
+				active: true,
+				current_phase: currentPhase,
+				...(sessionId ? { session_id: sessionId } : {}),
+			},
+			null,
+			2,
+		),
+	);
+}
+
+async function readModeState(cwd: string, skill: string, sessionId?: string): Promise<Record<string, unknown> | null> {
+	try {
+		const raw = await fs.readFile(path.join(stateBaseDir(cwd, sessionId), `${skill}-state.json`), "utf-8");
+		return JSON.parse(raw) as Record<string, unknown>;
+	} catch (err) {
+		const e = err as NodeJS.ErrnoException;
+		if (e.code === "ENOENT") return null;
+		throw err;
+	}
+}
+async function readActiveEntry(
+	cwd: string,
+	skill: string,
+	sessionId?: string,
+): Promise<Record<string, unknown> | null> {
+	try {
+		const raw = await fs.readFile(
+			path.join(stateBaseDir(cwd, sessionId), "active", `${encodeSessionSegment(skill)}.json`),
+			"utf-8",
+		);
+		return JSON.parse(raw) as Record<string, unknown>;
+	} catch (err) {
+		const e = err as NodeJS.ErrnoException;
+		if (e.code === "ENOENT") return null;
+		throw err;
+	}
+}
+async function writeActiveEntry(
+	cwd: string,
+	skill: string,
+	entry: Record<string, unknown>,
+	sessionId?: string,
+): Promise<void> {
+	const filePath = path.join(stateBaseDir(cwd, sessionId), "active", `${encodeSessionSegment(skill)}.json`);
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await fs.writeFile(
+		filePath,
+		JSON.stringify(
+			{
+				skill,
+				...(sessionId ? { session_id: sessionId } : {}),
+				...entry,
+			},
+			null,
+			2,
+		),
+	);
+}
+
+function createTestModel(id: string): Model {
+	return {
+		id,
+		name: id,
+		api: "openai-codex-responses",
+		provider: "openai-codex",
+		baseUrl: "https://chatgpt.com/backend-api",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 8192,
+	};
+}
+
+function createSession(
+	cwd: string,
+	skills: Skill[],
+	capture: CapturedSend[],
+	overrides: Partial<ToolSession> = {},
+	streaming = false,
+): ToolSession {
+	return {
+		cwd,
+		hasUI: false,
+		skills,
+		getSessionFile: () => null,
+		getSessionSpawns: () => "*",
+		settings: Settings.isolated(),
+		sendCustomMessage: async (message, options) => {
+			capture.push({ message, options });
+			// streaming flag is a placeholder; underlying agent-session.ts handles steer-vs-append
+			// based on its own isStreaming. The test asserts the options arg the tool passes
+			// to sendCustomMessage, which is what matters for behavior verification.
+			void streaming;
+		},
+		...overrides,
+	};
+}
+
+describe("SkillTool", () => {
+	it("createIf returns null when no skills are loaded", () => {
+		const session: ToolSession = {
+			cwd: "/tmp",
+			hasUI: false,
+			skills: [],
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: Settings.isolated(),
+			sendCustomMessage: async () => {},
+		};
+		expect(SkillTool.createIf(session)).toBeNull();
+	});
+
+	it("createIf returns null when session lacks sendCustomMessage", async () => {
+		const ultragoal = await makeSkill("ultragoal", "# Ultragoal\nBody");
+		const session: ToolSession = {
+			cwd: "/tmp",
+			hasUI: false,
+			skills: [ultragoal],
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: Settings.isolated(),
+		};
+		expect(SkillTool.createIf(session)).toBeNull();
+	});
+
+	it("uses runtime fallback through createIf while session skills retain name precedence", async () => {
+		const cwd = await makeTempCwd();
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-runtime-home-"));
+		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
+		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
+		let unrelated: Skill | undefined;
+		let preloaded: Skill | undefined;
+		try {
+			process.env.GJC_CONFIG_DIR = ".gjc";
+			delete process.env.PI_CONFIG_DIR;
+			const runtimePath = await makeRuntimeSkill(
+				path.join(home, ".gjc", "agent", "skills"),
+				"runtime-helper",
+				"Runtime helper",
+				"Runtime fallback body.",
+			);
+			unrelated = await makeSkill("unrelated", "Unrelated body.");
+			const captured: CapturedSend[] = [];
+			const session = createSession(cwd, [unrelated], captured, { settings: runtimeSkillSettings(), home });
+
+			const tool = SkillTool.createIf(session);
+			expect(tool).not.toBeNull();
+			const fallback = await tool!.execute("call-1", { name: "runtime-helper" });
+			expect(captured[0]?.message.content).toContain("Runtime fallback body.");
+			expect(fallback.details?.path).toBe(runtimePath);
+
+			preloaded = await makeSkill("runtime-helper", "Preloaded body.");
+			const preloadedCaptured: CapturedSend[] = [];
+			const preloadedTool = SkillTool.createIf(
+				createSession(cwd, [unrelated, preloaded], preloadedCaptured, {
+					settings: runtimeSkillSettings(),
+				}),
+			);
+			expect(preloadedTool).not.toBeNull();
+			const preloadedResult = await preloadedTool!.execute("call-2", { name: "runtime-helper" });
+			expect(preloadedCaptured[0]?.message.content).toContain("Preloaded body.");
+			expect(preloadedCaptured[0]?.message.content).not.toContain("Runtime fallback body.");
+			expect(preloadedResult.details?.path).toBe(preloaded.filePath);
+		} finally {
+			if (originalGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
+			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
+			if (originalPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
+			else process.env.PI_CONFIG_DIR = originalPiConfigDir;
+			if (unrelated) await safeRm(unrelated.baseDir, { recursive: true, force: true });
+			if (preloaded) await safeRm(preloaded.baseDir, { recursive: true, force: true });
+			await safeRm(cwd, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
+		}
+	});
+
+	it("uses exact runtime fallback precedence across project, canonical, configured, and historical roots", async () => {
+		const cwd = await makeTempCwd();
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-runtime-precedence-home-"));
+		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
+		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
+		const originalCodingAgentDir = process.env.GJC_CODING_AGENT_DIR;
+		const originalPiCodingAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
+		let loaded: Skill | undefined;
+		try {
+			delete process.env.GJC_CONFIG_DIR;
+			delete process.env.PI_CONFIG_DIR;
+			const gjcAgentDecoyDir = path.join(home, "gjc-agent-decoy");
+			const piAgentDecoyDir = path.join(home, "pi-agent-decoy");
+			const xdgConfigHome = path.join(home, "xdg-decoy");
+			process.env.GJC_CODING_AGENT_DIR = gjcAgentDecoyDir;
+			process.env.PI_CODING_AGENT_DIR = piAgentDecoyDir;
+			process.env.XDG_CONFIG_HOME = xdgConfigHome;
+			const defaultCanonicalPath = await makeRuntimeSkill(
+				path.join(home, ".gjc", "agent", "skills"),
+				"default-canonical",
+				"Default canonical",
+				"Default canonical body.",
+			);
+			const captured: CapturedSend[] = [];
+			loaded = await makeSkill("loaded", "Loaded");
+			const tool = SkillTool.createIf(
+				createSession(cwd, [loaded], captured, { settings: runtimeSkillSettings(), home }),
+			)!;
+			const defaultResult = await tool.execute("call-default-canonical", { name: "default-canonical" });
+			expect(captured.at(-1)?.message.content).toContain("Default canonical body.");
+			expect(defaultResult.details?.path).toBe(defaultCanonicalPath);
+
+			process.env.GJC_CONFIG_DIR = ".configured-gjc";
+			process.env.PI_CONFIG_DIR = ".configured-pi";
+			const configuredRoot = path.join(home, ".configured-gjc");
+			const canonicalPath = await makeRuntimeSkill(
+				path.join(configuredRoot, "agent", "skills"),
+				"canonical-only",
+				"Canonical",
+				"Canonical body.",
+			);
+			const configuredPath = await makeRuntimeSkill(
+				path.join(configuredRoot, "skills"),
+				"configured-only",
+				"Configured legacy",
+				"Configured legacy body.",
+			);
+			const historicalPath = await makeRuntimeSkill(
+				path.join(home, ".gjc", "skills"),
+				"historical-only",
+				"Historical legacy",
+				"Historical body.",
+			);
+			const projectPath = await makeRuntimeSkill(
+				path.join(cwd, ".gjc", "skills"),
+				"winner",
+				"Project",
+				"Project body.",
+			);
+			await makeRuntimeSkill(
+				path.join(configuredRoot, "agent", "skills"),
+				"winner",
+				"Canonical",
+				"Canonical winner body.",
+			);
+			await makeRuntimeSkill(path.join(configuredRoot, "skills"), "winner", "Configured", "Configured winner body.");
+			await makeRuntimeSkill(path.join(home, ".gjc", "skills"), "winner", "Historical", "Historical winner body.");
+			const canonicalDuplicatePath = await makeRuntimeSkill(
+				path.join(configuredRoot, "agent", "skills"),
+				"canonical-configured-historical",
+				"Canonical duplicate",
+				"Canonical duplicate body.",
+			);
+			await makeRuntimeSkill(
+				path.join(configuredRoot, "skills"),
+				"canonical-configured-historical",
+				"Configured duplicate",
+				"Configured duplicate body.",
+			);
+			await makeRuntimeSkill(
+				path.join(home, ".gjc", "skills"),
+				"canonical-configured-historical",
+				"Historical duplicate",
+				"Historical duplicate body.",
+			);
+			const configuredDuplicatePath = await makeRuntimeSkill(
+				path.join(configuredRoot, "skills"),
+				"configured-historical",
+				"Configured duplicate",
+				"Configured duplicate body.",
+			);
+			await makeRuntimeSkill(
+				path.join(home, ".gjc", "skills"),
+				"configured-historical",
+				"Historical duplicate",
+				"Historical duplicate body.",
+			);
+			const gjcDecoyPath = await makeRuntimeSkill(
+				path.join(gjcAgentDecoyDir, "skills"),
+				"gjc-direct-decoy",
+				"GJC direct decoy",
+				"Decoy.",
+			);
+			const piDecoyPath = await makeRuntimeSkill(
+				path.join(piAgentDecoyDir, "skills"),
+				"pi-direct-decoy",
+				"PI direct decoy",
+				"Decoy.",
+			);
+			const xdgDecoyPath = await makeRuntimeSkill(
+				path.join(xdgConfigHome, "gjc", "agent", "skills"),
+				"xdg-decoy",
+				"XDG decoy",
+				"Decoy.",
+			);
+			for (const [name, expectedPath, body] of [
+				["canonical-only", canonicalPath, "Canonical body."],
+				["configured-only", configuredPath, "Configured legacy body."],
+				["historical-only", historicalPath, "Historical body."],
+				["winner", projectPath, "Project body."],
+				["canonical-configured-historical", canonicalDuplicatePath, "Canonical duplicate body."],
+				["configured-historical", configuredDuplicatePath, "Configured duplicate body."],
+			] as const) {
+				const result = await tool.execute(`call-${name}`, { name });
+				expect(captured.at(-1)?.message.content).toContain(body);
+				expect(result.details?.path).toBe(expectedPath);
+			}
+			delete process.env.GJC_CONFIG_DIR;
+			const piCanonicalPath = await makeRuntimeSkill(
+				path.join(home, ".configured-pi", "agent", "skills"),
+				"pi-canonical",
+				"PI canonical",
+				"PI canonical body.",
+			);
+			const piResult = await tool.execute("call-pi", { name: "pi-canonical" });
+			expect(captured.at(-1)?.message.content).toContain("PI canonical body.");
+			expect(piResult.details?.path).toBe(piCanonicalPath);
+			const capturedBeforeDecoys = captured.length;
+			for (const name of ["gjc-direct-decoy", "pi-direct-decoy", "xdg-decoy"]) {
+				await expect(tool.execute(`call-${name}`, { name })).rejects.toThrow(/unknown skill/);
+			}
+			expect(captured).toHaveLength(capturedBeforeDecoys);
+			expect([gjcDecoyPath, piDecoyPath, xdgDecoyPath]).not.toContain(piResult.details?.path);
+		} finally {
+			if (originalGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
+			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
+			if (originalPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
+			else process.env.PI_CONFIG_DIR = originalPiConfigDir;
+			if (originalCodingAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = originalCodingAgentDir;
+			if (originalPiCodingAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = originalPiCodingAgentDir;
+			if (originalXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+			else process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
+			if (loaded) await safeRm(loaded.baseDir, { recursive: true, force: true });
+			await safeRm(cwd, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
+		}
+	});
+
+	it("dispatches the chained skill same-turn without deliverAs nextTurn", async () => {
+		const cwd = await makeTempCwd();
+		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\n# Ultragoal\nTrack execution.");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [ultragoal], captured);
+		const tool = SkillTool.createIf(session);
+		expect(tool).not.toBeNull();
+
+		const result = await tool!.execute("call-1", { name: "ultragoal", args: "go" });
+		const firstBlock = result.content[0];
+		expect(firstBlock?.type).toBe("text");
+		expect(firstBlock?.type === "text" ? firstBlock.text : "").toContain('"callee":"ultragoal"');
+		expect(firstBlock?.type === "text" ? firstBlock.text : "").toContain('"args":"go"');
+		expect(result.details?.name).toBe("ultragoal");
+		expect(result.details?.args).toBe("go");
+
+		expect(captured).toHaveLength(1);
+		const sent = captured[0]!;
+		expect(sent.message.customType).toBe(SKILL_PROMPT_MESSAGE_TYPE);
+		expect(sent.message.attribution).toBe("user");
+		expect(sent.options).toEqual({ triggerTurn: false });
+		expect(sent.options?.deliverAs).toBeUndefined();
+
+		const content = sent.message.content as string;
+		expect(content).toContain("# Ultragoal");
+		expect(content).toContain("Track execution.");
+		expect(content).toContain("User: go");
+	});
+
+	it("omits the User: line when args are absent or whitespace", async () => {
+		const cwd = await makeTempCwd();
+		const di = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nBody");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [di], captured);
+		const tool = SkillTool.createIf(session)!;
+		await tool.execute("call-1", { name: "deep-interview", args: "   " });
+		const content = captured[0]!.message.content as string;
+		expect(content).not.toContain("User:");
+	});
+
+	it("rejects wildcard/glob skill names immediately without dispatching", async () => {
+		const cwd = await makeTempCwd();
+		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\nBody");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [ultragoal], captured, {
+			getActiveSkillState: () => ({ skill: "deep-interview", session_id: "s1" }),
+			getActiveSkillPhase: () => "interviewing",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		await expect(tool.execute("call-1", { name: "*" })).rejects.toBeInstanceOf(ToolError);
+		await expect(tool.execute("call-1", { name: "*" })).rejects.toThrow(/not a valid skill name/);
+		await expect(tool.execute("call-1", { name: "git-*" })).rejects.toThrow(/glob or wildcard/);
+		// Guard runs before the phase/handoff path, so no dispatch and no state I/O.
+		expect(captured).toHaveLength(0);
+	});
+
+	it("rejects Windows filesystem aliases for bundled workflow skills", async () => {
+		const cwd = await makeTempCwd();
+		const alias = await makeSkill("ralplan.", "---\nname: ralplan.\n---\nAlias");
+		const captured: CapturedSend[] = [];
+		const tool = SkillTool.createIf(createSession(cwd, [alias], captured))!;
+
+		await expect(tool.execute("call-1", { name: "ralplan." })).rejects.toThrow(/filesystem alias/);
+		expect(captured).toHaveLength(0);
+	});
+
+	it("rejects chaining into the currently active skill (recursive-self guard)", async () => {
+		const cwd = await makeTempCwd();
+		const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nBody");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nBody");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [deepInterview, ralplan], captured, {
+			getActiveSkillState: () => ({ skill: "deep-interview", session_id: "session-1" }),
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		await expect(tool.execute("call-1", { name: " deep-interview " })).rejects.toBeInstanceOf(ToolError);
+		await expect(tool.execute("call-1", { name: "deep-interview" })).rejects.toThrow(
+			/refusing to chain into currently active skill "deep-interview"/,
+		);
+		expect(captured).toHaveLength(0);
+	});
+	it("chains from an active runtime skill without native workflow state", async () => {
+		const cwd = await makeTempCwd();
+		const autopilot = await makeSkill("vc-autopilot", "---\nname: vc-autopilot\n---\nAuto");
+		const interview = await makeSkill(
+			"vc-characterchat-interview",
+			"---\nname: vc-characterchat-interview\n---\nInterview",
+		);
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [autopilot, interview], captured, {
+			getActiveSkillState: () => ({ skill: "vc-autopilot", session_id: "s1" }),
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		const result = await tool.execute("call-1", { name: "vc-characterchat-interview", args: "brief.json --brief" });
+
+		expect(result.details?.name).toBe("vc-characterchat-interview");
+		expect(result.details?.args).toBe("brief.json --brief");
+		expect(captured).toHaveLength(1);
+		expect(await readModeState(cwd, "vc-autopilot", "s1")).toBeNull();
+	});
+
+	it("chains from an active runtime skill into a native workflow skill", async () => {
+		const cwd = await makeTempCwd();
+		const customSkill = await makeSkill("project-skill", "---\nname: project-skill\n---\nCustom");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [customSkill, ralplan], captured, {
+			getActiveSkillState: () => ({ skill: "project-skill", session_id: "s1" }),
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		const result = await tool.execute("call-1", { name: "ralplan" });
+
+		expect(result.details?.name).toBe("ralplan");
+		expect(captured).toHaveLength(1);
+		expect(captured[0]!.message.details).toEqual(expect.objectContaining({ name: "ralplan" }));
+	});
+
+	it("rejects chaining when caller phase is not terminal (phase guard)", async () => {
+		const cwd = await makeTempCwd();
+		const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nBody");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nBody");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [deepInterview, ralplan], captured, {
+			getActiveSkillState: () => ({ skill: "deep-interview", session_id: "s1" }),
+			getActiveSkillPhase: () => "interviewing",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		await expect(tool.execute("call-1", { name: "ralplan" })).rejects.toBeInstanceOf(ToolError);
+		await expect(tool.execute("call-1", { name: "ralplan" })).rejects.toThrow(
+			/refusing to chain from "deep-interview" \(phase=interviewing\) into "ralplan"/,
+		);
+		expect(captured).toHaveLength(0);
+	});
+
+	it("chains successfully when caller phase is 'handoff' and atomically updates state", async () => {
+		const cwd = await makeTempCwd();
+		await writeCallerModeState(cwd, "deep-interview", "handoff", "s1");
+		const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nBody");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [deepInterview, ralplan], captured, {
+			getActiveSkillState: () => ({ skill: "deep-interview", session_id: "s1" }),
+			getActiveSkillPhase: () => "handoff",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		const result = await tool.execute("call-1", { name: "ralplan" });
+		expect(result.details?.name).toBe("ralplan");
+		expect(captured).toHaveLength(1);
+
+		// Caller mode-state demoted; callee mode-state activated.
+		const di = await readModeState(cwd, "deep-interview", "s1");
+		expect(di?.active).toBe(false);
+		expect(di?.current_phase).toBe("handoff");
+		expect(di?.handoff_to).toBe("ralplan");
+		const rp = await readModeState(cwd, "ralplan", "s1");
+		expect(rp?.active).toBe(true);
+		expect(rp?.handoff_from).toBe("deep-interview");
+	});
+	it("chains from a native workflow skill into a runtime skill and demotes the caller", async () => {
+		const cwd = await makeTempCwd();
+		await writeCallerModeState(cwd, "ralplan", "handoff", "s1");
+		await writeActiveEntry(cwd, "ralplan", { active: true, phase: "handoff" }, "s1");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const runtimeSkill = await makeSkill("project-executor", "---\nname: project-executor\n---\nRun");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [ralplan, runtimeSkill], captured, {
+			getActiveSkillState: () => ({ skill: "ralplan", session_id: "s1" }),
+			getActiveSkillPhase: () => "handoff",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		await tool.execute("call-1", { name: "project-executor" });
+
+		const rp = await readModeState(cwd, "ralplan", "s1");
+		expect(rp?.active).toBe(false);
+		expect(rp?.current_phase).toBe("handoff");
+		expect(rp?.handoff_to).toBe("project-executor");
+		expect(await readActiveEntry(cwd, "ralplan", "s1")).toBeNull();
+		expect(await readModeState(cwd, "project-executor", "s1")).toBeNull();
+		expect(await readActiveEntry(cwd, "project-executor", "s1")).toBeNull();
+		expect(captured).toHaveLength(1);
+	});
+
+	it("supports R->U handoff (ralplan in handoff phase chains to ultragoal)", async () => {
+		const cwd = await makeTempCwd();
+		await writeCallerModeState(cwd, "ralplan", "handoff", "s1");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\nGo");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [ralplan, ultragoal], captured, {
+			getActiveSkillState: () => ({ skill: "ralplan", session_id: "s1" }),
+			getActiveSkillPhase: () => "handoff",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		await tool.execute("call-1", { name: "ultragoal" });
+		const rp = await readModeState(cwd, "ralplan", "s1");
+		expect(rp?.active).toBe(false);
+		expect(rp?.handoff_to).toBe("ultragoal");
+		const ug = await readModeState(cwd, "ultragoal", "s1");
+		expect(ug?.active).toBe(true);
+		expect(ug?.handoff_from).toBe("ralplan");
+	});
+
+	it("keeps explicit default model selection stable across workflow handoffs", async () => {
+		const cwd = await makeTempCwd();
+		await writeCallerModeState(cwd, "deep-interview", "handoff", "s1");
+		const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nInterview");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\nGo");
+		const explicitModel = createTestModel("gpt-5.5");
+		const staleDefaultModel = createTestModel("gpt-5.4");
+		const settings = Settings.isolated();
+		settings.setModelRole("default", `${explicitModel.provider}/${explicitModel.id}`);
+		settings.setModelRole("plan", `${staleDefaultModel.provider}/${staleDefaultModel.id}`);
+
+		let activeSkill = "deep-interview";
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [deepInterview, ralplan, ultragoal], captured, {
+			settings,
+			model: explicitModel,
+			getActiveModelString: () => `${explicitModel.provider}/${explicitModel.id}`,
+			getActiveSkillState: () => ({ skill: activeSkill, session_id: "s1" }),
+			getActiveSkillPhase: () => "handoff",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		await tool.execute("call-1", { name: "ralplan" });
+		activeSkill = "ralplan";
+		await writeCallerModeState(cwd, "ralplan", "handoff", "s1");
+		await tool.execute("call-2", { name: "ultragoal" });
+
+		expect(session.model).toBe(explicitModel);
+		expect(session.getActiveModelString?.()).toBe("openai-codex/gpt-5.5");
+		expect(settings.getModelRole("default")).toBe("openai-codex/gpt-5.5");
+		expect(settings.getModelRole("plan")).toBe("openai-codex/gpt-5.4");
+		expect(captured).toHaveLength(2);
+		expect(captured.map(item => item.message.details)).toEqual([
+			expect.objectContaining({ name: "ralplan" }),
+			expect.objectContaining({ name: "ultragoal" }),
+		]);
+	});
+
+	it("supports backward U->R chain (ultragoal in handoff phase chains to ralplan)", async () => {
+		const cwd = await makeTempCwd();
+		await writeCallerModeState(cwd, "ultragoal", "handoff", "s1");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\nGo");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [ralplan, ultragoal], captured, {
+			getActiveSkillState: () => ({ skill: "ultragoal", session_id: "s1" }),
+			getActiveSkillPhase: () => "handoff",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		await tool.execute("call-1", { name: "ralplan" });
+		const ug = await readModeState(cwd, "ultragoal", "s1");
+		expect(ug?.active).toBe(false);
+		expect(ug?.handoff_to).toBe("ralplan");
+		const rp = await readModeState(cwd, "ralplan", "s1");
+		expect(rp?.active).toBe(true);
+		expect(rp?.handoff_from).toBe("ultragoal");
+	});
+
+	// Terminal-phase allow-list coverage (architect blocker, code lane).
+	// TERMINAL_PHASES = {complete, completed, handoff, failed, cancelled, canceled, inactive}.
+	// For each terminal phase, the caller (deep-interview) must be allowed to
+	// chain into ralplan; handoff in particular is the documented happy path
+	// and the others must also pass the guard.
+	const TERMINAL_PHASES_TO_TEST = ["complete", "completed", "failed", "cancelled", "canceled", "inactive"] as const;
+	for (const phase of TERMINAL_PHASES_TO_TEST) {
+		it(`allows chaining when caller phase is terminal '${phase}'`, async () => {
+			const cwd = await makeTempCwd();
+			await writeCallerModeState(cwd, "deep-interview", phase, "s1");
+			const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nBody");
+			const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+			const captured: CapturedSend[] = [];
+			const session = createSession(cwd, [deepInterview, ralplan], captured, {
+				getActiveSkillState: () => ({ skill: "deep-interview", session_id: "s1" }),
+				getActiveSkillPhase: () => phase,
+			});
+			const tool = SkillTool.createIf(session)!;
+
+			const result = await tool.execute("call-1", { name: "ralplan" });
+			expect(result.details?.name).toBe("ralplan");
+			expect(captured).toHaveLength(1);
+			const rp = await readModeState(cwd, "ralplan", "s1");
+			expect(rp?.active).toBe(true);
+			expect(rp?.handoff_from).toBe("deep-interview");
+		});
+	}
+
+	// Manifest-driven chain permissions (autoresearch handoff-ready at any live
+	// phase; ralplan "final" is a manifest terminal state the generic set misses;
+	// ralplan/ultragoal live phases stay blocked).
+	for (const [phase, callee] of [
+		["research", "deep-interview"],
+		["verdict", "ralplan"],
+		["intake", "ralplan"],
+	] as const) {
+		it(`allows autoresearch (phase=${phase}) to chain into ${callee} without a pre-write`, async () => {
+			const cwd = await makeTempCwd();
+			await writeCallerModeState(cwd, "autoresearch", phase, "s1");
+			const autoresearch = await makeSkill("autoresearch", "---\nname: autoresearch\n---\nResearch");
+			const target = await makeSkill(callee, `---\nname: ${callee}\n---\nBody`);
+			const captured: CapturedSend[] = [];
+			const session = createSession(cwd, [autoresearch, target], captured, {
+				getActiveSkillState: () => ({ skill: "autoresearch", session_id: "s1" }),
+				getActiveSkillPhase: () => phase,
+			});
+			const tool = SkillTool.createIf(session)!;
+
+			const result = await tool.execute("call-1", { name: callee });
+			expect(result.details?.name).toBe(callee);
+			expect(captured).toHaveLength(1);
+			const ar = await readModeState(cwd, "autoresearch", "s1");
+			expect(ar?.active).toBe(false);
+			expect(ar?.current_phase).toBe("handoff");
+			expect(ar?.handoff_to).toBe(callee);
+			const promoted = await readModeState(cwd, callee, "s1");
+			expect(promoted?.active).toBe(true);
+			expect(promoted?.handoff_from).toBe("autoresearch");
+		});
+	}
+
+	it("allows ralplan (phase=final, manifest terminal) to chain into ultragoal", async () => {
+		const cwd = await makeTempCwd();
+		await writeCallerModeState(cwd, "ralplan", "final", "s1");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\nGo");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [ralplan, ultragoal], captured, {
+			getActiveSkillState: () => ({ skill: "ralplan", session_id: "s1" }),
+			getActiveSkillPhase: () => "final",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		const result = await tool.execute("call-1", { name: "ultragoal" });
+		expect(result.details?.name).toBe("ultragoal");
+		const rp = await readModeState(cwd, "ralplan", "s1");
+		expect(rp?.active).toBe(false);
+		expect(rp?.handoff_to).toBe("ultragoal");
+		const ug = await readModeState(cwd, "ultragoal", "s1");
+		expect(ug?.active).toBe(true);
+	});
+
+	for (const [caller, phase, callee] of [
+		["ralplan", "planner", "ultragoal"],
+		["ultragoal", "active", "ralplan"],
+	] as const) {
+		it(`still refuses ${caller} mid-flight chaining (phase=${phase})`, async () => {
+			const cwd = await makeTempCwd();
+			await writeCallerModeState(cwd, caller, phase, "s1");
+			const callerSkill = await makeSkill(caller, `---\nname: ${caller}\n---\nBody`);
+			const target = await makeSkill(callee, `---\nname: ${callee}\n---\nBody`);
+			const captured: CapturedSend[] = [];
+			const session = createSession(cwd, [callerSkill, target], captured, {
+				getActiveSkillState: () => ({ skill: caller, session_id: "s1" }),
+				getActiveSkillPhase: () => phase,
+			});
+			const tool = SkillTool.createIf(session)!;
+
+			await expect(tool.execute("call-1", { name: callee })).rejects.toThrow(/refusing to chain/);
+			expect(captured).toHaveLength(0);
+		});
+	}
+
+	it("calls handoff CLI before dispatching the chained skill (ordering)", async () => {
+		const cwd = await makeTempCwd();
+		await writeCallerModeState(cwd, "deep-interview", "handoff", "s1");
+		const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nBody");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+
+		// Use sendCustomMessage to inspect mode-state at dispatch time.
+		// If handoff ran first, deep-interview-state.json already has active=false when
+		// the message is captured.
+		let modeStateAtDispatch: Record<string, unknown> | null = null;
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [deepInterview, ralplan], captured, {
+			getActiveSkillState: () => ({ skill: "deep-interview", session_id: "s1" }),
+			getActiveSkillPhase: () => "handoff",
+			sendCustomMessage: async (message, options) => {
+				modeStateAtDispatch = await readModeState(cwd, "deep-interview", "s1");
+				captured.push({ message, options });
+			},
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		await tool.execute("call-1", { name: "ralplan" });
+		expect(modeStateAtDispatch).not.toBeNull();
+		expect((modeStateAtDispatch as Record<string, unknown> | null)?.active).toBe(false);
+	});
+
+	it("surfaces handoff CLI failure as a ToolError when caller mode-state is missing", async () => {
+		const cwd = await makeTempCwd();
+		// Do NOT pre-write caller mode-state; handoff will fail with "caller is not active".
+		const deepInterview = await makeSkill("deep-interview", "---\nname: deep-interview\n---\nBody");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [deepInterview, ralplan], captured, {
+			getActiveSkillState: () => ({ skill: "deep-interview", session_id: "s1" }),
+			getActiveSkillPhase: () => "handoff",
+		});
+		const tool = SkillTool.createIf(session)!;
+		await expect(tool.execute("call-1", { name: "ralplan" })).rejects.toThrow(/handoff failed/);
+		expect(captured).toHaveLength(0);
+	});
+
+	it("throws a ToolError naming the available skills when the name is unknown", async () => {
+		const cwd = await makeTempCwd();
+		const a = await makeSkill("ralplan", "ralplan body");
+		const b = await makeSkill("team", "team body");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [a, b], captured);
+		const tool = SkillTool.createIf(session)!;
+		await expect(tool.execute("call-1", { name: "does-not-exist" })).rejects.toBeInstanceOf(ToolError);
+		await expect(tool.execute("call-1", { name: "does-not-exist" })).rejects.toThrow(/Available: ralplan, team/);
+		expect(captured).toHaveLength(0);
+	});
+
+	it("enumerates and invokes registered marketplace skills by their namespaced name", async () => {
+		const cwd = await makeTempCwd();
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-marketplace-home-"));
+		const craftRoot = path.join(home, "plugin-cache", "craft-skills");
+		const bstackRoot = path.join(home, "plugin-cache", "bstack");
+		const registryPath = path.join(home, ".gjc", "plugins", "installed_plugins.json");
+		try {
+			await makeRuntimeSkill(path.join(craftRoot, "skills"), "design", "Craft design", "Craft body.");
+			await makeRuntimeSkill(path.join(bstackRoot, "skills"), "design", "Bstack design", "Bstack body.");
+			await fs.mkdir(path.dirname(registryPath), { recursive: true });
+			await fs.writeFile(
+				registryPath,
+				JSON.stringify({
+					version: 2,
+					plugins: {
+						"craft-skills@craft-skills": [
+							{ scope: "user", installPath: craftRoot, version: "0.14.6", enabled: true },
+						],
+						"bstack@bstack": [{ scope: "user", installPath: bstackRoot, version: "1.1.7", enabled: true }],
+					},
+				}),
+			);
+			clearPluginRootsAndCaches([registryPath]);
+			const settings = runtimeSkillSettings();
+			const loaded = await loadSkills({
+				...settings.getGroup("skills"),
+				cwd,
+				home,
+				disabledExtensions: settings.get("disabledExtensions"),
+			});
+			const captured: CapturedSend[] = [];
+			const tool = new SkillTool(createSession(cwd, loaded.skills, captured, { settings, home }));
+
+			await expect(tool.execute("missing", { name: "missing" })).rejects.toThrow(
+				/Available: bstack:design, craft-skills:design/,
+			);
+			await expect(tool.execute("bare", { name: "design" })).rejects.toThrow(/unknown skill "design"/);
+			expect(captured).toHaveLength(0);
+
+			const craft = await tool.execute("craft", { name: "craft-skills:design" });
+			const bstack = await tool.execute("bstack", { name: "bstack:design" });
+			expect(craft.details?.name).toBe("craft-skills:design");
+			expect(bstack.details?.name).toBe("bstack:design");
+			expect(captured[0]?.message.content).toContain("Craft body.");
+			expect(captured[1]?.message.content).toContain("Bstack body.");
+		} finally {
+			clearPluginRootsAndCaches([registryPath]);
+			await safeRm(cwd, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
+		}
+	});
+
+	it("bounds the Available catalog deterministically", async () => {
+		const cwd = await makeTempCwd();
+		try {
+			const skills = Array.from({ length: 60 }, (_, index) => ({
+				name: `market:${String(59 - index).padStart(2, "0")}`,
+				description: "",
+				filePath: `/unused/${index}/SKILL.md`,
+				baseDir: `/unused/${index}`,
+				source: "test",
+			}));
+			skills.push({ ...skills[0]!, filePath: "/unused/duplicate/SKILL.md" });
+			const tool = new SkillTool(createSession(cwd, skills, []));
+			let message = "";
+			try {
+				await tool.execute("missing", { name: "missing" });
+			} catch (error) {
+				message = error instanceof Error ? error.message : String(error);
+			}
+			const expectedNames = Array.from({ length: 50 }, (_, index) => `market:${String(index).padStart(2, "0")}`);
+			expect(message).toContain(`Available: ${expectedNames.join(", ")}, … (+10 more).`);
+			expect(message).not.toContain("market:50");
+			expect(message).not.toContain("market:59");
+		} finally {
+			await safeRm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("bounds Available output for oversized SDK-supplied skill names", async () => {
+		const cwd = await makeTempCwd();
+		try {
+			const hugeName = `market:${"x".repeat(10_000)}`;
+			const tool = new SkillTool(
+				createSession(
+					cwd,
+					[{ name: hugeName, description: "", filePath: "/unused", baseDir: "/", source: "test" }],
+					[],
+				),
+			);
+			let message = "";
+			try {
+				await tool.execute("missing", { name: "missing" });
+			} catch (error) {
+				message = error instanceof Error ? error.message : String(error);
+			}
+			expect(message.length).toBeLessThan(2200);
+			expect(message).toContain("Available: … (+1 more)");
+		} finally {
+			await safeRm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects empty name", async () => {
+		const cwd = await makeTempCwd();
+		const a = await makeSkill("ralplan", "body");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [a], captured);
+		const tool = SkillTool.createIf(session)!;
+		await expect(tool.execute("call-1", { name: "   " })).rejects.toBeInstanceOf(ToolError);
+		expect(captured).toHaveLength(0);
+	});
+});

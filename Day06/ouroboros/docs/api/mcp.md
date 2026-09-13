@@ -1,0 +1,1080 @@
+# MCP Module API Reference
+
+The MCP module (`ouroboros.mcp`) provides Model Context Protocol integration for both consuming external MCP servers and exposing Ouroboros as an MCP server.
+
+## Import
+
+```python
+from ouroboros.mcp import (
+    # Errors
+    MCPError,
+    MCPClientError,
+    MCPServerError,
+    MCPAuthError,
+    MCPTimeoutError,
+    MCPConnectionError,
+    MCPProtocolError,
+    MCPResourceNotFoundError,
+    MCPToolError,
+    # Types
+    TransportType,
+    ContentType,
+    MCPServerConfig,
+    MCPToolDefinition,
+    MCPToolParameter,
+    MCPToolResult,
+    MCPContentItem,
+    MCPResourceDefinition,
+    MCPResourceContent,
+    MCPPromptDefinition,
+    MCPPromptArgument,
+    MCPCapabilities,
+    MCPServerInfo,
+    MCPRequest,
+    MCPResponse,
+)
+
+# Client
+from ouroboros.mcp.client import (
+    MCPClient,
+    MCPClientAdapter,
+    MCPClientManager,
+)
+
+# Server
+from ouroboros.mcp.server import (
+    MCPServer,
+    ToolHandler,
+    ResourceHandler,
+    MCPServerAdapter,
+)
+
+# Tools
+from ouroboros.mcp.tools import (
+    ToolRegistry,
+    OUROBOROS_TOOLS,
+)
+
+# Resources
+from ouroboros.mcp.resources import (
+    OUROBOROS_RESOURCES,
+)
+```
+
+---
+
+## Types
+
+### Enum: `TransportType`
+
+MCP transport type for server connections.
+
+```python
+class TransportType(StrEnum):
+    STDIO = "stdio"
+    SSE = "sse"
+    STREAMABLE_HTTP = "streamable-http"
+    HTTP = "http"
+```
+
+### Enum: `ContentType`
+
+Type of content in an MCP response.
+
+```python
+class ContentType(StrEnum):
+    TEXT = "text"
+    IMAGE = "image"
+    RESOURCE = "resource"
+```
+
+### Class: `MCPServerConfig`
+
+Configuration for connecting to an MCP server.
+
+```python
+@dataclass(frozen=True, slots=True)
+class MCPServerConfig:
+    name: str                              # Unique name for the connection
+    transport: TransportType               # Transport type
+    command: str | None = None             # Command for stdio transport
+    args: tuple[str, ...] = ()             # Command arguments
+    url: str | None = None                 # URL for SSE/HTTP transport
+    env: dict[str, str] = {}               # Environment variables
+    timeout: float = 30.0                  # Connection timeout (seconds)
+    headers: dict[str, str] = {}           # HTTP headers for SSE/HTTP
+```
+
+#### Example
+
+```python
+# STDIO transport
+config = MCPServerConfig(
+    name="my-server",
+    transport=TransportType.STDIO,
+    command="npx",
+    args=("-y", "@my/mcp-server"),
+    env={"API_KEY": "xxx"},
+)
+
+# SSE transport
+config = MCPServerConfig(
+    name="remote-server",
+    transport=TransportType.SSE,
+    url="https://api.example.com/mcp",
+    headers={"Authorization": "Bearer xxx"},
+)
+
+# HTTP transport (alias for streamable-http, used by Claude Code)
+http_config = MCPServerConfig(
+    name="github-mcp",
+    transport=TransportType.HTTP,
+    url="http://localhost:3000/mcp",
+)
+```
+
+### Class: `MCPToolDefinition`
+
+Definition of an MCP tool.
+
+```python
+@dataclass(frozen=True, slots=True)
+class MCPToolDefinition:
+    name: str                                    # Unique tool name
+    description: str                             # Human-readable description
+    parameters: tuple[MCPToolParameter, ...] = () # Tool parameters
+    server_name: str | None = None               # Server providing this tool
+```
+
+#### Methods
+
+##### `to_input_schema() -> dict[str, Any]`
+
+Convert to JSON Schema for tool input.
+
+### Class: `MCPToolParameter`
+
+A single parameter for an MCP tool.
+
+```python
+@dataclass(frozen=True, slots=True)
+class MCPToolParameter:
+    name: str                           # Parameter name
+    type: ToolInputType                 # JSON Schema type
+    description: str = ""               # Description
+    required: bool = True               # Is required
+    default: Any = None                 # Default value
+    enum: tuple[str, ...] | None = None # Allowed values
+```
+
+### Class: `MCPToolResult`
+
+Result from an MCP tool invocation.
+
+```python
+@dataclass(frozen=True, slots=True)
+class MCPToolResult:
+    content: tuple[MCPContentItem, ...] = ()  # Content items
+    is_error: bool = False                    # Was there an error
+    meta: dict[str, Any] = {}                 # Metadata
+```
+
+#### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `text_content` | `str` | Concatenated text from all text items |
+
+### Class: `MCPContentItem`
+
+A single content item in an MCP response.
+
+```python
+@dataclass(frozen=True, slots=True)
+class MCPContentItem:
+    type: ContentType                  # Content type
+    text: str | None = None            # Text content
+    data: str | None = None            # Binary data (base64)
+    mime_type: str | None = None       # MIME type
+    uri: str | None = None             # Resource URI
+```
+
+### Class: `MCPResourceDefinition`
+
+Definition of an MCP resource.
+
+```python
+@dataclass(frozen=True, slots=True)
+class MCPResourceDefinition:
+    uri: str                           # Resource URI
+    name: str                          # Human-readable name
+    description: str = ""              # Description
+    mime_type: str = "text/plain"      # MIME type
+```
+
+### Class: `MCPResourceContent`
+
+Content of an MCP resource.
+
+```python
+@dataclass(frozen=True, slots=True)
+class MCPResourceContent:
+    uri: str                           # Resource URI
+    text: str | None = None            # Text content
+    blob: str | None = None            # Binary content (base64)
+    mime_type: str = "text/plain"      # MIME type
+```
+
+### Class: `MCPCapabilities`
+
+Capabilities of an MCP server.
+
+```python
+@dataclass(frozen=True, slots=True)
+class MCPCapabilities:
+    tools: bool = False
+    resources: bool = False
+    prompts: bool = False
+    logging: bool = False
+```
+
+### Class: `MCPServerInfo`
+
+Information about an MCP server.
+
+```python
+@dataclass(frozen=True, slots=True)
+class MCPServerInfo:
+    name: str
+    version: str = "1.0.0"
+    capabilities: MCPCapabilities
+    tools: tuple[MCPToolDefinition, ...]
+    resources: tuple[MCPResourceDefinition, ...]
+    prompts: tuple[MCPPromptDefinition, ...]
+```
+
+---
+
+## Ouroboros MCP Tools
+
+Ouroboros exposes workflow tools as ordinary MCP handlers. The MCP server does
+not parse `ooo` syntax and does not receive channel-specific identifiers for
+skill routing.
+
+### Detached `auto` Jobs
+
+`ouroboros_start_auto` starts detached `auto` work as non-terminal tracked
+background work. A successful start response returns a `job_id` immediately;
+that handle identifies tracked background work, not a completed workflow result.
+The job remains observable through its lifecycle status until it reaches a
+terminal state such as `completed`, `failed`, or `cancelled`. Terminal results
+are read from persisted job events; the in-memory handle TTL only bounds live
+registry cleanup, not completed result retrieval.
+
+MCP clients wait for and retrieve detached `auto` results with the standard job
+tools:
+
+```text
+ouroboros_job_status(job_id="JOB_ID")
+ouroboros_job_wait(job_id="JOB_ID")
+ouroboros_job_result(job_id="JOB_ID")
+```
+
+Pollable background start responses also include
+`meta.job_observer.protocol="ouroboros.job_observer.v1"`. Hosts with independent
+child sessions should delegate that object to exactly one read-only observer.
+The observer exclusively owns the wait cursor and terminal result retrieval;
+the main conversation remains available for user interaction and explicit
+on-demand status checks. Hosts without child sessions use the contract's
+`fallback` fields and keep the bounded polling loop in the main session.
+OpenCode plugin delegation returns `job_id=None` and does not emit a local job
+observer because the plugin child already owns the execution lifecycle. The
+exception is `ouroboros_start_evaluate` with `auto_evolve=true`: that operation
+stays parent-owned and pollable so the server can observe a rejected verdict,
+seed generation 1, and start the configured Ralph successor.
+
+The contract's `relay` section turns job changes into bounded parent-session
+events (`phase_changed`, `progress_advanced`, `attention_required`, `terminal`)
+and suppresses unchanged heartbeats and raw tool output. Its `parent_session`
+section tells the host to show `dashboard_url` or `ouroboros tui open`, keep the
+conversation available for safe concurrent work, and conflict-check writes to
+the active workspace.
+
+Treat `running` or other non-terminal status output as progress only. A
+`running` lifecycle status is non-terminal tracked background work, not a final
+`auto` result. Wait with `ouroboros_job_wait`, then fetch the completed result
+with `ouroboros_job_result` after the job reaches a terminal lifecycle status.
+When MCP status reports `completed`, `ouroboros_job_result(job_id="JOB_ID")`
+retrieves the stable completed `auto` result for that job handle. Unknown or
+otherwise unavailable handles return an MCP error response.
+When MCP status cannot resolve the supplied handle, treat the detached work as
+`invalid` or unavailable rather than as running or completed. The stable
+observable status is the MCP error response for that handle, not a detached
+`auto` result. Next steps are to check the copied `job_id`, inspect any
+surfaced auto session, execution, or lineage handle, then restart the detached
+auto flow when no valid handle can be recovered.
+
+The minimal stable invalid-handle error contract marks the handle as terminally
+unavailable and resultless:
+
+```text
+ouroboros_job_result(job_id="missing_detached_auto")
+
+error.message = "Job handle not found: missing_detached_auto. Result unavailable."
+error.error_code = "job_handle_not_found"
+error.details.job_id = "missing_detached_auto"
+error.details.lifecycle_status = "invalid"
+error.details.is_terminal = true
+error.details.result_available = false
+error.details.reason = "not_found"
+```
+
+A completed detached `auto` result may include text content, metadata, and an
+artifact resource reference. The minimal stable retrieval contract is the job
+handle, terminal lifecycle status, terminal marker, and returned content:
+
+```text
+ouroboros_job_result(job_id="job_auto_docs_done")
+
+content[0].text = "detached auto result artifact: seed.yaml"
+content[1].uri = "file:///tmp/detached-auto-result.json"
+meta.job_id = "job_auto_docs_done"
+meta.status = "completed"
+meta.is_terminal = true
+```
+
+When MCP status reports `failed`, the job is terminal and still observable;
+`ouroboros_job_result(job_id="JOB_ID")` returns the stable failure output or
+error details for that job handle with `is_error=true`, not a successful `auto`
+result. Next steps are to inspect `ouroboros_job_status(job_id="JOB_ID")` and
+`ouroboros_job_result(job_id="JOB_ID")`, then resume or retry from the surfaced
+auto session, execution, or lineage handle when one is present.
+
+```text
+ouroboros_job_result(job_id="job_auto_docs_failed")
+
+is_error = true
+content[0].text = "detached auto failed: seed repair budget exhausted"
+meta.job_id = "job_auto_docs_failed"
+meta.status = "failed"
+meta.is_terminal = true
+meta.error = "seed repair budget exhausted"
+```
+
+When MCP status reports `cancelled`, the job is terminal and still observable;
+`ouroboros_job_result(job_id="JOB_ID")` returns stable cancellation output or
+error details for that job handle with `is_error=true` and the cancellation
+reason when one is available, not a successful `auto` result. Next steps are to
+inspect `ouroboros_job_status(job_id="JOB_ID")` and
+`ouroboros_job_result(job_id="JOB_ID")`, then restart the detached auto flow or
+resume from the surfaced auto session, execution, or lineage handle when one is
+present.
+
+```text
+ouroboros_job_result(job_id="job_auto_docs_cancelled")
+
+is_error = true
+content[0].text = "detached auto cancelled: user requested cancellation"
+meta.job_id = "job_auto_docs_cancelled"
+meta.status = "cancelled"
+meta.lifecycle_status = "cancelled"
+meta.is_terminal = true
+meta.error = "user requested cancellation"
+```
+
+When a terminal job is older than the in-memory handle TTL,
+`ouroboros_job_result(job_id="JOB_ID")` still retrieves the persisted terminal
+result for that job handle. `ouroboros_job_status` reports the stored terminal
+lifecycle status, and result retrieval returns the durable result artifact
+rather than an expiration error.
+
+```text
+ouroboros_job_result(job_id="job_auto_docs_expired")
+
+is_error = false
+content[0].text = "detached auto result artifact: expired seed.yaml"
+meta.job_id = "job_auto_docs_expired"
+meta.status = "completed"
+meta.lifecycle_status = "completed"
+meta.is_terminal = true
+meta.result_available = true
+```
+
+### Read-only Project Status
+
+`ouroboros_project_status` rebuilds a complete cross-run `ProjectRecord` from
+persisted session events. It accepts an optional `project_dir` (the server's
+captured caller directory is the default), an optional canonical
+project-relative `workspace`, and a positive `limit` (default `100`). The
+result's `structuredContent` is the ProjectRecord JSON also emitted by
+`ouroboros status project --json`.
+
+```text
+ouroboros_project_status(
+  project_dir="/work/project",
+  workspace="packages/app",
+  limit=100
+)
+```
+
+The tool is side-effect free and advertises read-only, non-destructive,
+idempotent capability metadata. It opens an owned EventStore in database-level
+read-only mode and never creates schema. Identity conflicts, storage or
+reconstruction failures, and limits below the complete matching population fail
+the request without returning a partial record. Project status is attribution
+only: it cannot authorize execution, alter evidence, or declare acceptance.
+
+The returned `ProjectRecord` includes ambiguity-gate statistics for the Seeds
+associated with the project's recorded runs: `gated_seed_count`,
+`forced_seed_count`, `unknown_seed_count`, and `override_rate`. The rate is
+`forced_seed_count / (forced_seed_count + gated_seed_count)`; it is `null` when
+there are no known decisions, and unknown/legacy entries are excluded from the
+denominator.
+
+### `ouroboros_brownfield` Scan Boundaries
+
+The brownfield MCP tool registers existing codebases for PM/interview context.
+For `{"action": "scan"}`, `scan_root` controls only the filesystem walk for
+seed repositories and worktrees. When `scan_root` is omitted, the walk starts at
+the current user's home directory. Dot-prefixed directories and known noisy
+directories such as `node_modules` are not walked as seed locations.
+
+Linked worktree expansion is asymmetric. When the walk finds a normal repo root
+with a `.git` directory, Ouroboros runs `git worktree list --porcelain` from
+that repo and may register Git-reported linked worktrees even when those paths
+are outside `scan_root`. When the walk finds a linked worktree root with a
+`.git` file, Ouroboros registers that worktree itself but does not use it to
+register the main worktree or sibling worktrees outside `scan_root`. This keeps
+narrow scans scoped when a user intentionally passes one worktree as AI context.
+Local repos, repos without remotes, and repos whose remotes are not named
+`origin` are all eligible. Stale linked worktree paths are skipped when the path
+no longer exists or is no longer a valid Git working tree.
+
+Runtime integrations that support `ooo <skill>` or `/ouroboros:<skill>` use the
+shared stateless router in `ouroboros.router` before invoking MCP. The router
+loads packaged `SKILL.md` frontmatter, validates `mcp_tool` and `mcp_args`,
+substitutes `$1` / `$CWD` templates, and returns runtime-neutral dispatch
+metadata. The runtime then performs its own structured logging, `AgentMessage`
+assembly, and MCP handler invocation.
+
+For setup and command authoring details, see the
+[Shared `ooo` Skill Dispatch Router](../guides/ooo-skill-dispatch-router.md)
+guide.
+
+---
+
+## Error Hierarchy
+
+All MCP-specific exceptions inherit from `MCPError`, which inherits from `OuroborosError`.
+
+```
+OuroborosError
++-- MCPError (MCP base)
+    +-- MCPClientError          - Client-side failures
+    |   +-- MCPConnectionError  - Connection failures
+    |   +-- MCPTimeoutError     - Request timeout
+    |   +-- MCPProtocolError    - Protocol errors
+    +-- MCPServerError          - Server-side failures
+        +-- MCPAuthError        - Authentication failures
+        +-- MCPResourceNotFoundError - Resource not found
+        +-- MCPToolError        - Tool execution failures
+```
+
+### Class: `MCPError`
+
+Base exception for all MCP-related errors.
+
+```python
+class MCPError(OuroborosError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        server_name: str | None = None,
+        is_retriable: bool = False,
+        details: dict[str, Any] | None = None,
+    ) -> None: ...
+```
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `server_name` | `str | None` | Name of the MCP server involved |
+| `is_retriable` | `bool` | Whether the operation can be retried |
+
+### Class: `MCPConnectionError`
+
+Failed to connect to an MCP server. Typically retriable.
+
+```python
+class MCPConnectionError(MCPClientError):
+    transport: str | None  # Transport type
+```
+
+### Class: `MCPTimeoutError`
+
+MCP request timed out. Typically retriable with backoff.
+
+```python
+class MCPTimeoutError(MCPClientError):
+    timeout_seconds: float | None  # Timeout value
+    operation: str | None          # Operation that timed out
+```
+
+### Class: `MCPToolError`
+
+Error during tool execution.
+
+```python
+class MCPToolError(MCPServerError):
+    tool_name: str | None    # Tool that failed
+    error_code: str | None   # Tool-specific error code
+```
+
+---
+
+## MCP Client
+
+### Class: `MCPClientAdapter`
+
+Concrete implementation of MCPClient protocol using the MCP SDK.
+
+```python
+class MCPClientAdapter:
+    def __init__(
+        self,
+        *,
+        max_retries: int = 3,
+        retry_wait_initial: float = 1.0,
+        retry_wait_max: float = 10.0,
+    ) -> None: ...
+```
+
+#### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `is_connected` | `bool` | True if currently connected |
+| `server_info` | `MCPServerInfo | None` | Connected server info |
+
+#### Methods
+
+##### `async connect(config: MCPServerConfig) -> Result[MCPServerInfo, MCPClientError]`
+
+Connect to an MCP server.
+
+```python
+async with MCPClientAdapter() as client:
+    result = await client.connect(config)
+    if result.is_ok:
+        print(f"Connected to {result.value.name}")
+```
+
+##### `async disconnect() -> Result[None, MCPClientError]`
+
+Disconnect from the current MCP server.
+
+##### `async list_tools() -> Result[Sequence[MCPToolDefinition], MCPClientError]`
+
+List available tools from the connected server.
+
+##### `async call_tool(name: str, arguments: dict[str, Any] | None = None) -> Result[MCPToolResult, MCPClientError]`
+
+Call a tool on the connected server.
+
+```python
+result = await client.call_tool(
+    "search_files",
+    {"pattern": "*.py", "path": "/src"},
+)
+if result.is_ok:
+    print(result.value.text_content)
+```
+
+##### `async list_resources() -> Result[Sequence[MCPResourceDefinition], MCPClientError]`
+
+List available resources from the connected server.
+
+##### `async read_resource(uri: str) -> Result[MCPResourceContent, MCPClientError]`
+
+Read a resource from the connected server.
+
+##### `async list_prompts() -> Result[Sequence[MCPPromptDefinition], MCPClientError]`
+
+List available prompts from the connected server.
+
+##### `async get_prompt(name: str, arguments: dict[str, str] | None = None) -> Result[str, MCPClientError]`
+
+Get a filled prompt from the connected server.
+
+### Class: `MCPClientManager`
+
+Manager for multiple MCP server connections with connection pooling and health checks.
+
+```python
+class MCPClientManager:
+    def __init__(
+        self,
+        *,
+        max_retries: int = 3,
+        health_check_interval: float = 60.0,
+        default_timeout: float = 30.0,
+    ) -> None: ...
+```
+
+#### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `servers` | `Sequence[str]` | List of server names |
+
+#### Methods
+
+##### `async add_server(config: MCPServerConfig, *, connect: bool = False) -> Result[MCPServerInfo | None, MCPClientError]`
+
+Add a server configuration.
+
+##### `async remove_server(server_name: str) -> Result[None, MCPClientError]`
+
+Remove a server and disconnect if connected.
+
+##### `async connect(server_name: str) -> Result[MCPServerInfo, MCPClientError]`
+
+Connect to a specific server.
+
+##### `async connect_all() -> dict[str, Result[MCPServerInfo, MCPClientError]]`
+
+Connect to all registered servers.
+
+##### `async disconnect_all() -> dict[str, Result[None, MCPClientError]]`
+
+Disconnect from all servers.
+
+##### `async list_all_tools() -> Sequence[MCPToolDefinition]`
+
+List all tools from all connected servers.
+
+##### `find_tool_server(tool_name: str) -> str | None`
+
+Find which server provides a given tool.
+
+##### `async call_tool(server_name: str, tool_name: str, arguments: dict[str, Any] | None = None, *, timeout: float | None = None) -> Result[MCPToolResult, MCPClientError]`
+
+Call a tool on a specific server.
+
+##### `async call_tool_auto(tool_name: str, arguments: dict[str, Any] | None = None, *, timeout: float | None = None) -> Result[MCPToolResult, MCPClientError]`
+
+Call a tool, automatically finding the server that provides it.
+
+##### `start_health_checks() -> None`
+
+Start periodic health checks for all connections.
+
+#### Example
+
+```python
+manager = MCPClientManager()
+
+# Add multiple servers
+await manager.add_server(MCPServerConfig(
+    name="filesystem",
+    transport=TransportType.STDIO,
+    command="npx",
+    args=("-y", "@modelcontextprotocol/server-filesystem"),
+))
+
+await manager.add_server(MCPServerConfig(
+    name="github",
+    transport=TransportType.STDIO,
+    command="npx",
+    args=("-y", "@modelcontextprotocol/server-github"),
+    env={"GITHUB_TOKEN": os.environ["GITHUB_TOKEN"]},
+))
+
+# Connect to all
+results = await manager.connect_all()
+
+# Use tools from any server
+all_tools = await manager.list_all_tools()
+
+# Call tool with auto-discovery
+result = await manager.call_tool_auto("read_file", {"path": "/etc/hosts"})
+
+# Cleanup
+await manager.disconnect_all()
+```
+
+---
+
+## MCP Server
+
+### Class: `MCPServerAdapter`
+
+Concrete implementation of the Ouroboros `MCPServer` protocol using the MCP SDK v2 server API.
+
+```python
+class MCPServerAdapter:
+    def __init__(
+        self,
+        *,
+        name: str = "ouroboros-mcp",
+        version: str = "1.0.0",
+        auth_config: AuthConfig | None = None,
+        rate_limit_config: RateLimitConfig | None = None,
+    ) -> None: ...
+```
+
+#### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `info` | `MCPServerInfo` | Server information |
+
+#### Methods
+
+##### `register_tool(handler: ToolHandler) -> None`
+
+Register a tool handler.
+
+##### `register_resource(handler: ResourceHandler) -> None`
+
+Register a resource handler.
+
+##### `register_prompt(handler: PromptHandler) -> None`
+
+Register a prompt handler.
+
+##### `async list_tools() -> Sequence[MCPToolDefinition]`
+
+List all registered tools.
+
+##### `async call_tool(name: str, arguments: dict[str, Any], credentials: dict[str, str] | None = None) -> Result[MCPToolResult, MCPServerError]`
+
+Call a registered tool.
+
+##### `async read_resource(uri: str) -> Result[MCPResourceContent, MCPServerError]`
+
+Read a registered resource.
+
+##### `async serve() -> None`
+
+Start serving MCP requests. This method blocks until the server is stopped.
+
+##### `async shutdown() -> None`
+
+Shutdown the server gracefully.
+
+#### Example
+
+```python
+from ouroboros.mcp.server import MCPServerAdapter
+
+server = MCPServerAdapter(
+    name="my-ouroboros-server",
+    version="1.0.0",
+)
+
+# Register custom handlers
+server.register_tool(MyToolHandler())
+server.register_resource(MyResourceHandler())
+
+# Start serving
+await server.serve()
+```
+
+---
+
+## Tool Registry
+
+### Class: `ToolRegistry`
+
+Registry for managing MCP tool handlers.
+
+```python
+class ToolRegistry:
+    def __init__(self) -> None: ...
+```
+
+#### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `tool_count` | `int` | Number of registered tools |
+
+#### Methods
+
+##### `register(handler: ToolHandler, *, category: str = "default") -> None`
+
+Register a tool handler.
+
+##### `register_all(handlers: Sequence[ToolHandler], *, category: str = "default") -> None`
+
+Register multiple tool handlers.
+
+##### `unregister(name: str) -> bool`
+
+Unregister a tool handler. Returns True if found.
+
+##### `get(name: str) -> ToolHandler | None`
+
+Get a tool handler by name.
+
+##### `list_tools(category: str | None = None) -> Sequence[MCPToolDefinition]`
+
+List all registered tools, optionally filtered by category.
+
+##### `list_categories() -> Sequence[str]`
+
+List all tool categories.
+
+##### `async call(name: str, arguments: dict[str, Any]) -> Result[MCPToolResult, MCPServerError]`
+
+Call a registered tool.
+
+##### `has_tool(name: str) -> bool`
+
+Check if a tool is registered.
+
+##### `clear() -> None`
+
+Clear all registered tools.
+
+#### Example
+
+```python
+from ouroboros.mcp.tools import ToolRegistry
+
+registry = ToolRegistry()
+
+# Register tools by category
+registry.register(ExecuteSeedHandler(), category="execution")
+registry.register(SessionStatusHandler(), category="status")
+
+# List tools
+all_tools = registry.list_tools()
+execution_tools = registry.list_tools(category="execution")
+
+# Call a tool
+result = await registry.call("execute_seed", {"seed_id": "123"})
+```
+
+### Global Registry
+
+A global registry instance is available for convenience:
+
+```python
+from ouroboros.mcp.tools import get_global_registry, register_tool
+
+# Get global registry
+registry = get_global_registry()
+
+# Register to global registry
+register_tool(MyHandler(), category="custom")
+```
+
+---
+
+## Convenience Functions
+
+### `create_mcp_client`
+
+Context manager for creating and connecting an MCP client.
+
+```python
+from ouroboros.mcp.client.adapter import create_mcp_client
+
+async with create_mcp_client(config) as client:
+    tools = await client.list_tools()
+    # client is automatically connected and will disconnect on exit
+```
+
+### `create_ouroboros_server`
+
+Factory function for creating an Ouroboros MCP server with default configuration.
+
+```python
+from ouroboros.mcp.server import create_ouroboros_server
+
+server = create_ouroboros_server(
+    name="my-server",
+    version="1.0.0",
+)
+# Register additional handlers as needed
+await server.serve()
+```
+
+---
+
+## Orchestrator MCP Integration
+
+### Class: `MCPToolProvider`
+
+Provider for MCP tools to integrate with OrchestratorRunner.
+
+```python
+from ouroboros.orchestrator import MCPToolProvider
+
+class MCPToolProvider:
+    def __init__(
+        self,
+        mcp_manager: MCPClientManager,
+        *,
+        default_timeout: float = 30.0,
+        tool_prefix: str = "",
+    ) -> None: ...
+```
+
+#### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `tool_prefix` | `str` | Prefix added to tool names |
+| `conflicts` | `Sequence[ToolConflict]` | Tool conflicts detected |
+
+#### Methods
+
+##### `async get_tools(builtin_tools: Sequence[str] | None = None) -> Sequence[MCPToolInfo]`
+
+Discover tools from all connected MCP servers.
+
+```python
+provider = MCPToolProvider(manager, tool_prefix="mcp_")
+tools = await provider.get_tools(builtin_tools=["Read", "Write", "Edit"])
+# Returns MCPToolInfo for each non-conflicting tool
+```
+
+##### `get_tool_names() -> Sequence[str]`
+
+Get list of available tool names (with prefix).
+
+##### `has_tool(name: str) -> bool`
+
+Check if a tool is available.
+
+##### `get_tool_info(name: str) -> MCPToolInfo | None`
+
+Get info for a specific tool.
+
+##### `async call_tool(name: str, arguments: dict[str, Any] | None = None, *, timeout: float | None = None) -> Result[MCPToolResult, MCPToolError]`
+
+Call an MCP tool with retry logic and graceful error handling.
+
+```python
+result = await provider.call_tool("mcp_read_file", {"path": "/tmp/test"})
+if result.is_ok:
+    print(result.value.text_content)
+else:
+    print(f"Error: {result.error}")  # Never raises, returns error
+```
+
+### Class: `MCPToolInfo`
+
+Information about an available MCP tool.
+
+```python
+@dataclass(frozen=True, slots=True)
+class MCPToolInfo:
+    name: str           # Tool name (possibly prefixed)
+    original_name: str  # Original tool name from server
+    server_name: str    # Server providing this tool
+    description: str    # Tool description
+    input_schema: dict[str, Any]  # JSON Schema for parameters
+```
+
+### Class: `ToolConflict`
+
+Information about a tool name conflict.
+
+```python
+@dataclass(frozen=True, slots=True)
+class ToolConflict:
+    tool_name: str      # Conflicting tool name
+    source: str         # Server name or "built-in"
+    shadowed_by: str    # What shadowed this tool
+    resolution: str     # How conflict was resolved
+```
+
+### Configuration Loading
+
+#### Function: `load_mcp_config`
+
+Load MCP client configuration from a YAML file.
+
+```python
+from ouroboros.orchestrator import load_mcp_config
+
+result = load_mcp_config(Path("mcp.yaml"))
+if result.is_ok:
+    config = result.value
+    # config.servers - list of MCPServerConfig
+    # config.connection - MCPConnectionConfig
+    # config.tool_prefix - optional prefix
+```
+
+#### Class: `MCPClientConfig`
+
+Complete MCP client configuration.
+
+```python
+@dataclass(frozen=True, slots=True)
+class MCPClientConfig:
+    servers: tuple[MCPServerConfig, ...]
+    connection: MCPConnectionConfig
+    tool_prefix: str = ""
+```
+
+#### Class: `MCPConnectionConfig`
+
+Connection settings for MCP servers.
+
+```python
+@dataclass(frozen=True, slots=True)
+class MCPConnectionConfig:
+    timeout_seconds: float = 30.0
+    retry_attempts: int = 3
+    health_check_interval: float = 60.0
+```
+
+### Example: Using MCP Tools with OrchestratorRunner
+
+```python
+from ouroboros.orchestrator import (
+    ClaudeAgentAdapter,
+    OrchestratorRunner,
+    load_mcp_config,
+)
+from ouroboros.mcp.client.manager import MCPClientManager
+from ouroboros.persistence.event_store import EventStore
+
+# Load MCP config
+config_result = load_mcp_config(Path("mcp.yaml"))
+config = config_result.value
+
+# Create and connect MCP manager
+manager = MCPClientManager(
+    max_retries=config.connection.retry_attempts,
+    default_timeout=config.connection.timeout_seconds,
+)
+
+for server_config in config.servers:
+    await manager.add_server(server_config)
+
+await manager.connect_all()
+
+# Create runner with MCP integration
+event_store = EventStore()
+await event_store.initialize()
+
+adapter = ClaudeAgentAdapter()
+runner = OrchestratorRunner(
+    adapter,
+    event_store,
+    mcp_manager=manager,
+    mcp_tool_prefix=config.tool_prefix,
+)
+
+# Execute seed - MCP tools will be available to the agent
+result = await runner.execute_seed(seed)
+
+# Cleanup
+await manager.disconnect_all()
+```

@@ -1,0 +1,804 @@
+"""Run-to-evaluate chaining for PR-D.
+
+Successful background ``ooo run`` results should enqueue the formal evaluator
+as a separate bounded job.  Disabling the flag must leave the legacy run result
+byte-for-byte at the metadata boundary.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import faulthandler
+import tempfile
+import time
+from typing import Any
+
+import pytest
+
+from ouroboros.core.types import Result
+from ouroboros.mcp.errors import MCPToolError
+from ouroboros.mcp.job_manager import JobManager, JobSnapshot, JobStatus
+from ouroboros.mcp.tools import evaluation_handlers, execution_handlers
+from ouroboros.mcp.tools.evaluation_handlers import StartEvaluateHandler
+from ouroboros.mcp.tools.execution_handlers import (
+    StartExecuteSeedHandler,
+    _run_only_verification_meta,
+    _run_only_verification_text,
+)
+from ouroboros.mcp.tools.run_evaluate_chain import snapshot_run_successor_policy
+from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
+from ouroboros.persistence.event_store import EventStore
+
+
+@pytest.fixture
+async def event_store():
+    store = EventStore("sqlite+aiosqlite:///:memory:")
+    await store.initialize()
+    yield store
+    await store.close()
+
+
+async def _wait_terminal(job_manager: JobManager, job_id: str) -> JobSnapshot:
+    # 15s was too tight for loaded/shared CI runners (observed intermittent
+    # timeouts on GitHub Actions despite the awaited work completing in <1s
+    # locally); 60s gives ample headroom without weakening the assertion.
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        snapshot = await asyncio.wait_for(job_manager.get_snapshot(job_id), timeout=5.0)
+        if snapshot.is_terminal:
+            return snapshot
+        task = job_manager._tasks.get(job_id)
+        if task is not None and not task.done():
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=min(0.05, remaining))
+            except TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(0.01)
+    diagnostics = _diagnose_stuck_job(job_manager, job_id)
+    diagnostics += "\n" + await _dump_all_job_streams(job_manager)
+    raise AssertionError(f"job {job_id} did not reach a terminal state\n{diagnostics}")
+
+
+@pytest.mark.parametrize(
+    ("first_config", "second_config"),
+    [((False, False), (True, True)), ((True, True), (False, False))],
+)
+def test_detached_run_successor_policy_survives_config_flip(
+    first_config: tuple[bool, bool],
+    second_config: tuple[bool, bool],
+) -> None:
+    initial, initial_evaluate, initial_evolve = snapshot_run_successor_policy(
+        {},
+        configured_auto_evaluate=first_config[0],
+        configured_auto_evolve=first_config[1],
+    )
+    replayed, replay_evaluate, replay_evolve = snapshot_run_successor_policy(
+        initial,
+        configured_auto_evaluate=second_config[0],
+        configured_auto_evolve=second_config[1],
+    )
+
+    assert (initial_evaluate, initial_evolve) == first_config
+    assert (replay_evaluate, replay_evolve) == first_config
+    assert replayed["auto_evaluate"] is first_config[0]
+    assert replayed["auto_evolve"] is first_config[1]
+
+
+async def _dump_all_job_streams(job_manager: JobManager) -> str:
+    """Dump every persisted job stream plus store/manager state (#1566 insurance).
+
+    The append-void class of this flake (silently lost terminal events) is only
+    diagnosable from the FULL persisted picture: the run job's stream, the
+    chained evaluate job's stream, and the store connection/pool state.
+    """
+    lines: list[str] = ["--- all persisted job streams ---"]
+    store = job_manager._event_store
+    try:
+        created_events = await store.query_events(event_type="mcp.job.created", limit=50)
+        for job_id in [e.aggregate_id for e in created_events]:
+            try:
+                events, cursor = await store.get_events_after("job", job_id, 0)
+            except Exception as exc:  # noqa: BLE001 - diagnostics must not mask failures
+                lines.append(f"job {job_id}: <stream unavailable: {exc!r}>")
+                continue
+            lines.append(f"job {job_id} (cursor={cursor}):")
+            for e in events:
+                meta = e.data.get("result_meta")
+                meta_keys = sorted(meta) if isinstance(meta, dict) else meta
+                lines.append(
+                    f"  {e.timestamp} {e.type} id={e.id} "
+                    f"status={e.data.get('status')} meta_keys={meta_keys}"
+                )
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"<job discovery unavailable: {exc!r}>")
+    try:
+        engine = store._engine
+        lines.append(f"engine pool: {engine.pool.status() if engine is not None else '<none>'}")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"<pool status unavailable: {exc!r}>")
+    lines.append(f"manager tasks={sorted(job_manager._tasks)}")
+    lines.append(f"manager runner_tasks={sorted(job_manager._runner_tasks)}")
+    lines.append(f"manager backstops={sorted(getattr(job_manager, '_backstops', {}))}")
+    lines.append(
+        f"manager started_job_ids={sorted(getattr(job_manager, '_started_job_ids', set()))}"
+    )
+    return "\n".join(lines)
+
+
+def _diagnose_stuck_job(job_manager: JobManager, job_id: str) -> str:
+    """Capture where every task/thread is stuck when the job never terminalizes.
+
+    This failure is CI-only (issue #1566) and has never reproduced locally, so
+    the assertion message is the only diagnostic channel we get: dump the job
+    task states plus every asyncio task stack and native thread stack.
+    """
+    lines: list[str] = ["--- stuck-job diagnostics (#1566) ---"]
+    task = job_manager._tasks.get(job_id)
+    runner = job_manager._runner_tasks.get(job_id)
+    lines.append(f"job task: {task!r}")
+    lines.append(f"runner task: {runner!r}")
+    for t in asyncio.all_tasks():
+        frames = t.get_stack(limit=6)
+        where = " <- ".join(
+            f"{f.f_code.co_name}:{f.f_code.co_filename.rsplit('/', 1)[-1]}:{f.f_lineno}"
+            for f in reversed(frames)
+        )
+        lines.append(f"asyncio task {t.get_name()} done={t.done()}: {where or '<no stack>'}")
+    # faulthandler needs a real file descriptor (StringIO raises
+    # io.UnsupportedOperation: fileno), so dump native thread stacks to a
+    # temp file and read them back into the assertion message.
+    try:
+        with tempfile.TemporaryFile(mode="w+") as buf:
+            faulthandler.dump_traceback(file=buf)
+            buf.seek(0)
+            lines.append(buf.read())
+    except Exception as exc:  # diagnostics must never mask the real failure
+        lines.append(f"<faulthandler dump unavailable: {exc!r}>")
+    return "\n".join(lines)
+
+
+async def _wait_for_call(calls: list[Any]) -> None:
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        if calls:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("expected chained evaluate handler to be called")
+
+
+class _SuccessfulExecuteHandler:
+    agent_runtime_backend = None
+    llm_backend = None
+
+    def __init__(self, *, text: str = "run finished", worktree_path: str | None = None) -> None:
+        self.text = text
+        self.worktree_path = worktree_path
+        self.returned_meta: dict[str, Any] | None = None
+
+    async def handle(
+        self,
+        arguments: dict[str, Any],
+        *,
+        execution_id: str | None = None,
+        session_id_override: str | None = None,
+        synchronous: bool = False,
+    ) -> Result[MCPToolResult, Any]:
+        assert synchronous is True
+        session_id = session_id_override or arguments.get("session_id") or "orch_fake"
+        meta = {
+            "seed_id": "seed-test",
+            "session_id": session_id,
+            "execution_id": execution_id,
+            "launched": True,
+            "status": "completed",
+            "success": True,
+            **_run_only_verification_meta(session_id),
+        }
+        if self.worktree_path is not None:
+            meta["worktree_path"] = self.worktree_path
+        self.returned_meta = dict(meta)
+        return Result.ok(
+            MCPToolResult(
+                content=(
+                    MCPContentItem(
+                        type=ContentType.TEXT,
+                        text=self.text + "\n" + _run_only_verification_text(session_id),
+                    ),
+                ),
+                is_error=False,
+                meta=meta,
+            )
+        )
+
+
+class _FailedExecuteHandler(_SuccessfulExecuteHandler):
+    async def handle(
+        self,
+        arguments: dict[str, Any],
+        *,
+        execution_id: str | None = None,
+        session_id_override: str | None = None,
+        synchronous: bool = False,
+    ) -> Result[MCPToolResult, Any]:
+        result = await super().handle(
+            arguments,
+            execution_id=execution_id,
+            session_id_override=session_id_override,
+            synchronous=synchronous,
+        )
+        assert result.is_ok
+        meta = {**result.value.meta, "success": False, "status": "failed"}
+        self.returned_meta = dict(meta)
+        return Result.ok(
+            MCPToolResult(
+                content=(
+                    MCPContentItem(
+                        type=ContentType.TEXT,
+                        text="execution failed: AC 2 did not produce output.json",
+                    ),
+                ),
+                is_error=True,
+                meta=meta,
+            )
+        )
+
+
+async def test_successful_run_enqueues_chained_evaluate_job(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
+    evaluate_calls: list[dict[str, Any]] = []
+
+    class FakeEvaluateHandler:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        async def handle(
+            self, arguments: dict[str, Any], **_kwargs: Any
+        ) -> Result[MCPToolResult, Any]:
+            evaluate_calls.append({"arguments": arguments, "kwargs": self.kwargs})
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="approved"),),
+                    is_error=False,
+                    meta={
+                        "final_approved": True,
+                        "session_id": arguments["session_id"],
+                    },
+                )
+            )
+
+    monkeypatch.setattr(evaluation_handlers, "EvaluateHandler", FakeEvaluateHandler)
+
+    job_manager = JobManager(event_store)
+    handler = StartExecuteSeedHandler(
+        execute_handler=_SuccessfulExecuteHandler(text="execution artifact"),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+        start_evaluate_handler=StartEvaluateHandler(
+            event_store=event_store,
+            job_manager=job_manager,
+        ),
+    )
+
+    seed_content = (
+        "goal: Build a CLI task manager\n"
+        "acceptance_criteria:\n"
+        "  - Tasks can be created\n"
+        "  - Tasks can be listed\n"
+        "ontology_schema:\n"
+        "  name: TaskManager\n"
+        "  description: Task management domain\n"
+        "metadata:\n"
+        "  ambiguity_score: 0.15\n"
+    )
+    started = await handler.handle({"seed_content": seed_content, "cwd": str(tmp_path)})
+    assert started.is_ok
+
+    snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
+
+    if snapshot.status != JobStatus.COMPLETED:
+        # Self-explaining flake diagnostics (#1566): a non-COMPLETED terminal
+        # here has historically meant a silently lost terminal append; dump
+        # the full persisted picture for both jobs plus store state.
+        raise AssertionError(
+            f"expected COMPLETED, got {snapshot.status} "
+            f"(result_meta={snapshot.result_meta})\n" + await _dump_all_job_streams(job_manager)
+        )
+    assert snapshot.result_meta["success"] is True
+    evaluation_job_id = snapshot.result_meta["chained_evaluate_job_id"]
+    assert isinstance(evaluation_job_id, str)
+    assert evaluation_job_id.startswith("job_")
+    assert snapshot.result_meta["verification_status"] == "evaluation_enqueued"
+    assert snapshot.result_meta["evaluation_status"] == "enqueued"
+    assert snapshot.result_meta["evaluated"] is False
+    assert "Manual Retry: ooo evaluate" in (snapshot.result_text or "")
+    await _wait_for_call(evaluate_calls)
+    evaluate_snapshot = await job_manager.get_snapshot(evaluation_job_id)
+    assert evaluate_snapshot.job_type == "evaluate"
+    assert evaluate_calls
+    assert evaluate_calls[0]["arguments"]["session_id"] == snapshot.result_meta["session_id"]
+    assert evaluate_calls[0]["arguments"]["seed_content"] == seed_content
+    assert evaluate_calls[0]["arguments"]["acceptance_criteria"] == [
+        "Tasks can be created",
+        "Tasks can be listed",
+    ]
+    assert evaluate_calls[0]["arguments"]["working_dir"] == str(tmp_path)
+    assert "execution artifact" in evaluate_calls[0]["arguments"]["artifact"]
+
+
+async def test_failed_run_with_artifact_enqueues_chained_evaluate_job(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
+    evaluate_calls: list[dict[str, Any]] = []
+    constructor_kwargs: list[dict[str, Any]] = []
+
+    class FakeStartEvaluateHandler:
+        def __init__(self, **kwargs: Any) -> None:
+            constructor_kwargs.append(kwargs)
+
+        async def handle(self, arguments: dict[str, Any]) -> Result[MCPToolResult, Any]:
+            evaluate_calls.append(arguments)
+            return Result.ok(
+                MCPToolResult(
+                    meta={"job_id": "job_eval_failed_run", "session_id": arguments["session_id"]}
+                )
+            )
+
+    monkeypatch.setattr(
+        evaluation_handlers,
+        "StartEvaluateHandler",
+        FakeStartEvaluateHandler,
+    )
+    job_manager = JobManager(event_store)
+    handler = StartExecuteSeedHandler(
+        execute_handler=_FailedExecuteHandler(),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+        start_evaluate_handler=FakeStartEvaluateHandler(deadline_seconds=1800.0),  # type: ignore[arg-type]
+    )
+    seed_content = (
+        "goal: Preserve failed output\n"
+        "acceptance_criteria:\n"
+        "  - output.json exists\n"
+        "  - output.json is valid\n"
+        "ontology_schema:\n"
+        "  name: Output\n"
+        "  description: Output domain\n"
+        "metadata:\n"
+        "  ambiguity_score: 0.1\n"
+    )
+
+    started = await handler.handle({"seed_content": seed_content, "cwd": str(tmp_path)})
+    assert started.is_ok
+    snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
+
+    # The run remains a failed run even though its evidence is evaluable and
+    # the formal evaluator was successfully enqueued.
+    assert snapshot.status == JobStatus.FAILED
+    assert snapshot.result_meta["success"] is False
+    assert snapshot.result_meta["chained_evaluate_job_id"] == "job_eval_failed_run"
+    assert constructor_kwargs[0]["deadline_seconds"] == 1800.0
+    assert evaluate_calls[0]["acceptance_criteria"] == [
+        "output.json exists",
+        "output.json is valid",
+    ]
+    assert evaluate_calls[0]["_source_execution_status"] == "failed"
+    assert "execution failed: AC 2 did not produce output.json" in evaluate_calls[0]["artifact"]
+
+
+async def test_failed_run_rejection_persists_failed_gen1_status(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
+    monkeypatch.setattr(evaluation_handlers, "get_auto_evolve_enabled", lambda: True)
+
+    class RejectedEvaluateHandler:
+        async def handle(
+            self, arguments: dict[str, Any], **_kwargs: Any
+        ) -> Result[MCPToolResult, Any]:
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="REJECTED"),),
+                    meta={
+                        "session_id": arguments["session_id"],
+                        "final_approved": False,
+                        "highest_stage": 2,
+                        "pass_rate": 0.0,
+                        "run_feedback": ["failed execution remains incomplete"],
+                        "checklist": [
+                            {
+                                "ac_text": "output.json exists",
+                                "passed": False,
+                                "failure_reason": "not found",
+                            }
+                        ],
+                    },
+                )
+            )
+
+    class FakeStartRalphHandler:
+        async def handle(self, _arguments: dict[str, Any]) -> Result[MCPToolResult, Any]:
+            return Result.ok(MCPToolResult(meta={"job_id": "job_failed_run_ralph"}))
+
+    manager = JobManager(event_store)
+    start_evaluate = StartEvaluateHandler(
+        evaluate_handler=RejectedEvaluateHandler(),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=manager,
+        start_ralph_handler=FakeStartRalphHandler(),  # type: ignore[arg-type]
+    )
+    handler = StartExecuteSeedHandler(
+        execute_handler=_FailedExecuteHandler(),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=manager,
+        start_evaluate_handler=start_evaluate,
+    )
+    seed_content = (
+        "goal: Preserve failed output\n"
+        "acceptance_criteria:\n"
+        "  - output.json exists\n"
+        "ontology_schema:\n"
+        "  name: Output\n"
+        "  description: Output domain\n"
+        "metadata:\n"
+        "  seed_id: seed-failed-gen1\n"
+        "  ambiguity_score: 0.1\n"
+    )
+
+    started = await handler.handle({"seed_content": seed_content, "cwd": str(tmp_path)})
+    run_snapshot = await _wait_terminal(manager, started.value.meta["job_id"])
+    evaluate_snapshot = await _wait_terminal(
+        manager, run_snapshot.result_meta["chained_evaluate_job_id"]
+    )
+
+    assert run_snapshot.status == JobStatus.FAILED
+    lineage_id = evaluate_snapshot.result_meta["chained_ralph_lineage_id"]
+    events = await event_store.replay_lineage(lineage_id)
+    gen1 = next(event for event in events if event.type == "lineage.generation.completed")
+    assert gen1.data["evaluation_summary"]["execution_completion_status"] == "failed"
+
+
+async def test_run_job_stranded_without_terminal_event_still_terminalizes(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for this file's own CI flake signature (#1566 / PR #1576):
+    the run job's task is fully released — job task AND runner task popped,
+    persisted stream = created + running only — with no terminal event and no
+    log. Whatever silently defeats the inline guards (modeled here by dropping
+    every terminal append for the run job while its task lives), the run job
+    must still reach a terminal state instead of zombying for the full wait
+    deadline: first via the detached release-point backstop, and failing that
+    via the get_snapshot in-process stranded-job net.
+    """
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
+
+    class FakeEvaluateHandler:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        async def handle(
+            self, arguments: dict[str, Any], **_kwargs: Any
+        ) -> Result[MCPToolResult, Any]:
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="approved"),),
+                    is_error=False,
+                    meta={"final_approved": True, "session_id": arguments["session_id"]},
+                )
+            )
+
+    monkeypatch.setattr(evaluation_handlers, "EvaluateHandler", FakeEvaluateHandler)
+
+    job_manager = JobManager(event_store)
+    handler = StartExecuteSeedHandler(
+        execute_handler=_SuccessfulExecuteHandler(text="execution artifact"),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+        start_evaluate_handler=StartEvaluateHandler(
+            event_store=event_store,
+            job_manager=job_manager,
+        ),
+    )
+
+    _terminal_types = {
+        "mcp.job.completed",
+        "mcp.job.failed",
+        "mcp.job.cancelled",
+        "mcp.job.interrupted",
+    }
+    # Identify the run job from its created event (allocated before handle()
+    # returns) and drop its terminal appends while the drop flag is on. The
+    # chained evaluate job is untouched.
+    target: dict[str, str | None] = {"job_id": None}
+    dropping = {"on": True}
+    original_append_event = job_manager._append_event
+
+    async def _drop_run_job_terminal_appends(
+        event_type: str, job_id: str, data: dict, **kwargs: Any
+    ) -> None:
+        if event_type == "mcp.job.created" and data.get("job_type") == "execute_seed":
+            target["job_id"] = job_id
+        if dropping["on"] and job_id == target["job_id"] and event_type in _terminal_types:
+            return  # silently lost, like the CI capture: no event, no exception
+        await original_append_event(event_type, job_id, data, **kwargs)
+
+    job_manager._append_event = _drop_run_job_terminal_appends
+
+    started = await handler.handle({"seed_content": "goal: stranded\n", "cwd": str(tmp_path)})
+    assert started.is_ok
+    run_job_id = started.value.meta["job_id"]
+    assert target["job_id"] == run_job_id
+
+    # Wait for the run job's tasks to be fully released and its detached
+    # backstop (whose appends are also dropped) to finish: the CI signature.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and (
+        run_job_id in job_manager._tasks or getattr(job_manager, "_backstops", {})
+    ):
+        await asyncio.sleep(0.01)
+    assert run_job_id not in job_manager._tasks
+    assert run_job_id not in job_manager._runner_tasks
+    events, _ = await event_store.get_events_after("job", run_job_id, 0)
+    assert all(e.type in {"mcp.job.created", "mcp.job.updated"} for e in events)
+
+    # From here the store is healthy again; the job must terminalize promptly
+    # instead of zombying for the full 60s wait deadline.
+    dropping["on"] = False
+    deadline = time.monotonic() + 5.0
+    snapshot = await job_manager.get_snapshot(run_job_id)
+    while not snapshot.is_terminal and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+        snapshot = await job_manager.get_snapshot(run_job_id)
+    assert snapshot.is_terminal, f"run job stranded in {snapshot.status}"
+    assert snapshot.result_meta.get("interrupted_from_stranded_job_task") is True
+
+
+async def test_chained_evaluate_uses_execution_worktree_when_present(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
+    evaluate_calls: list[dict[str, Any]] = []
+
+    class FakeEvaluateHandler:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        async def handle(
+            self, arguments: dict[str, Any], **_kwargs: Any
+        ) -> Result[MCPToolResult, Any]:
+            evaluate_calls.append(arguments)
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="approved"),),
+                    is_error=False,
+                    meta={"final_approved": True, "session_id": arguments["session_id"]},
+                )
+            )
+
+    monkeypatch.setattr(evaluation_handlers, "EvaluateHandler", FakeEvaluateHandler)
+    execution_worktree = tmp_path / "task-worktree"
+    execution_worktree.mkdir()
+    original_cwd = tmp_path / "original"
+    original_cwd.mkdir()
+
+    job_manager = JobManager(event_store)
+    handler = StartExecuteSeedHandler(
+        execute_handler=_SuccessfulExecuteHandler(
+            text="execution artifact",
+            worktree_path=str(execution_worktree),
+        ),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+        start_evaluate_handler=StartEvaluateHandler(
+            event_store=event_store,
+            job_manager=job_manager,
+        ),
+    )
+
+    started = await handler.handle({"seed_content": "goal: chain\n", "cwd": str(original_cwd)})
+    assert started.is_ok
+
+    await _wait_for_call(evaluate_calls)
+    snapshot = await job_manager.get_snapshot(started.value.meta["job_id"])
+    assert snapshot.job_type == "execute_seed"
+
+    assert evaluate_calls
+    assert evaluate_calls[0]["working_dir"] == str(execution_worktree)
+
+
+async def test_auto_evaluate_override_false_preserves_legacy_run_meta_exactly(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
+
+    class UnexpectedStartEvaluateHandler:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def handle(self, _: dict[str, Any]) -> Result[MCPToolResult, Any]:
+            raise AssertionError("auto_evaluate=false must not enqueue evaluation")
+
+    monkeypatch.setattr(
+        evaluation_handlers,
+        "StartEvaluateHandler",
+        UnexpectedStartEvaluateHandler,
+    )
+
+    execute_handler = _SuccessfulExecuteHandler(text="legacy")
+    job_manager = JobManager(event_store)
+    handler = StartExecuteSeedHandler(
+        execute_handler=execute_handler,  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+    )
+
+    started = await handler.handle(
+        {
+            "seed_content": "goal: legacy\n",
+            "cwd": str(tmp_path),
+            "auto_evaluate": False,
+        }
+    )
+    assert started.is_ok
+
+    snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
+
+    assert snapshot.status == JobStatus.COMPLETED
+    assert execute_handler.returned_meta is not None
+    assert snapshot.result_meta == execute_handler.returned_meta
+    assert "chained_evaluate_job_id" not in snapshot.result_meta
+    assert snapshot.result_meta["verification_status"] == "executed_unverified"
+
+
+async def test_auto_evaluate_config_false_preserves_legacy_run_meta_exactly(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: False)
+
+    class UnexpectedStartEvaluateHandler:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def handle(self, _: dict[str, Any]) -> Result[MCPToolResult, Any]:
+            raise AssertionError("execution.auto_evaluate=false must not enqueue evaluation")
+
+    monkeypatch.setattr(
+        evaluation_handlers,
+        "StartEvaluateHandler",
+        UnexpectedStartEvaluateHandler,
+    )
+
+    execute_handler = _SuccessfulExecuteHandler(text="legacy config")
+    job_manager = JobManager(event_store)
+    handler = StartExecuteSeedHandler(
+        execute_handler=execute_handler,  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+    )
+
+    started = await handler.handle({"seed_content": "goal: config-off\n", "cwd": str(tmp_path)})
+    assert started.is_ok
+
+    snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
+
+    assert snapshot.status == JobStatus.COMPLETED
+    assert execute_handler.returned_meta is not None
+    assert snapshot.result_meta == execute_handler.returned_meta
+    assert "chained_evaluate_job_id" not in snapshot.result_meta
+    assert snapshot.result_meta["verification_status"] == "executed_unverified"
+
+
+async def test_evaluate_enqueue_failure_keeps_run_completed(
+    event_store,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execution_handlers, "get_auto_evaluate_enabled", lambda: True)
+
+    class FailingStartEvaluateHandler:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def handle(self, _: dict[str, Any]) -> Result[MCPToolResult, Any]:
+            return Result.err(MCPToolError("enqueue boom", tool_name="ouroboros_start_evaluate"))
+
+    monkeypatch.setattr(evaluation_handlers, "StartEvaluateHandler", FailingStartEvaluateHandler)
+
+    job_manager = JobManager(event_store)
+    handler = StartExecuteSeedHandler(
+        execute_handler=_SuccessfulExecuteHandler(),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+        start_evaluate_handler=FailingStartEvaluateHandler(),  # type: ignore[arg-type]
+    )
+
+    started = await handler.handle({"seed_content": "goal: failure\n", "cwd": str(tmp_path)})
+    assert started.is_ok
+
+    snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
+
+    assert snapshot.status == JobStatus.COMPLETED
+    assert snapshot.result_meta["success"] is True
+    assert snapshot.result_meta["evaluation_status"] == "enqueue_failed"
+    assert snapshot.result_meta["evaluation_error"] == "enqueue boom"
+    assert snapshot.result_meta["next_step"].startswith("ooo evaluate orch_")
+    assert "chained_evaluate_job_id" not in snapshot.result_meta
+    assert "run verdict remains unchanged" in (snapshot.result_text or "")
+
+
+async def test_start_evaluate_timeout_writes_terminal_event(
+    event_store,
+) -> None:
+    class SlowEvaluateHandler:
+        async def handle(self, _: dict[str, Any], **_kwargs: Any) -> Result[MCPToolResult, Any]:
+            await asyncio.sleep(1)
+            return Result.ok(MCPToolResult())
+
+    job_manager = JobManager(event_store)
+    handler = StartEvaluateHandler(
+        evaluate_handler=SlowEvaluateHandler(),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+        deadline_seconds=0.01,
+    )
+
+    started = await handler.handle({"session_id": "orch_timeout", "artifact": "code"})
+    assert started.is_ok
+
+    snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
+
+    assert snapshot.status == JobStatus.FAILED
+    assert snapshot.result_meta["session_id"] == "orch_timeout"
+    assert snapshot.result_meta["evaluation_status"] == "timed_out"
+    assert snapshot.result_meta["status"] == "timed_out"
+    assert "Evaluation timed out" in (snapshot.result_text or "")
+
+    events, _ = await event_store.get_events_after("job", started.value.meta["job_id"])
+    terminal = [event for event in events if event.type == "mcp.job.failed"]
+    assert terminal
+    assert terminal[-1].data["result_meta"]["evaluation_status"] == "timed_out"
+
+
+async def test_start_evaluate_zero_deadline_waits_without_timeout(event_store) -> None:
+    class ImmediateEvaluateHandler:
+        async def handle(self, _: dict[str, Any], **_kwargs: Any) -> Result[MCPToolResult, Any]:
+            await asyncio.sleep(0)
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="approved"),),
+                    meta={"session_id": "orch_no_deadline", "final_approved": True},
+                )
+            )
+
+    job_manager = JobManager(event_store)
+    handler = StartEvaluateHandler(
+        evaluate_handler=ImmediateEvaluateHandler(),  # type: ignore[arg-type]
+        event_store=event_store,
+        job_manager=job_manager,
+        deadline_seconds=0,
+    )
+
+    started = await handler.handle({"session_id": "orch_no_deadline", "artifact": "code"})
+    assert started.is_ok
+    snapshot = await _wait_terminal(job_manager, started.value.meta["job_id"])
+
+    assert snapshot.status == JobStatus.COMPLETED
+    assert snapshot.result_meta["final_approved"] is True

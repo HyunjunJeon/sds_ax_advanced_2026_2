@@ -1,0 +1,847 @@
+"""Seed Draft Ledger for bounded auto-mode convergence."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from enum import StrEnum
+import re
+from typing import Any
+
+
+class LedgerSource(StrEnum):
+    """Source categories for ledger entries."""
+
+    USER_GOAL = "user_goal"
+    REPO_FACT = "repo_fact"
+    EXISTING_CONVENTION = "existing_convention"
+    USER_PREFERENCE = "user_preference"
+    CONSERVATIVE_DEFAULT = "conservative_default"
+    ASSUMPTION = "assumption"
+    NON_GOAL = "non_goal"
+    INFERENCE = "inference"
+    # Aggressive LLM auto-fill for a non-converging interview (RFC #1256 §I3,
+    # #1263). Assumption-class, not evidence-backed: a model best-guess emitted
+    # only when the interview cannot otherwise close a required section.
+    AUTO_FILL_INFERENCE = "auto_fill_inference"
+    BLOCKER = "blocker"
+
+
+class LedgerStatus(StrEnum):
+    """Status of a ledger entry or section."""
+
+    MISSING = "missing"
+    WEAK = "weak"
+    DEFAULTED = "defaulted"
+    INFERRED = "inferred"
+    CONFIRMED = "confirmed"
+    CONFLICTING = "conflicting"
+    BLOCKED = "blocked"
+
+
+class DecisionProvenance(StrEnum):
+    """How a ledger decision came to be — orthogonal to :class:`LedgerSource`.
+
+    ``LedgerSource`` classifies *what kind of content-authority* a decision
+    rests on (user goal, repo fact, inference, …). ``DecisionProvenance``
+    classifies *how the decision was reached*, which is the axis the #1485
+    failure exposed: a timeout-defaulted decision was indistinguishable from a
+    user-confirmed one, so degraded seeds (whose contract fields contained raw
+    question text) executed silently.
+
+    The two gated classes — :data:`MODEL_INFERRED` and :data:`TIMEOUT_DEFAULT` —
+    must pass a low-ambiguity criterion (see :mod:`ouroboros.auto.grading`)
+    before the ledger can become an executable Seed. The other three are
+    grounded/human-authorized and pass the gate unconditionally.
+    """
+
+    USER_CONFIRMED = "user_confirmed"
+    MODEL_INFERRED = "model_inferred"
+    TIMEOUT_DEFAULT = "timeout_default"
+    LATERAL_CONSENSUS = "lateral_consensus"
+    MAINTAINER_POLICY = "maintainer_policy"
+
+
+SOURCE_PRIORITY: tuple[LedgerSource, ...] = (
+    LedgerSource.USER_GOAL,
+    LedgerSource.REPO_FACT,
+    LedgerSource.EXISTING_CONVENTION,
+    LedgerSource.NON_GOAL,
+    LedgerSource.USER_PREFERENCE,
+    LedgerSource.CONSERVATIVE_DEFAULT,
+    LedgerSource.INFERENCE,
+    LedgerSource.ASSUMPTION,
+    LedgerSource.AUTO_FILL_INFERENCE,
+    LedgerSource.BLOCKER,
+)
+"""Deterministic conflict priority for same-key ledger contradictions.
+
+Higher-priority sources are allowed to supersede lower-priority entries
+without a human decision. Same-priority ties fall back to confidence; exact
+source+confidence ties remain CONFLICTING so the interview driver blocks
+instead of inventing a merge.
+"""
+
+
+REQUIRED_SECTIONS = (
+    "goal",
+    "actors",
+    "inputs",
+    "outputs",
+    "constraints",
+    "non_goals",
+    "acceptance_criteria",
+    "verification_plan",
+    "failure_modes",
+    "runtime_context",
+)
+
+
+# Invariant: a section is "evidence-backed" only when its resolution is
+# anchored in something the user said, something we read off the repo, an
+# existing convention we can point to, or an explicit user-stated non-goal.
+# INFERENCE entries are model-derived guesses (not anchored in any of the
+# above) and therefore land in ``assumption_only_sections`` — the whole point
+# of this surface is to let MCP clients distinguish trustable evidence from
+# speculative content, so inferred reasoning must not be presented as grounded.
+_EVIDENCE_BACKED_SOURCES: frozenset[LedgerSource] = frozenset(
+    {
+        LedgerSource.USER_GOAL,
+        LedgerSource.REPO_FACT,
+        LedgerSource.EXISTING_CONVENTION,
+        LedgerSource.USER_PREFERENCE,
+        LedgerSource.NON_GOAL,
+    }
+)
+
+_INACTIVE_STATUSES: frozenset[LedgerStatus] = frozenset(
+    {
+        LedgerStatus.WEAK,
+        LedgerStatus.CONFLICTING,
+        LedgerStatus.BLOCKED,
+    }
+)
+
+
+_RESOLVED_STATUSES: frozenset[LedgerStatus] = frozenset(
+    {
+        LedgerStatus.CONFIRMED,
+        LedgerStatus.DEFAULTED,
+        LedgerStatus.INFERRED,
+    }
+)
+
+
+# Derivation from the content-authority axis (``LedgerSource``) to the
+# decision-origin axis (``DecisionProvenance``) for entries that were never
+# explicitly stamped — i.e. legacy sessions, deserialized entries, and the many
+# writer sites whose ``LedgerSource`` already fully implies the origin. Sources
+# not listed here (currently only ``BLOCKER``, which is never active) fall
+# through to the safest honest default: ``MODEL_INFERRED``. That default keeps
+# old sessions from crashing AND from silently passing the provenance gate — an
+# unstamped entry is treated as a model guess and screened for low ambiguity.
+_PROVENANCE_FROM_SOURCE: dict[LedgerSource, DecisionProvenance] = {
+    # Grounded in a human statement OR verified repo/convention evidence — these
+    # are not model guesses, so they pass the provenance gate unconditionally.
+    LedgerSource.USER_GOAL: DecisionProvenance.USER_CONFIRMED,
+    LedgerSource.USER_PREFERENCE: DecisionProvenance.USER_CONFIRMED,
+    LedgerSource.NON_GOAL: DecisionProvenance.USER_CONFIRMED,
+    LedgerSource.REPO_FACT: DecisionProvenance.USER_CONFIRMED,
+    LedgerSource.EXISTING_CONVENTION: DecisionProvenance.USER_CONFIRMED,
+    # Deterministic policy/config fill applied during normal answering.
+    LedgerSource.CONSERVATIVE_DEFAULT: DecisionProvenance.MAINTAINER_POLICY,
+    # Model best-guesses — gated.
+    LedgerSource.INFERENCE: DecisionProvenance.MODEL_INFERRED,
+    LedgerSource.ASSUMPTION: DecisionProvenance.MODEL_INFERRED,
+    LedgerSource.AUTO_FILL_INFERENCE: DecisionProvenance.MODEL_INFERRED,
+}
+
+_PROVENANCE_DEFAULT: DecisionProvenance = DecisionProvenance.MODEL_INFERRED
+
+
+@dataclass(frozen=True, slots=True)
+class AssumptionRecord:
+    """Auditable provenance for an assumption-class ledger entry.
+
+    Surfaced via :meth:`SeedDraftLedger.assumption_sources` and
+    :attr:`ouroboros.auto.pipeline.AutoPipelineResult.assumption_sources`
+    so callers can distinguish *what the system assumed for them* from
+    *what the user/repo confirmed*. PR-C2 of #1157.
+
+    ``source`` is the string form of one of the assumption-class
+    :class:`LedgerSource` values — ``assumption`` (auto-answerer
+    fallback), ``inference`` (model reasoning), ``conservative_default``
+    (safe-default policy), or ``auto_fill_inference`` (RFC #1256 §I3
+    aggressive auto-fill for a non-converging interview). These are
+    precisely the sources that, per :data:`_EVIDENCE_BACKED_SOURCES`,
+    are not evidence-backed and therefore contribute to
+    ``assumption_only_sections`` in :meth:`SeedDraftLedger.summary`.
+    """
+
+    text: str
+    source: str
+    confidence: float
+
+
+@dataclass(slots=True)
+class LedgerEntry:
+    """A single machine-readable fact in the Seed Draft Ledger."""
+
+    key: str
+    value: str
+    source: LedgerSource | str
+    confidence: float
+    status: LedgerStatus | str
+    reversible: bool = True
+    rationale: str = ""
+    evidence: list[str] = field(default_factory=list)
+    # Decision-origin stamp (A1 / #1485). ``None`` for unstamped/legacy entries;
+    # :attr:`effective_provenance` derives a value from ``source`` in that case.
+    # Writer sites whose origin ``source`` cannot express (deadline/timeout
+    # backstops, lateral consensus) stamp this explicitly at the decision point.
+    provenance: DecisionProvenance | str | None = None
+
+    def __post_init__(self) -> None:
+        self.source = LedgerSource(str(self.source))
+        self.status = LedgerStatus(str(self.status))
+        self.confidence = max(0.0, min(1.0, float(self.confidence)))
+        if self.provenance is not None:
+            self.provenance = DecisionProvenance(str(self.provenance))
+
+    @property
+    def effective_provenance(self) -> DecisionProvenance:
+        """Return the decision origin, deriving from ``source`` when unstamped.
+
+        Explicit :attr:`provenance` wins; otherwise the content-authority
+        ``source`` is mapped via :data:`_PROVENANCE_FROM_SOURCE`, defaulting to
+        :data:`_PROVENANCE_DEFAULT` (``model_inferred``) — the safe fallback that
+        neither crashes legacy sessions nor lets an unstamped decision skip the
+        low-ambiguity gate.
+        """
+        if self.provenance is not None:
+            return DecisionProvenance(self.provenance)
+        source = self.source if isinstance(self.source, LedgerSource) else LedgerSource(self.source)
+        return _PROVENANCE_FROM_SOURCE.get(source, _PROVENANCE_DEFAULT)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to JSON-compatible data."""
+        data = asdict(self)
+        data["source"] = self.source.value
+        data["status"] = self.status.value
+        # Keep serialization additive: only emit ``provenance`` when explicitly
+        # stamped so legacy round-trips (entries without the key) are byte-stable.
+        if self.provenance is None:
+            data.pop("provenance", None)
+        else:
+            data["provenance"] = DecisionProvenance(self.provenance).value
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LedgerEntry:
+        """Deserialize from JSON-compatible data."""
+        if not isinstance(data, dict):
+            msg = "ledger entry must be an object"
+            raise ValueError(msg)
+        required = {"key", "value", "source", "confidence", "status"}
+        missing = sorted(required - data.keys())
+        if missing:
+            msg = f"ledger entry is missing required fields: {', '.join(missing)}"
+            raise ValueError(msg)
+        if not isinstance(data["key"], str) or not data["key"].strip():
+            msg = "ledger entry key must be a non-empty string"
+            raise ValueError(msg)
+        if not isinstance(data["value"], str):
+            msg = "ledger entry value must be a string"
+            raise ValueError(msg)
+        if not isinstance(data.get("rationale", ""), str):
+            msg = "ledger entry rationale must be a string"
+            raise ValueError(msg)
+        evidence = data.get("evidence", [])
+        if not isinstance(evidence, list) or not all(isinstance(item, str) for item in evidence):
+            msg = "ledger entry evidence must be a list of strings"
+            raise ValueError(msg)
+        if "reversible" in data and not isinstance(data["reversible"], bool):
+            msg = "ledger entry reversible must be a boolean"
+            raise ValueError(msg)
+        try:
+            confidence = float(data["confidence"])
+        except (TypeError, ValueError) as exc:
+            msg = "ledger entry confidence must be numeric"
+            raise ValueError(msg) from exc
+        if confidence < 0.0 or confidence > 1.0:
+            msg = "ledger entry confidence must be between 0 and 1"
+            raise ValueError(msg)
+        provenance = data.get("provenance")
+        if provenance is not None:
+            try:
+                DecisionProvenance(str(provenance))
+            except ValueError as exc:
+                msg = f"ledger entry provenance is not a valid decision provenance: {provenance!r}"
+                raise ValueError(msg) from exc
+        return cls(**data)
+
+
+class ConflictResolution(StrEnum):
+    """Outcome of resolving a same-key ledger contradiction."""
+
+    SAME_VALUE = "same_value"
+    INCOMING_WINS = "incoming_wins"
+    EXISTING_WINS = "existing_wins"
+    BLOCKED = "blocked"
+    CONFLICTING = "conflicting"
+
+
+def resolve_conflict(existing: LedgerEntry, incoming: LedgerEntry) -> ConflictResolution:
+    """Resolve a same-key ledger conflict without model judgment.
+
+    The policy follows #809 Pillar B: source priority first, then confidence,
+    then CONFLICTING for exact ties. Incoming ``BLOCKED`` entries remain a
+    human-decision surface; earlier transient blockers can be retired by a
+    later non-blocked same-key answer.
+    """
+    if _normalize_conflict_value(existing.value) == _normalize_conflict_value(incoming.value):
+        return ConflictResolution.SAME_VALUE
+    if incoming.status == LedgerStatus.BLOCKED:
+        return ConflictResolution.BLOCKED
+    if existing.status == LedgerStatus.BLOCKED:
+        return ConflictResolution.INCOMING_WINS
+
+    existing_priority = _source_priority_index(existing.source)
+    incoming_priority = _source_priority_index(incoming.source)
+    if incoming_priority < existing_priority:
+        return ConflictResolution.INCOMING_WINS
+    if existing_priority < incoming_priority:
+        return ConflictResolution.EXISTING_WINS
+
+    if incoming.confidence > existing.confidence:
+        return ConflictResolution.INCOMING_WINS
+    if existing.confidence > incoming.confidence:
+        return ConflictResolution.EXISTING_WINS
+    return ConflictResolution.CONFLICTING
+
+
+def _source_priority_index(source: LedgerSource) -> int:
+    try:
+        return SOURCE_PRIORITY.index(source)
+    except ValueError:
+        return len(SOURCE_PRIORITY)
+
+
+@dataclass(slots=True)
+class LedgerSection:
+    """A Seed section containing one or more ledger entries."""
+
+    name: str
+    entries: list[LedgerEntry] = field(default_factory=list)
+
+    def status(self) -> LedgerStatus:
+        """Return the aggregate status for this section."""
+        if not self.entries:
+            return LedgerStatus.MISSING
+        statuses = {entry.status for entry in self.entries}
+        if LedgerStatus.BLOCKED in statuses:
+            return LedgerStatus.BLOCKED
+        if LedgerStatus.CONFLICTING in statuses:
+            return LedgerStatus.CONFLICTING
+        if LedgerStatus.CONFIRMED in statuses:
+            return LedgerStatus.CONFIRMED
+        if LedgerStatus.DEFAULTED in statuses:
+            return LedgerStatus.DEFAULTED
+        if LedgerStatus.INFERRED in statuses:
+            return LedgerStatus.INFERRED
+        return LedgerStatus.WEAK
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize section data."""
+        return {"name": self.name, "entries": [entry.to_dict() for entry in self.entries]}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LedgerSection:
+        """Deserialize section data."""
+        if not isinstance(data, dict):
+            msg = "ledger section must be an object"
+            raise ValueError(msg)
+        if not isinstance(data.get("name"), str) or not data["name"].strip():
+            msg = "ledger section name must be a non-empty string"
+            raise ValueError(msg)
+        entries_raw = data.get("entries")
+        if not isinstance(entries_raw, list):
+            msg = "ledger section entries must be a list"
+            raise ValueError(msg)
+        entries = [LedgerEntry.from_dict(item) for item in entries_raw]
+        return cls(name=data["name"], entries=entries)
+
+
+@dataclass(slots=True)
+class SeedDraftLedger:
+    """Structured auto-mode Seed draft.
+
+    The ledger performs no external IO or model calls.  It is safe to mutate in
+    tight loops without risking hangs.
+    """
+
+    sections: dict[str, LedgerSection] = field(default_factory=dict)
+    question_history: list[dict[str, str]] = field(default_factory=list)
+
+    @classmethod
+    def from_goal(cls, goal: str) -> SeedDraftLedger:
+        """Create a ledger initialized with a user goal."""
+        ledger = cls(sections={name: LedgerSection(name) for name in REQUIRED_SECTIONS})
+        clean_goal = goal.strip()
+        ledger.add_entry(
+            "goal",
+            LedgerEntry(
+                key="goal.primary",
+                value=clean_goal,
+                source=LedgerSource.USER_GOAL,
+                confidence=0.95 if clean_goal else 0.0,
+                status=LedgerStatus.CONFIRMED if clean_goal else LedgerStatus.WEAK,
+                reversible=False,
+                rationale=(
+                    "Initial user-provided auto task."
+                    if clean_goal
+                    else "Auto task goal is blank and must be clarified before Seed generation."
+                ),
+            ),
+        )
+        _hydrate_explicit_goal_sections(ledger, clean_goal)
+        return ledger
+
+    def add_entry(self, section_name: str, entry: LedgerEntry) -> None:
+        """Append ``entry`` to a section, marking same-key contradictions explicit.
+
+        A later same-key answer that returns to a previously seen value is treated
+        as a correction: older contradictory entries become weak historical facts
+        instead of keeping the section permanently conflicting.
+        """
+        section = self.sections.setdefault(section_name, LedgerSection(section_name))
+        same_key_entries = [existing for existing in section.entries if existing.key == entry.key]
+        entry_value = _normalize_conflict_value(entry.value)
+        matching_prior = [
+            existing
+            for existing in same_key_entries
+            if _normalize_conflict_value(existing.value) == entry_value
+        ]
+        if (
+            same_key_entries
+            and entry.source in {LedgerSource.USER_GOAL, LedgerSource.NON_GOAL}
+            and entry.status == LedgerStatus.CONFIRMED
+        ):
+            for existing in same_key_entries:
+                existing.status = LedgerStatus.WEAK
+                existing.rationale = (
+                    existing.rationale or "Superseded by a later user-confirmed answer."
+                )
+        elif matching_prior:
+            for existing in same_key_entries:
+                if entry.status == LedgerStatus.BLOCKED:
+                    continue
+                if existing.status == LedgerStatus.BLOCKED:
+                    existing.status = LedgerStatus.WEAK
+                    existing.rationale = (
+                        existing.rationale or "Superseded by a later same-key answer."
+                    )
+                    continue
+                if _normalize_conflict_value(existing.value) == entry_value:
+                    if existing.status == LedgerStatus.CONFLICTING:
+                        existing.status = entry.status
+                    continue
+                existing.status = LedgerStatus.WEAK
+                existing.rationale = (
+                    existing.rationale or "Superseded by a later same-key correction."
+                )
+        else:
+            for existing in same_key_entries:
+                resolution = resolve_conflict(existing, entry)
+                if resolution is ConflictResolution.BLOCKED:
+                    continue
+                if resolution is ConflictResolution.INCOMING_WINS:
+                    existing.status = LedgerStatus.WEAK
+                    existing.rationale = existing.rationale or (
+                        "Superseded by deterministic source-priority/confidence policy."
+                    )
+                    continue
+                if resolution is ConflictResolution.EXISTING_WINS:
+                    entry.status = LedgerStatus.WEAK
+                    entry.rationale = entry.rationale or (
+                        "Superseded by deterministic source-priority/confidence policy."
+                    )
+                    continue
+                existing.status = LedgerStatus.CONFLICTING
+                entry.status = LedgerStatus.CONFLICTING
+                existing.rationale = existing.rationale or (
+                    "Conflicts with another same-priority auto ledger answer."
+                )
+                entry.rationale = entry.rationale or (
+                    "Conflicts with another same-priority auto ledger answer."
+                )
+        section.entries.append(entry)
+
+    def record_qa(self, question: str, answer: str) -> None:
+        """Record an interview Q/A pair in bounded form."""
+        self.question_history.append(
+            {
+                "question": _truncate(question),
+                "answer": _truncate(answer),
+            }
+        )
+
+    def section_statuses(self) -> dict[str, LedgerStatus]:
+        """Return aggregate statuses for required sections."""
+        return {
+            name: self.sections.get(name, LedgerSection(name)).status()
+            for name in REQUIRED_SECTIONS
+        }
+
+    def committed_decisions(
+        self, *, exclude_sections: frozenset[str] = frozenset({"goal"})
+    ) -> list[tuple[str, str, str]]:
+        """Return already-decided, active contracts as ``(section, key, value)``.
+
+        These are the concrete decisions the interview has locked in so far —
+        every entry whose authority is *active* (``CONFIRMED`` / ``DEFAULTED`` /
+        ``INFERRED``), one per ``(section, key)`` keeping the latest active
+        value, with the goal echo excluded (the goal is surfaced to the refiner
+        separately). ``WEAK`` / ``CONFLICTING`` / ``BLOCKED`` / ``MISSING``
+        entries are omitted because they are superseded or unresolved.
+
+        The answer refiner consumes this snapshot to stay CONSISTENT with prior
+        rounds instead of re-deciding the same facet differently every round —
+        the root cause of interview oscillation (a non-deterministic refiner
+        reformatting an already-committed output contract into a contradictory
+        one, which never converges and trips ``interview_phase_deadline``).
+        """
+        active = {LedgerStatus.CONFIRMED, LedgerStatus.DEFAULTED, LedgerStatus.INFERRED}
+        decided: dict[tuple[str, str], str] = {}
+        for name, section in self.sections.items():
+            if name in exclude_sections:
+                continue
+            for entry in section.entries:
+                if entry.status in active and entry.value.strip():
+                    decided[(name, entry.key)] = entry.value
+        return [(section, key, value) for (section, key), value in decided.items()]
+
+    def open_gaps(self) -> list[str]:
+        """Return required sections that are not Seed-ready."""
+        blocked = {
+            LedgerStatus.MISSING,
+            LedgerStatus.WEAK,
+            LedgerStatus.CONFLICTING,
+            LedgerStatus.BLOCKED,
+        }
+        return [name for name, status in self.section_statuses().items() if status in blocked]
+
+    def is_seed_ready(self) -> bool:
+        """Return True when no required section is missing/conflicting/blocked."""
+        return not self.open_gaps()
+
+    def count_active_conflicting_entries(self) -> int:
+        """Return the count of entries currently flagged as CONFLICTING.
+
+        Used by the deterministic_floor computation in :mod:`grading` so the
+        A-grade gate can see objective conflict pressure even when the LLM
+        under-reports ``ambiguity_score``.
+        """
+        return sum(
+            1
+            for section in self.sections.values()
+            for entry in section.entries
+            if entry.status == LedgerStatus.CONFLICTING
+        )
+
+    def provenance_histogram(self) -> dict[str, int]:
+        """Return counts of active entries by decision origin (A1 / #1485).
+
+        Keys are :class:`DecisionProvenance` string values; only *active*
+        entries (not WEAK/CONFLICTING/BLOCKED) are counted, so the histogram
+        reflects the decisions that actually flow into the synthesized Seed.
+        Surfaced on ``SeedMetadata.decision_provenance`` so later phases (the A2
+        trace artifact) can grep how a seed's contract was assembled and how
+        many gated (``model_inferred`` / ``timeout_default``) decisions it rests
+        on. Deterministically ordered for stable serialization.
+        """
+        counts: dict[str, int] = {}
+        for section in self.sections.values():
+            for entry in section.entries:
+                if entry.status in _INACTIVE_STATUSES:
+                    continue
+                key = entry.effective_provenance.value
+                counts[key] = counts.get(key, 0) + 1
+        return dict(sorted(counts.items()))
+
+    def assumptions(self) -> list[str]:
+        """Return assumption entry values."""
+        return self._values_for_sources({LedgerSource.ASSUMPTION})
+
+    def assumption_sources(self) -> list[AssumptionRecord]:
+        """Return active assumption-class entries with provenance attached.
+
+        PR-C2 / #1157: auditable companion to :meth:`assumptions` (which
+        returns plain ``list[str]`` for backwards-compatible callers). The
+        returned records cover every active entry whose source is one of
+        the four assumption-class :class:`LedgerSource` values —
+        ``ASSUMPTION``, ``INFERENCE``, ``CONSERVATIVE_DEFAULT``, and
+        ``AUTO_FILL_INFERENCE`` — i.e. the sources that produce
+        ``assumption_only_sections`` in
+        :meth:`summary`. Entries whose status is in
+        :data:`_INACTIVE_STATUSES` (WEAK / CONFLICTING / BLOCKED) are
+        excluded, matching the active-set semantics used by
+        :meth:`_values_for_sources`.
+
+        Same-text deduplication uses the same normalization as
+        :meth:`_values_for_sources` so the textual surface stays in lockstep
+        with :meth:`assumptions` for the ``LedgerSource.ASSUMPTION`` subset.
+        """
+        sources = {
+            LedgerSource.ASSUMPTION,
+            LedgerSource.INFERENCE,
+            LedgerSource.CONSERVATIVE_DEFAULT,
+            LedgerSource.AUTO_FILL_INFERENCE,
+        }
+        resolved: dict[tuple[str, str], AssumptionRecord] = {}
+        for section in self.sections.values():
+            for entry in section.entries:
+                if entry.source not in sources or entry.status in _INACTIVE_STATUSES:
+                    continue
+                source_str = (
+                    entry.source.value
+                    if isinstance(entry.source, LedgerSource)
+                    else str(entry.source)
+                )
+                resolved[(section.name, entry.key)] = AssumptionRecord(
+                    text=entry.value,
+                    source=source_str,
+                    confidence=entry.confidence,
+                )
+
+        seen: set[str] = set()
+        out: list[AssumptionRecord] = []
+        for record in resolved.values():
+            normalized = _normalize_conflict_value(record.text)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            out.append(record)
+        return out
+
+    def non_goals(self) -> list[str]:
+        """Return non-goal entry values."""
+        return self._values_for_sources({LedgerSource.NON_GOAL})
+
+    def summary(self) -> dict[str, Any]:
+        """Return a bounded summary suitable for CLI/MCP output."""
+        statuses = self.section_statuses()
+        # Only resolved sections (CONFIRMED/DEFAULTED/INFERRED) appear in the
+        # provenance surface.  Sections that are still MISSING/WEAK/CONFLICTING/
+        # BLOCKED at the aggregate level are reported via ``open_gaps`` instead,
+        # so a section with a defaulted entry plus a later blocker is not
+        # misrepresented as grounded in either the raw provenance map or the
+        # derived evidence/assumption classification.
+        resolved_sections = {
+            name for name, status in statuses.items() if status in _RESOLVED_STATUSES
+        }
+        provenance = self._provenance_index(resolved_sections)
+        evidence_backed_set = {
+            section
+            for source in _EVIDENCE_BACKED_SOURCES
+            for section in provenance.get(source.value, ())
+        }
+        evidence_backed = sorted(evidence_backed_set)
+        assumption_only = sorted(resolved_sections - evidence_backed_set)
+        return {
+            "complete_sections": [
+                name
+                for name, status in statuses.items()
+                if status in {LedgerStatus.CONFIRMED, LedgerStatus.DEFAULTED, LedgerStatus.INFERRED}
+            ],
+            "weak_sections": [
+                name for name, status in statuses.items() if status == LedgerStatus.WEAK
+            ],
+            "defaulted_sections": [
+                name for name, status in statuses.items() if status == LedgerStatus.DEFAULTED
+            ],
+            "assumptions": [_truncate(value) for value in self.assumptions()],
+            "non_goals": [_truncate(value) for value in self.non_goals()],
+            "open_gaps": self.open_gaps(),
+            "risks": [
+                _truncate(entry.value)
+                for section in self.sections.values()
+                for entry in section.entries
+                if entry.key.startswith("risk.")
+            ],
+            "provenance": provenance,
+            "evidence_backed_sections": evidence_backed,
+            "assumption_only_sections": assumption_only,
+        }
+
+    def _provenance_index(self, resolved_sections: set[str]) -> dict[str, list[str]]:
+        """Group resolved section names by ledger source for #640 surface visibility.
+
+        ``resolved_sections`` is the set of sections whose aggregate status is
+        CONFIRMED/DEFAULTED/INFERRED.  Sections still in
+        MISSING/WEAK/CONFLICTING/BLOCKED are excluded so the surface never
+        attributes a source to a section the ledger reports as unresolved.
+        """
+        index: dict[str, set[str]] = {source.value: set() for source in LedgerSource}
+        for section in self.sections.values():
+            if section.name not in resolved_sections:
+                continue
+            for entry in section.entries:
+                if entry.status in _INACTIVE_STATUSES:
+                    continue
+                index[entry.source.value].add(section.name)
+        return {key: sorted(values) for key, values in index.items() if values}
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the ledger."""
+        return {
+            "sections": {name: section.to_dict() for name, section in self.sections.items()},
+            "question_history": list(self.question_history),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SeedDraftLedger:
+        """Deserialize the ledger."""
+        if not isinstance(data, dict):
+            msg = "ledger must be an object"
+            raise ValueError(msg)
+        sections_raw = data.get("sections")
+        if not isinstance(sections_raw, dict):
+            msg = "ledger sections must be an object"
+            raise ValueError(msg)
+        sections: dict[str, LedgerSection] = {}
+        for name, section_raw in sections_raw.items():
+            if not isinstance(name, str) or not name.strip():
+                msg = "ledger section keys must be non-empty strings"
+                raise ValueError(msg)
+            section = LedgerSection.from_dict(section_raw)
+            if section.name != name:
+                msg = f"ledger section key/name mismatch: {name} != {section.name}"
+                raise ValueError(msg)
+            sections[name] = section
+
+        question_history = data.get("question_history")
+        if not isinstance(question_history, list):
+            msg = "ledger question_history must be a list"
+            raise ValueError(msg)
+        for item in question_history:
+            if not isinstance(item, dict):
+                msg = "ledger question_history entries must be objects"
+                raise ValueError(msg)
+            if set(item) != {"question", "answer"}:
+                msg = "ledger question_history entries must contain question and answer"
+                raise ValueError(msg)
+            if not isinstance(item["question"], str) or not isinstance(item["answer"], str):
+                msg = "ledger question_history question and answer must be strings"
+                raise ValueError(msg)
+
+        ledger = cls(sections=sections, question_history=[dict(item) for item in question_history])
+        for required in REQUIRED_SECTIONS:
+            ledger.sections.setdefault(required, LedgerSection(required))
+        return ledger
+
+    def _values_for_sources(self, sources: set[LedgerSource]) -> list[str]:
+        resolved: dict[tuple[str, str], str] = {}
+        inactive = {LedgerStatus.WEAK, LedgerStatus.CONFLICTING, LedgerStatus.BLOCKED}
+        for section in self.sections.values():
+            for entry in section.entries:
+                if entry.source not in sources or entry.status in inactive:
+                    continue
+                resolved[(section.name, entry.key)] = entry.value
+
+        values: list[str] = []
+        seen: set[str] = set()
+        for value in resolved.values():
+            normalized = _normalize_conflict_value(value)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            values.append(value)
+        return values
+
+
+def _normalize_conflict_value(value: str) -> str:
+    return " ".join(value.strip().casefold().split())
+
+
+_EXPLICIT_GOAL_SECTION_PATTERNS: tuple[tuple[str, str, str, LedgerSource], ...] = (
+    ("actors", "actors.user_goal", r"actors?", LedgerSource.USER_GOAL),
+    ("inputs", "inputs.user_goal", r"inputs?", LedgerSource.USER_GOAL),
+    ("outputs", "outputs.user_goal", r"outputs?", LedgerSource.USER_GOAL),
+    (
+        "runtime_context",
+        "runtime_context.user_goal",
+        r"runtime context",
+        LedgerSource.USER_GOAL,
+    ),
+    ("non_goals", "non_goals.user_goal", r"non[- ]goals?", LedgerSource.NON_GOAL),
+    (
+        "acceptance_criteria",
+        "acceptance_criteria.user_goal",
+        r"acceptance criteria",
+        LedgerSource.USER_GOAL,
+    ),
+    (
+        "verification_plan",
+        "verification_plan.user_goal",
+        r"verification plan",
+        LedgerSource.USER_GOAL,
+    ),
+    ("failure_modes", "failure_modes.user_goal", r"failure modes?", LedgerSource.USER_GOAL),
+    ("constraints", "constraints.user_goal", r"constraints?", LedgerSource.USER_GOAL),
+)
+
+_EXPLICIT_GOAL_SECTION_LABEL_PATTERN = "|".join(
+    f"(?:{label_pattern})"
+    for _section_name, _key, label_pattern, _source in _EXPLICIT_GOAL_SECTION_PATTERNS
+)
+_EXPLICIT_GOAL_SECTION_START = r"(?:^\s*(?:[-*]\s*)?|(?<=[.;!?])\s+|(?:\r?\n)\s*(?:[-*]\s*)?)"
+_EXPLICIT_GOAL_SECTION_BOUNDARY = (
+    rf"(?=(?:[.;!?]\s+|(?:\r?\n)\s*(?:[-*]\s*)?)"
+    rf"(?:{_EXPLICIT_GOAL_SECTION_LABEL_PATTERN})\s+(?:is|are)\s+|\s*$)"
+)
+
+
+def _hydrate_explicit_goal_sections(ledger: SeedDraftLedger, goal: str) -> None:
+    """Populate required ledger sections from explicit structured goal facts.
+
+    ``ooo auto`` callers often provide a complete, sentence-shaped brief such as
+    "Actor is ... Inputs are ... Outputs are ...".  The interview answerer only
+    updates sections when the backend asks matching questions, so a completed
+    interview could otherwise block with empty required sections even though the
+    user goal already contained the facts.  Keep this parser deliberately
+    narrow: it only confirms sections with explicit ``<section> is/are`` labels.
+    """
+    if not goal:
+        return
+    for section_name, key, label_pattern, source in _EXPLICIT_GOAL_SECTION_PATTERNS:
+        pattern = (
+            rf"{_EXPLICIT_GOAL_SECTION_START}\b(?:{label_pattern})\s+(?:is|are)\s+"
+            rf"(?P<value>.*?)"
+            rf"{_EXPLICIT_GOAL_SECTION_BOUNDARY}"
+        )
+        for match in re.finditer(pattern, goal, flags=re.IGNORECASE | re.DOTALL):
+            value = _clean_goal_fact(match.group("value"))
+            if not value:
+                continue
+            ledger.add_entry(
+                section_name,
+                LedgerEntry(
+                    key=key,
+                    value=value,
+                    source=source,
+                    confidence=0.93,
+                    status=LedgerStatus.CONFIRMED,
+                    reversible=False,
+                    rationale=f"Explicitly supplied in the initial auto goal for {section_name}.",
+                ),
+            )
+
+
+def _clean_goal_fact(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip(" ,:;")
+
+
+def _truncate(value: str, *, limit: int = 500) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 15].rstrip() + " ... (truncated)"

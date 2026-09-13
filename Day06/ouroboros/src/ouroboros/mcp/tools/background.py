@@ -1,0 +1,412 @@
+"""Shared background-job pipeline for the ``Start*`` MCP tool handlers.
+
+The fire-and-forget ``ouroboros_start_*`` tools all wrap their real work in
+the same four-step pipeline:
+
+1. ``allocate_job_id()`` — reserve a durable job id up front.
+2. A ``should_cancel()`` pre-work guard so a job cancelled while still queued
+   returns a terminal *cancelled* result instead of starting work.
+3. ``run_with_agent_process(process_id="{scope}:{job_id}",
+   cancel_key="mcp_job:{job_id}")`` — bind the runner to the AgentProcess
+   acceptance boundary AND to the durable cancel marker
+   :meth:`JobManager.cancel_job` writes under ``mcp_job:{job_id}``.
+4. ``start_job(..., job_id=job_id)`` — enqueue and return the snapshot.
+
+Extracting it here removes five copies and, more importantly, fixes a
+divergence: ``StartEvaluateHandler`` and ``StartAutoHandler`` historically
+wrapped their runner with ``lambda _handle: _runner()`` and passed **no**
+``process_id`` / ``cancel_key``.  Because ``run_with_agent_process`` only
+constructs a :class:`CheckpointStore` (the component that loads a persisted
+cancel marker) when ``cancel_key or process_id`` is set, those two surfaces
+wrote a durable ``mcp_job:{job_id}`` cancel marker that their agent process
+could never observe — the restart-visible cancellation contract documented
+on :meth:`JobManager._persist_durable_cancel` was silently broken for them.
+Routing every ``Start*`` handler through this helper gives evaluate/auto the
+same guard and cancel_key as evolve/execute/ralph, restoring that contract.
+
+The helper deliberately does **not** build the receipt envelope: each
+handler's receipt text/meta differs (lineage_id vs session_id vs auto's
+dispatch_mode tuple), and some handlers compose work *around* enqueue
+(auto's start-lease lifecycle, execute_seed's post-receipt idempotency
+write).  The helper returns the :class:`JobSnapshot` so callers keep full
+control of the receipt and of any compose-around bookkeeping.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+import inspect
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from ouroboros.mcp.detached_jobs import (
+    DetachedJobAcceptanceTimeout,
+    DetachedJobRequest,
+    launch_detached_job,
+)
+from ouroboros.mcp.errors import JobWorkError, MCPToolError
+from ouroboros.mcp.failure_taxonomy import RUN_FAILURE_CAUSES, FailureReasonCode
+from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
+from ouroboros.orchestrator.agent_process import run_with_agent_process
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ouroboros.mcp.job_manager import JobLinks, JobManager, JobSnapshot
+    from ouroboros.orchestrator.agent_process import AgentProcessHandle
+    from ouroboros.persistence.event_store import EventStore
+
+# Type of the inner work callable: receives the AgentProcess handle (so the
+# work can re-check cancellation mid-flight if it wants) and returns the
+# tool result.
+WorkFn = Callable[["AgentProcessHandle"], Awaitable[MCPToolResult]]
+
+
+@dataclass(slots=True)
+class BackgroundJobAcceptanceState:
+    """Track whether cancellation may race an accepted background owner."""
+
+    phase: str = "pre_acceptance"
+    job_manager: JobManager | None = None
+    job_id: str | None = None
+
+    def begin_detached_acceptance(self, job_manager: JobManager, job_id: str) -> None:
+        self.phase = "detached_pending"
+        self.job_manager = job_manager
+        self.job_id = job_id
+
+    def begin_local_acceptance(self, job_manager: JobManager, job_id: str) -> None:
+        self.phase = "local_pending"
+        self.job_manager = job_manager
+        self.job_id = job_id
+
+    def mark_accepted(self) -> None:
+        self.phase = "accepted"
+
+    def may_have_accepted(self, _exc: BaseException) -> bool:
+        """Classify ownership from the transport phase, not exception type alone."""
+        if self.phase == "accepted":
+            return True
+        if self.phase == "detached_pending":
+            if self.job_manager is None or self.job_id is None:
+                return True
+            has_unresolved_acceptance = getattr(
+                type(self.job_manager), "has_unresolved_job_acceptance", None
+            )
+            return not callable(has_unresolved_acceptance) or bool(
+                has_unresolved_acceptance(self.job_manager, self.job_id)
+            )
+        if self.phase != "local_pending" or self.job_manager is None or self.job_id is None:
+            return False
+        has_accepted_job = getattr(type(self.job_manager), "has_accepted_job", None)
+        return bool(callable(has_accepted_job) and has_accepted_job(self.job_manager, self.job_id))
+
+
+def make_cancelled_result(text: str) -> MCPToolResult:
+    """Build the terminal *cancelled-before-work* tool result.
+
+    Centralises the ``is_error=True`` / ``meta={"status": "cancelled"}``
+    shape the pre-work guard returns so every ``Start*`` handler emits an
+    identical cancellation envelope.  ``run_with_agent_process`` reads
+    ``meta["status"] == "cancelled"`` to terminalise the AgentProcess as
+    *cancelled* rather than *failed*.
+    """
+    return MCPToolResult(
+        content=(MCPContentItem(type=ContentType.TEXT, text=text),),
+        is_error=True,
+        meta={"status": "cancelled"},
+    )
+
+
+def _runtime_requires_in_process_job(runtime_backend: str | None) -> bool:
+    """Return whether this runtime's jobs must stay in the serving process.
+
+    Capability-driven, not a name check: a runtime with ``supports_runtime``
+    and no CLI spawns nothing — its execution parks in-process waiters (the
+    host-dispatch bridge) that only this server's tool handlers can redeem.
+    """
+    candidate = (runtime_backend or "").strip().lower()
+    if not candidate:
+        return False
+    from ouroboros.backends import get_backend_capability
+
+    capability = get_backend_capability(candidate)
+    return capability is not None and capability.supports_runtime and capability.cli_name is None
+
+
+async def start_background_tool_job(
+    *,
+    job_manager: JobManager,
+    event_store: EventStore,
+    job_type: str,
+    intent: str,
+    process_scope: str,
+    initial_message: str,
+    links: JobLinks,
+    work_fn: WorkFn,
+    cancelled_text: str,
+    detached_tool_name: str | None = None,
+    detached_arguments: dict[str, object] | None = None,
+    runtime_backend: str | None = None,
+    llm_backend: str | None = None,
+    opencode_mode: str | None = None,
+    on_detaching: Callable[[], Awaitable[None]] | None = None,
+    on_started: Callable[[JobSnapshot], Awaitable[None]] | None = None,
+    on_enqueue_failure: Callable[[BaseException], Awaitable[None]] | None = None,
+    prepare_inline: (Callable[[], Awaitable[tuple[JobLinks, WorkFn]]] | None) = None,
+    on_cancel_before_work: Callable[[], Awaitable[None]] | None = None,
+    acceptance_state: BackgroundJobAcceptanceState | None = None,
+    requires_in_process_job: bool = False,
+) -> JobSnapshot:
+    """Run the shared allocate -> guard -> agent-process -> start_job pipeline.
+
+    Args:
+        job_manager: The per-server :class:`JobManager`.
+        event_store: The shared :class:`EventStore` (passed to the runner).
+        job_type: ``JobManager`` job_type tag (e.g. ``"evolve_step"``).
+        intent: AgentProcess intent label (e.g. ``"evolve_step"``).
+        process_scope: Prefix for the deterministic AgentProcess
+            ``process_id`` (e.g. ``"evolve_step:{lineage_id}"``); the helper
+            appends ``":{job_id}"``.
+        initial_message: Human-readable queued message for the job snapshot.
+        links: :class:`JobLinks` for the job (session/execution/lineage).
+        work_fn: The inner work, invoked with the AgentProcess handle.  The
+            helper wraps it with the standard ``should_cancel()`` pre-work
+            guard so callers must not re-implement that check.
+        cancelled_text: Text for the cancelled-before-work result.
+        detached_tool_name: Public Start* tool to re-enter in the detached
+            owner process when durable jobs are enabled.
+        detached_arguments: JSON-safe arguments for ``detached_tool_name``.
+        runtime_backend: Runtime override reproduced in the worker composition.
+        llm_backend: LLM override reproduced in the worker composition.
+        opencode_mode: OpenCode integration mode reproduced in the worker.
+        on_detaching: Optional hook invoked only in the accepting process just
+            before ownership is transferred. Auto uses it to release its
+            parent-owned pending lease so the worker can reserve/claim one.
+        on_started: Optional async hook invoked with the snapshot *after* a
+            successful ``start_job`` and *before* this function returns — used
+            by auto to update its start lease while still owning the snapshot.
+        on_enqueue_failure: Optional async hook invoked if ``start_job``
+            raises, *before* the exception is re-raised — used by auto to
+            release its start lease.  The helper always closes the pending
+            runner coroutine on failure regardless of this hook.
+        prepare_inline: Optional two-phase preparation invoked only in the
+            process that will own the inline runner. It may replace both the
+            durable job links and work function before ``mcp.job.created`` is
+            persisted. Detached accepting processes deliberately skip it.
+        on_cancel_before_work: Optional cleanup for state reserved by
+            ``prepare_inline`` when cancellation wins before the work starts.
+        acceptance_state: Optional caller-owned phase tracker used to classify
+            cancellation as definitive non-acceptance or potentially accepted
+            ownership without exposing transport internals to the caller.
+        requires_in_process_job: Force the in-process decision `runtime_backend`
+            alone cannot make. A caller whose job composes multiple stages at
+            different runtimes (``ooo auto`` with a mixed
+            ``runtime_profile.stages``) must resolve whether ANY stage is a
+            host-dispatch runtime itself and pass the result here — the
+            capability check on ``runtime_backend`` alone only sees the label
+            the caller was constructed with (e.g. auto's reflect-stage
+            default), which can differ from the stage that actually parks a
+            dispatch.
+
+    Returns:
+        The :class:`JobSnapshot` from a successful enqueue.
+
+    Raises:
+        Re-raises any exception from ``start_job`` after running
+        ``on_enqueue_failure`` and closing the runner coroutine.
+    """
+    acceptance_state = acceptance_state or BackgroundJobAcceptanceState()
+    job_id = await job_manager.allocate_job_id()
+    claim_inline = getattr(job_manager, "claim_forced_inline_allocation", None)
+    forced_inline = bool(claim_inline(job_id)) if callable(claim_inline) else False
+    durable_jobs_enabled = (
+        getattr(job_manager, "durable_jobs_enabled", False) is True
+        and getattr(event_store, "supports_cross_process_workers", False) is True
+    )
+    if durable_jobs_enabled and (
+        _runtime_requires_in_process_job(runtime_backend) or requires_in_process_job
+    ):
+        # Host-driven dispatch runtimes park in-process waiters that the MCP
+        # host redeems through THIS server's bridge. A detached worker would
+        # park them in its own process, invisible to every job_wait/submit
+        # call the host can make — so the job must run where the host talks.
+        durable_jobs_enabled = False
+
+    if durable_jobs_enabled and not forced_inline:
+        if detached_tool_name is None or detached_arguments is None:
+            job_manager.abandon_reserved_job_id(job_id)
+            raise RuntimeError(
+                f"Durable background job {job_type!r} is missing its detached invocation"
+            )
+        try:
+            request = DetachedJobRequest(
+                job_id=job_id,
+                tool_name=detached_tool_name,
+                arguments=dict(detached_arguments),
+                database_url=event_store.database_url,
+                cwd=str(Path.cwd()),
+                runtime_backend=runtime_backend,
+                llm_backend=llm_backend,
+                opencode_mode=opencode_mode,
+            )
+            if on_detaching is not None:
+                await on_detaching()
+            acceptance_state.begin_detached_acceptance(job_manager, job_id)
+            snapshot = await launch_detached_job(
+                job_manager=job_manager,
+                event_store=event_store,
+                request=request,
+            )
+            acceptance_state.mark_accepted()
+            settle_external_acceptance = getattr(
+                job_manager, "settle_external_job_acceptance", None
+            )
+            if callable(settle_external_acceptance):
+                settle_external_acceptance(job_id)
+        except DetachedJobAcceptanceTimeout as exc:
+            acceptance_state.mark_accepted()
+            settle_external_acceptance = getattr(
+                job_manager, "settle_external_job_acceptance", None
+            )
+            if callable(settle_external_acceptance):
+                settle_external_acceptance(job_id)
+            if on_enqueue_failure is not None:
+                try:
+                    await on_enqueue_failure(exc)
+                except Exception:
+                    logger.warning(
+                        "mcp.background_job.detached_enqueue_failure_hook_failed",
+                        extra={"job_type": job_type},
+                        exc_info=True,
+                    )
+            raise MCPToolError(
+                "Detached worker acceptance is still pending. Do not start a duplicate; "
+                "use the structured status_check receipt.",
+                tool_name=detached_tool_name,
+                error_code="detached_job_acceptance_pending",
+                details=exc.receipt,
+            ) from exc
+        except BaseException as exc:
+            if acceptance_state.may_have_accepted(exc):
+                acceptance_state.mark_accepted()
+                settle_external_acceptance = getattr(
+                    job_manager, "settle_external_job_acceptance", None
+                )
+                if callable(settle_external_acceptance):
+                    settle_external_acceptance(job_id)
+            else:
+                job_manager.abandon_reserved_job_id(job_id)
+            if on_enqueue_failure is not None:
+                try:
+                    await on_enqueue_failure(exc)
+                except Exception:
+                    logger.warning(
+                        "mcp.background_job.detached_enqueue_failure_hook_failed",
+                        extra={"job_type": job_type},
+                        exc_info=True,
+                    )
+            raise
+        if on_started is not None:
+            await on_started(snapshot)
+        return snapshot
+
+    inline_links = links
+    inline_work_fn = work_fn
+    if prepare_inline is not None:
+        try:
+            inline_links, inline_work_fn = await prepare_inline()
+        except BaseException as exc:
+            job_manager.abandon_reserved_job_id(job_id)
+            if on_enqueue_failure is not None:
+                await on_enqueue_failure(exc)
+            raise
+
+    async def _guarded_runner(handle: AgentProcessHandle) -> MCPToolResult:
+        # Uniform pre-work cancel guard: a job cancelled while still queued
+        # must return a terminal cancelled result without starting work.
+        if handle.should_cancel():
+            if on_cancel_before_work is not None:
+                await on_cancel_before_work()
+            return make_cancelled_result(cancelled_text)
+        return await inline_work_fn(handle)
+
+    runner = run_with_agent_process(
+        event_store=event_store,
+        intent=intent,
+        work_fn=_guarded_runner,
+        process_id=f"{process_scope}:{job_id}",
+        cancel_key=f"mcp_job:{job_id}",
+    )
+
+    acceptance_state.begin_local_acceptance(job_manager, job_id)
+    try:
+        snapshot = await job_manager.start_job(
+            job_type=job_type,
+            initial_message=initial_message,
+            runner=runner,
+            links=inline_links,
+            job_id=job_id,
+        )
+    except BaseException as exc:
+        # Mirror the pre-extraction auto handler's failure path: close the
+        # un-started runner coroutine so it is not left un-awaited, then let
+        # the caller release any compose-around bookkeeping before we re-raise.
+        # Once ``start_job`` registers ownership it has wrapped this coroutine
+        # in a live Task; closing the same coroutine here would strand that job.
+        if not acceptance_state.may_have_accepted(exc):
+            job_manager.abandon_reserved_job_id(job_id)
+            if inspect.iscoroutine(runner):
+                runner.close()
+        if on_enqueue_failure is not None:
+            try:
+                await on_enqueue_failure(exc)
+            except Exception:
+                # Cleanup is best-effort: a failing hook must never mask the
+                # original enqueue exception being re-raised below.
+                logger.warning(
+                    "mcp.background_job.enqueue_failure_hook_failed",
+                    extra={"job_type": job_type},
+                    exc_info=True,
+                )
+        raise
+
+    acceptance_state.mark_accepted()
+    if on_started is not None:
+        await on_started(snapshot)
+
+    return snapshot
+
+
+_REASON_CODE_VALUES = frozenset(code.value for code in FailureReasonCode)
+
+
+def job_work_error(error: object) -> JobWorkError:
+    """Wrap a handler's ``Result.err`` for a background job runner.
+
+    Replaces ``RuntimeError(str(error))`` at the job runners so the failed
+    terminal payload keeps the same human-readable message while lifting only
+    closed vocabulary out of ``MCPToolError.failure_meta``: a
+    ``failure_cause`` from ``RUN_FAILURE_CAUSES`` (with its derived reason
+    code) and/or an explicit ``failure_reason_code``. Anything else stays
+    behind — prose, paths, and identifiers never reach ``result_meta``.
+    """
+    from ouroboros.orchestrator.run_failure_cause import failure_reason_code_for_run_cause
+
+    meta: dict[str, Any] = {}
+    details = getattr(error, "failure_meta", None)
+    if isinstance(details, Mapping):
+        cause = details.get("failure_cause")
+        if isinstance(cause, str) and cause in RUN_FAILURE_CAUSES:
+            meta["failure_cause"] = cause
+            meta["failure_reason_code"] = failure_reason_code_for_run_cause(cause).value
+        reason = details.get("failure_reason_code")
+        if (
+            "failure_reason_code" not in meta
+            and isinstance(reason, str)
+            and reason in _REASON_CODE_VALUES
+        ):
+            meta["failure_reason_code"] = reason
+    return JobWorkError(str(error), result_meta=meta)

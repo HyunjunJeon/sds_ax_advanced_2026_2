@@ -1,0 +1,551 @@
+"""Unit tests for TUI widgets."""
+
+from unittest.mock import MagicMock
+
+from rich.text import Text
+
+from ouroboros.tui.widgets.ac_progress import ACProgressItem, ACProgressWidget
+from ouroboros.tui.widgets.ac_tree import ACTreeWidget
+from ouroboros.tui.widgets.phase_progress import PhaseIndicator, PhaseProgressWidget
+
+
+class TestPhaseIndicator:
+    """Tests for PhaseIndicator widget."""
+
+    def test_create_phase_indicator(self) -> None:
+        """Test creating a phase indicator."""
+        indicator = PhaseIndicator(
+            phase_name="discover",
+            phase_label="Discover",
+            phase_type="diverge",
+            is_active=False,
+            is_completed=False,
+        )
+
+        assert indicator.phase_name == "discover"
+        assert indicator.phase_type == "diverge"
+        assert indicator.has_class("diverge")
+
+    def test_active_indicator(self) -> None:
+        """Test active phase indicator."""
+        indicator = PhaseIndicator(
+            phase_name="define",
+            phase_label="Define",
+            phase_type="converge",
+            is_active=True,
+        )
+
+        assert indicator.has_class("active")
+
+    def test_completed_indicator(self) -> None:
+        """Test completed phase indicator."""
+        indicator = PhaseIndicator(
+            phase_name="discover",
+            phase_label="Discover",
+            phase_type="diverge",
+            is_completed=True,
+        )
+
+        assert indicator.has_class("completed")
+
+    def test_set_active(self) -> None:
+        """Test setting active state."""
+        indicator = PhaseIndicator(
+            phase_name="discover",
+            phase_label="Discover",
+            phase_type="diverge",
+        )
+
+        indicator.set_active(True)
+        assert indicator.has_class("active")
+
+        indicator.set_active(False)
+        assert not indicator.has_class("active")
+
+    def test_set_completed(self) -> None:
+        """Test setting completed state."""
+        indicator = PhaseIndicator(
+            phase_name="discover",
+            phase_label="Discover",
+            phase_type="diverge",
+        )
+
+        indicator.set_completed(True)
+        assert indicator.has_class("completed")
+
+        indicator.set_completed(False)
+        assert not indicator.has_class("completed")
+
+
+class TestPhaseProgressWidget:
+    """Tests for PhaseProgressWidget."""
+
+    def test_create_widget(self) -> None:
+        """Test creating phase progress widget."""
+        widget = PhaseProgressWidget(current_phase="discover", iteration=1)
+
+        assert widget.current_phase == "discover"
+        assert widget.iteration == 1
+
+    def test_update_phase(self) -> None:
+        """Test updating current phase."""
+        widget = PhaseProgressWidget()
+
+        widget.update_phase("define", iteration=2)
+
+        assert widget.current_phase == "define"
+        assert widget.iteration == 2
+
+    def test_is_phase_completed(self) -> None:
+        """Test phase completion check."""
+        widget = PhaseProgressWidget(current_phase="design")
+
+        # Discover and Define should be completed
+        assert widget._is_phase_completed("discover") is True
+        assert widget._is_phase_completed("define") is True
+        # Design and Deliver should not be completed
+        assert widget._is_phase_completed("design") is False
+        assert widget._is_phase_completed("deliver") is False
+
+    def test_is_phase_completed_no_current(self) -> None:
+        """Test phase completion when no current phase."""
+        widget = PhaseProgressWidget(current_phase="")
+
+        assert widget._is_phase_completed("discover") is False
+
+
+class TestACTreeWidget:
+    """Tests for ACTreeWidget."""
+
+    def test_create_widget_empty(self) -> None:
+        """Test creating empty AC tree widget."""
+        widget = ACTreeWidget()
+
+        assert widget.tree_data == {}
+        assert widget.current_ac_id == ""
+        assert widget._node_map == {}
+
+    def test_create_widget_with_data(self) -> None:
+        """Test creating widget with tree data."""
+        tree_data = {
+            "root_id": "ac_123",
+            "nodes": {
+                "ac_123": {
+                    "id": "ac_123",
+                    "content": "Root AC",
+                    "depth": 0,
+                    "status": "pending",
+                    "is_atomic": False,
+                    "children_ids": [],
+                },
+            },
+        }
+
+        widget = ACTreeWidget(tree_data=tree_data, current_ac_id="ac_123")
+
+        assert widget.tree_data == tree_data
+        assert widget.current_ac_id == "ac_123"
+
+    def test_update_tree(self) -> None:
+        """Test updating tree data."""
+        widget = ACTreeWidget()
+        tree_data = {"root_id": "ac_456", "nodes": {}}
+
+        widget.update_tree(tree_data, current_ac_id="ac_456")
+
+        assert widget.tree_data == tree_data
+        assert widget.current_ac_id == "ac_456"
+
+    def test_update_tree_force_rebuild(self) -> None:
+        """Test update_tree with force_rebuild clears node map."""
+        widget = ACTreeWidget()
+        widget._node_map = {"ac_old": "dummy"}
+
+        widget.update_tree({}, force_rebuild=True)
+
+        assert widget._node_map == {}
+
+    def test_update_tree_recomposes_when_subtask_changes_tree_shape(self) -> None:
+        """New Sub-AC nodes should force a rebuild so the rendered tree stays in sync."""
+        initial_tree = {
+            "root_id": "root",
+            "nodes": {
+                "root": {
+                    "id": "root",
+                    "content": "Acceptance Criteria",
+                    "children_ids": ["ac_1"],
+                },
+                "ac_1": {
+                    "id": "ac_1",
+                    "content": "Composite AC",
+                    "status": "executing",
+                    "children_ids": [],
+                },
+            },
+        }
+        updated_tree = {
+            "root_id": "root",
+            "nodes": {
+                **initial_tree["nodes"],
+                "ac_1": {
+                    "id": "ac_1",
+                    "content": "Composite AC",
+                    "status": "executing",
+                    "children_ids": ["ac_1_sub_1"],
+                },
+                "ac_1_sub_1": {
+                    "id": "ac_1_sub_1",
+                    "content": "Draft migration plan",
+                    "status": "executing",
+                    "is_atomic": True,
+                    "children_ids": [],
+                },
+            },
+        }
+
+        widget = ACTreeWidget(tree_data=initial_tree)
+        widget._tree_widget = MagicMock()
+        widget._tree_data_cache = initial_tree
+        widget._node_map = {"root": MagicMock(), "ac_1": MagicMock()}
+        widget.refresh = MagicMock()
+
+        widget.update_tree(updated_tree)
+
+        assert any(call.kwargs.get("recompose") is True for call in widget.refresh.call_args_list)
+        assert widget._node_map == {}
+
+    def test_update_tree_syncs_existing_labels_for_rapid_subtask_status_changes(self) -> None:
+        """Status-only Sub-AC updates should patch the rendered labels without a full rebuild."""
+        initial_tree = {
+            "root_id": "root",
+            "nodes": {
+                "root": {
+                    "id": "root",
+                    "content": "Acceptance Criteria",
+                    "children_ids": ["ac_1"],
+                },
+                "ac_1": {
+                    "id": "ac_1",
+                    "content": "Composite AC",
+                    "status": "executing",
+                    "children_ids": ["ac_1_sub_1"],
+                },
+                "ac_1_sub_1": {
+                    "id": "ac_1_sub_1",
+                    "content": "Draft migration plan",
+                    "status": "executing",
+                    "is_atomic": True,
+                    "children_ids": [],
+                },
+            },
+        }
+        updated_tree = {
+            "root_id": "root",
+            "nodes": {
+                **initial_tree["nodes"],
+                "ac_1_sub_1": {
+                    "id": "ac_1_sub_1",
+                    "content": "Draft migration plan",
+                    "status": "completed",
+                    "is_atomic": True,
+                    "children_ids": [],
+                },
+            },
+        }
+
+        root_node = MagicMock()
+        ac_node = MagicMock()
+        subtask_node = MagicMock()
+
+        widget = ACTreeWidget(tree_data=initial_tree)
+        widget._tree_widget = MagicMock()
+        widget._tree_data_cache = initial_tree
+        widget._node_map = {
+            "root": root_node,
+            "ac_1": ac_node,
+            "ac_1_sub_1": subtask_node,
+        }
+        widget.refresh = MagicMock()
+
+        widget.update_tree(updated_tree)
+
+        assert not any(
+            call.kwargs.get("recompose") is True for call in widget.refresh.call_args_list
+        )
+        subtask_node.set_label.assert_called_once()
+        rendered_label = subtask_node.set_label.call_args[0][0]
+        assert "[green][OK][/green]" in rendered_label
+        assert "Draft migration plan" in rendered_label
+
+    def test_update_node_status(self) -> None:
+        """Test updating a node's status."""
+        tree_data = {
+            "root_id": "ac_123",
+            "nodes": {
+                "ac_123": {
+                    "id": "ac_123",
+                    "content": "Test AC",
+                    "depth": 0,
+                    "status": "pending",
+                    "is_atomic": False,
+                    "children_ids": [],
+                },
+            },
+        }
+        widget = ACTreeWidget(tree_data=tree_data)
+
+        widget.update_node_status("ac_123", "completed")
+
+        assert widget.tree_data["nodes"]["ac_123"]["status"] == "completed"
+
+    def test_update_node_status_nonexistent(self) -> None:
+        """Test updating status of nonexistent node does nothing."""
+        tree_data = {
+            "root_id": "ac_123",
+            "nodes": {
+                "ac_123": {"id": "ac_123", "content": "Test", "status": "pending"},
+            },
+        }
+        widget = ACTreeWidget(tree_data=tree_data)
+
+        # Should not raise
+        widget.update_node_status("nonexistent", "completed")
+
+        assert widget.tree_data["nodes"]["ac_123"]["status"] == "pending"
+
+    def test_format_node_label_pending(self) -> None:
+        """Test formatting label for pending node."""
+        widget = ACTreeWidget()
+        node_data = {
+            "status": "pending",
+            "content": "Test content",
+            "is_atomic": False,
+        }
+
+        label = widget._format_node_label(node_data)
+
+        assert "[dim][ ][/dim]" in label
+        assert "Test content" in label
+
+    def test_format_node_label_atomic(self) -> None:
+        """Test formatting label for atomic node."""
+        widget = ACTreeWidget()
+        node_data = {
+            "status": "atomic",
+            "content": "Atomic task",
+            "is_atomic": True,
+        }
+
+        label = widget._format_node_label(node_data)
+
+        assert "[blue][A][/blue]" in label
+
+    def test_format_node_label_atomic_subtask_keeps_runtime_status_icon(self) -> None:
+        """Atomic Sub-ACs should still surface live execution status changes."""
+        widget = ACTreeWidget()
+        node_data = {
+            "status": "completed",
+            "content": "Atomic subtask",
+            "is_atomic": True,
+        }
+
+        label = widget._format_node_label(node_data)
+
+        assert "[green][OK][/green]" in label
+        assert "[blue][A][/blue]" not in label
+
+    def test_format_node_label_current(self) -> None:
+        """Test formatting label for current AC."""
+        widget = ACTreeWidget()
+        node_data = {
+            "status": "executing",
+            "content": "Current task",
+            "is_atomic": False,
+        }
+
+        label = widget._format_node_label(node_data, is_current=True)
+
+        assert "[bold yellow]" in label
+
+    def test_format_node_label_truncation(self) -> None:
+        """Test content truncation in label."""
+        widget = ACTreeWidget()
+        long_content = "A" * 100
+        node_data = {
+            "status": "pending",
+            "content": long_content,
+            "is_atomic": False,
+        }
+
+        label = widget._format_node_label(node_data)
+
+        assert "..." in label
+        assert Text.from_markup(label).cell_len <= 54
+
+    def test_mark_node_atomic(self) -> None:
+        """Test marking a node as atomic."""
+        tree_data = {
+            "root_id": "ac_123",
+            "nodes": {
+                "ac_123": {
+                    "id": "ac_123",
+                    "content": "Test AC",
+                    "depth": 0,
+                    "status": "pending",
+                    "is_atomic": False,
+                },
+            },
+        }
+        widget = ACTreeWidget(tree_data=tree_data)
+
+        widget.mark_node_atomic("ac_123")
+
+        assert widget.tree_data["nodes"]["ac_123"]["is_atomic"] is True
+        assert widget.tree_data["nodes"]["ac_123"]["status"] == "atomic"
+
+    def test_mark_node_atomic_nonexistent(self) -> None:
+        """Test marking nonexistent node does nothing."""
+        tree_data = {
+            "root_id": "ac_123",
+            "nodes": {"ac_123": {"id": "ac_123", "is_atomic": False}},
+        }
+        widget = ACTreeWidget(tree_data=tree_data)
+
+        # Should not raise
+        widget.mark_node_atomic("nonexistent")
+
+        assert widget.tree_data["nodes"]["ac_123"]["is_atomic"] is False
+
+    def test_add_children_no_tree_widget(self) -> None:
+        """Test add_children returns False when tree widget not initialized."""
+        widget = ACTreeWidget()
+        children = [{"id": "child_1", "content": "Child 1"}]
+
+        result = widget.add_children("parent_id", children)
+
+        assert result is False
+
+    def test_add_children_parent_not_found(self) -> None:
+        """Test add_children returns False when parent not in node_map."""
+        widget = ACTreeWidget()
+        widget._tree_widget = "dummy"  # Simulate initialized tree
+        widget._node_map = {"other_id": "node"}
+        children = [{"id": "child_1", "content": "Child 1"}]
+
+        result = widget.add_children("parent_id", children)
+
+        assert result is False
+
+    def test_get_node_by_id_found(self) -> None:
+        """Test getting node by ID when it exists."""
+        widget = ACTreeWidget()
+        mock_node = "mock_tree_node"
+        widget._node_map = {"ac_123": mock_node}
+
+        result = widget.get_node_by_id("ac_123")
+
+        assert result == mock_node
+
+    def test_get_node_by_id_not_found(self) -> None:
+        """Test getting node by ID when it doesn't exist."""
+        widget = ACTreeWidget()
+        widget._node_map = {}
+
+        result = widget.get_node_by_id("nonexistent")
+
+        assert result is None
+
+
+class TestACProgressItem:
+    """Tests for ACProgressItem dataclass."""
+
+    def test_create_item(self) -> None:
+        """Test creating an AC progress item."""
+        item = ACProgressItem(
+            index=1,
+            content="Create a hello.py file",
+            status="pending",
+        )
+
+        assert item.index == 1
+        assert item.content == "Create a hello.py file"
+        assert item.status == "pending"
+        assert item.elapsed_display == ""
+        assert item.is_current is False
+
+    def test_create_item_with_elapsed(self) -> None:
+        """Test creating item with elapsed time."""
+        item = ACProgressItem(
+            index=2,
+            content="Run tests",
+            status="in_progress",
+            elapsed_display="45s",
+            is_current=True,
+        )
+
+        assert item.index == 2
+        assert item.status == "in_progress"
+        assert item.elapsed_display == "45s"
+        assert item.is_current is True
+
+
+class TestACProgressWidget:
+    """Tests for ACProgressWidget."""
+
+    def test_create_widget_empty(self) -> None:
+        """Test creating an empty progress widget."""
+        widget = ACProgressWidget()
+
+        assert widget.acceptance_criteria == []
+        assert widget.completed_count == 0
+        assert widget.total_count == 0
+
+    def test_create_widget_with_criteria(self) -> None:
+        """Test creating widget with acceptance criteria."""
+        items = [
+            ACProgressItem(index=1, content="AC 1", status="completed"),
+            ACProgressItem(index=2, content="AC 2", status="in_progress"),
+            ACProgressItem(index=3, content="AC 3", status="pending"),
+        ]
+
+        widget = ACProgressWidget(
+            acceptance_criteria=items,
+            completed_count=1,
+            total_count=3,
+        )
+
+        assert len(widget.acceptance_criteria) == 3
+        assert widget.completed_count == 1
+        assert widget.total_count == 3
+
+    def test_update_progress(self) -> None:
+        """Test updating progress."""
+        widget = ACProgressWidget()
+
+        items = [
+            ACProgressItem(index=1, content="AC 1", status="completed"),
+        ]
+
+        widget.update_progress(
+            acceptance_criteria=items,
+            completed_count=1,
+            total_count=2,
+            estimated_remaining="~5m remaining",
+        )
+
+        assert len(widget.acceptance_criteria) == 1
+        assert widget.completed_count == 1
+        assert widget.total_count == 2
+        assert widget.estimated_remaining == "~5m remaining"
+
+    def test_update_progress_partial(self) -> None:
+        """Test partial progress update."""
+        widget = ACProgressWidget(
+            completed_count=0,
+            total_count=3,
+        )
+
+        widget.update_progress(completed_count=1)
+
+        assert widget.completed_count == 1
+        assert widget.total_count == 3  # Unchanged

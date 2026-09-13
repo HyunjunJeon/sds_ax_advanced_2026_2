@@ -1,0 +1,668 @@
+/**
+ * Config CLI command handlers.
+ *
+ * Handles `gjc config <command>` subcommands for managing settings.
+ * Uses the settings schema as the source of truth for available settings.
+ */
+
+import * as fs from "node:fs/promises";
+import type * as path from "node:path";
+import { APP_NAME, getAgentDir } from "@gajae-code/utils";
+import { YAML } from "bun";
+import chalk from "chalk";
+import { AtomicYamlReplaceError, AtomicYamlRetargetError } from "../config/atomic-yaml-patch";
+import {
+	validateAutoroutingLocal,
+	validateAutoroutingProvenance,
+	validateAutoroutingSetup,
+} from "../config/autorouting-contract";
+import { loadEffectiveModelProfiles } from "../config/model-preset-registry";
+import { resolveModelProfileName } from "../config/model-profile-contract";
+import { ModelsConfigFile } from "../config/model-registry";
+import {
+	getDefault,
+	getEnumValues,
+	getType,
+	getUi,
+	SETTINGS_SCHEMA,
+	type SettingPath,
+	Settings,
+	type SettingValue,
+	settings,
+} from "../config/settings";
+import { resolveEagerTaskDelegation } from "../config/task-delegation";
+import { theme } from "../modes/theme/theme";
+import { initXdg } from "./commands/init-xdg";
+
+// =============================================================================
+// Types
+// =============================================================================
+
+export type ConfigAction = "list" | "get" | "set" | "reset" | "path" | "doctor" | "init-xdg";
+
+export interface ConfigCommandArgs {
+	action: ConfigAction;
+	key?: string;
+	value?: string;
+	flags: {
+		json?: boolean;
+		showSecrets?: boolean;
+	};
+}
+// =============================================================================
+// Setting Filtering
+// =============================================================================
+
+type CliSettingDef = {
+	path: SettingPath;
+	type: string;
+	description: string;
+	tab: string;
+};
+
+const ALL_SETTING_PATHS = Object.keys(SETTINGS_SCHEMA) as SettingPath[];
+const REDACTED_SECRET_VALUE = "<redacted>";
+const SECRET_SETTING_WORDS = new Set(["token", "secret", "password", "passwd", "pwd", "credential", "credentials"]);
+const SECRET_SETTING_COMPOUND_PREFIXES = [
+	"api",
+	"auth",
+	"access",
+	"refresh",
+	"bearer",
+	"session",
+	"client",
+	"broker",
+	"bot",
+	"basic",
+];
+const SECRET_SETTING_COMPOUND_SUFFIXES = ["token", "secret", "password", "credential"];
+
+function isSecretSettingSegment(segment: string): boolean {
+	const normalized = segment.toLowerCase();
+	if (SECRET_SETTING_WORDS.has(normalized)) return true;
+	if (/api[-_]?key/i.test(segment)) return true;
+	const words = normalized.split(/[-_]/).filter(Boolean);
+	if (words.some(word => SECRET_SETTING_WORDS.has(word))) return true;
+	return SECRET_SETTING_COMPOUND_PREFIXES.some(prefix =>
+		SECRET_SETTING_COMPOUND_SUFFIXES.some(suffix => normalized === `${prefix}${suffix}`),
+	);
+}
+
+function isSecretSettingPath(path: string): boolean {
+	return path.split(".").some(segment => isSecretSettingSegment(segment));
+}
+
+function redactConfigValue(path: string, value: unknown, showSecrets?: boolean): unknown {
+	if (showSecrets || value === undefined || value === null || !isSecretSettingPath(path)) {
+		return value;
+	}
+	return REDACTED_SECRET_VALUE;
+}
+
+/** Find setting definition by path */
+function findSettingDef(path: string): CliSettingDef | undefined {
+	if (!(path in SETTINGS_SCHEMA)) return undefined;
+	const key = path as SettingPath;
+	const ui = getUi(key);
+	return {
+		path: key,
+		type: getType(key),
+		description: ui?.description ?? "",
+		tab: ui?.tab ?? "internal",
+	};
+}
+
+/** Get available values for a setting */
+function getSettingValues(def: CliSettingDef): readonly string[] | undefined {
+	if (def.type === "enum") {
+		return getEnumValues(def.path);
+	}
+	return undefined;
+}
+
+// =============================================================================
+// Argument Parser
+// =============================================================================
+
+const VALID_ACTIONS: ConfigAction[] = ["list", "get", "set", "reset", "path", "doctor", "init-xdg"];
+
+/**
+ * Parse config subcommand arguments.
+ * Returns undefined if not a config command.
+ */
+export function parseConfigArgs(args: string[]): ConfigCommandArgs | undefined {
+	if (args.length === 0 || args[0] !== "config") {
+		return undefined;
+	}
+
+	if (args.length < 2 || args[1] === "--help" || args[1] === "-h") {
+		return { action: "list", flags: {} };
+	}
+
+	const action = args[1];
+	if (!VALID_ACTIONS.includes(action as ConfigAction)) {
+		console.error(chalk.red(`Unknown config command: ${action}`));
+		console.error(`Valid commands: ${VALID_ACTIONS.join(", ")}`);
+		process.exit(1);
+	}
+
+	const result: ConfigCommandArgs = {
+		action: action as ConfigAction,
+		flags: {},
+	};
+
+	const positionalArgs: string[] = [];
+	for (let i = 2; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--json") {
+			result.flags.json = true;
+		} else if (arg === "--show-secrets") {
+			result.flags.showSecrets = true;
+		} else if (!arg.startsWith("-")) {
+			positionalArgs.push(arg);
+		}
+	}
+
+	if (positionalArgs.length > 0) {
+		result.key = positionalArgs[0];
+	}
+	if (positionalArgs.length > 1) {
+		result.value = positionalArgs.slice(1).join(" ");
+	}
+
+	return result;
+}
+
+// =============================================================================
+// Value Formatting
+// =============================================================================
+
+function formatValue(value: unknown): string {
+	if (value === undefined || value === null) {
+		return chalk.dim("(not set)");
+	}
+	if (typeof value === "boolean") {
+		return value ? chalk.green("true") : chalk.red("false");
+	}
+	if (typeof value === "number") {
+		return chalk.cyan(String(value));
+	}
+	if (typeof value === "string") {
+		return chalk.yellow(value);
+	}
+	if (Array.isArray(value) || typeof value === "object") {
+		try {
+			return chalk.yellow(JSON.stringify(value));
+		} catch {
+			return chalk.yellow(String(value));
+		}
+	}
+	return chalk.yellow(String(value));
+}
+
+function getTypeDisplay(def: CliSettingDef): string {
+	const values = getSettingValues(def);
+	if (values && values.length > 0) {
+		return `(${values.join("|")})`;
+	}
+	switch (def.type) {
+		case "boolean":
+			return "(boolean)";
+		case "number":
+			return "(number)";
+		case "array":
+			return "(array)";
+		case "record":
+		case "constrained-record":
+			return "(record)";
+		case "optional-object":
+			return "(object)";
+		default:
+			return "(string)";
+	}
+}
+
+// =============================================================================
+// Schema-Driven Value Parsing
+// =============================================================================
+
+function parseAndSetValue(path: SettingPath, rawValue: string): void {
+	const schemaType = getType(path);
+	let parsedValue: unknown;
+
+	const trimmed = rawValue.trim();
+	switch (schemaType) {
+		case "boolean": {
+			const lower = trimmed.toLowerCase();
+			if (["true", "1", "yes", "on"].includes(lower)) parsedValue = true;
+			else if (["false", "0", "no", "off"].includes(lower)) parsedValue = false;
+			else throw new Error(`Invalid boolean value: ${rawValue}. Use true/false, yes/no, on/off, or 1/0`);
+			break;
+		}
+		case "number": {
+			parsedValue = Number(trimmed);
+			if (!Number.isFinite(parsedValue)) throw new Error(`Invalid number: ${rawValue}`);
+			const validate =
+				"validate" in SETTINGS_SCHEMA[path]
+					? (SETTINGS_SCHEMA[path].validate as ((value: number) => boolean) | undefined)
+					: undefined;
+			if (validate?.(parsedValue as number) === false) {
+				throw new Error(`Invalid number for ${path}: ${rawValue}`);
+			}
+			break;
+		}
+		case "enum": {
+			const valid = getEnumValues(path);
+			if (valid && !valid.includes(trimmed)) {
+				throw new Error(`Invalid value: ${rawValue}. Valid values: ${valid.join(", ")}`);
+			}
+			parsedValue = trimmed;
+			break;
+		}
+		case "array": {
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(trimmed);
+			} catch {
+				throw new Error(`Invalid array JSON: ${rawValue}`);
+			}
+			if (!Array.isArray(parsed)) {
+				throw new Error(`Invalid array JSON: ${rawValue}`);
+			}
+			parsedValue = parsed;
+			break;
+		}
+		case "record":
+		case "constrained-record":
+		case "optional-object": {
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(trimmed);
+			} catch {
+				throw new Error(`Invalid record JSON: ${rawValue}`);
+			}
+			if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+				throw new Error(`Invalid record JSON: ${rawValue}`);
+			}
+			parsedValue = parsed;
+			break;
+		}
+		default:
+			parsedValue = trimmed;
+	}
+	const issues =
+		path === "task.autorouting.tiers"
+			? validateAutoroutingLocal({ tiers: parsedValue })
+			: path === "task.autorouting.setup"
+				? validateAutoroutingSetup(parsedValue)
+				: path === "task.autorouting.provenance"
+					? validateAutoroutingProvenance(parsedValue)
+					: [];
+	if (issues.length > 0) {
+		throw new Error(`Invalid value for ${path}: ${issues.map(issue => `${issue.path}: ${issue.detail}`).join("; ")}`);
+	}
+
+	settings.set(path, parsedValue as SettingValue<typeof path>);
+}
+
+// =============================================================================
+// Command Handlers
+// =============================================================================
+
+export async function runConfigCommand(cmd: ConfigCommandArgs): Promise<void> {
+	await Settings.init();
+
+	switch (cmd.action) {
+		case "list":
+			handleList(cmd.flags);
+			break;
+		case "get":
+			handleGet(cmd.key, cmd.flags);
+			break;
+		case "set":
+			await handleSet(cmd.key, cmd.value, cmd.flags);
+			break;
+		case "reset":
+			await handleReset(cmd.key, cmd.flags);
+			break;
+		case "path":
+			handlePath();
+			break;
+		case "doctor":
+			handleDoctor(cmd.flags);
+			break;
+		case "init-xdg":
+			await initXdg();
+			break;
+	}
+}
+
+function handleList(flags: { json?: boolean; showSecrets?: boolean }): void {
+	const defs = ALL_SETTING_PATHS.map(path => findSettingDef(path)).filter((def): def is CliSettingDef => !!def);
+
+	if (flags.json) {
+		const result: Record<string, { value: unknown; type: string; description: string }> = {};
+		for (const def of defs) {
+			const value = settings.get(def.path);
+			result[def.path] = {
+				value: redactConfigValue(def.path, value, flags.showSecrets),
+				type: def.type,
+				description: def.description,
+			};
+		}
+		console.log(JSON.stringify(result, null, 2));
+		return;
+	}
+
+	console.log(chalk.bold("Settings:\n"));
+
+	const groups: Record<string, CliSettingDef[]> = {};
+	for (const def of defs) {
+		if (!groups[def.tab]) {
+			groups[def.tab] = [];
+		}
+		groups[def.tab].push(def);
+	}
+
+	const sortedGroups = Object.keys(groups).sort((a, b) => {
+		if (a === "config") return -1;
+		if (b === "config") return 1;
+		return a.localeCompare(b);
+	});
+
+	for (const group of sortedGroups) {
+		console.log(chalk.bold.blue(`[${group}]`));
+		for (const def of groups[group]) {
+			const value = settings.get(def.path);
+			const displayValue = redactConfigValue(def.path, value, flags.showSecrets);
+			const valueStr = formatValue(displayValue);
+			const typeStr = getTypeDisplay(def);
+			console.log(`  ${chalk.white(def.path)} = ${valueStr} ${chalk.dim(typeStr)}`);
+		}
+		console.log("");
+	}
+}
+
+function handleGet(key: string | undefined, flags: { json?: boolean; showSecrets?: boolean }): void {
+	if (!key) {
+		console.error(chalk.red(`Usage: ${APP_NAME} config get <key>`));
+		console.error(chalk.dim(`\nRun '${APP_NAME} config list' to see available keys`));
+		process.exit(1);
+	}
+
+	const def = findSettingDef(key);
+	if (!def) {
+		console.error(chalk.red(`Unknown setting: ${key}`));
+		console.error(chalk.dim(`\nRun '${APP_NAME} config list' to see available keys`));
+		process.exit(1);
+	}
+
+	const value = settings.get(def.path);
+	const displayValue = redactConfigValue(def.path, value, flags.showSecrets);
+
+	if (flags.json) {
+		console.log(
+			JSON.stringify({ key: def.path, value: displayValue, type: def.type, description: def.description }, null, 2),
+		);
+		return;
+	}
+
+	console.log(formatValue(displayValue));
+}
+
+/**
+ * `settings.set`/`unset` are synchronous in-memory writes whose persistence runs in the
+ * background, so a mutating command that returns without flushing reports success from the
+ * merged in-memory view even when the durable save later fails. On filesystems where the
+ * native exact replacement is unavailable (NFS answers `atomic_unavailable`), `config.yml`
+ * is refused a fallback and never updated, yet the command still printed a success line and
+ * exited 0 -- the setting silently reverts on the next process. Await the durable save and
+ * fail loudly instead.
+ */
+const SAFE_NESTED_DIAGNOSTIC_PATTERN =
+	/\b(?:atomic_[a-z0-9_]+|destination_[a-z0-9_]+|source_[a-z0-9_]+|cleanup_[a-z0-9_]+|E[A-Z0-9_]+)\b/i;
+
+function errorCode(error: unknown): string | undefined {
+	if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+	const code = (error as { code?: unknown }).code;
+	return typeof code === "string" && code.length > 0 ? code : undefined;
+}
+
+function errorCause(error: unknown): unknown {
+	if (typeof error !== "object" || error === null || !("cause" in error)) return undefined;
+	return (error as { cause?: unknown }).cause;
+}
+
+function nestedCauseDiagnostic(cause: unknown): string | undefined {
+	const code = errorCode(cause);
+	if (code && /^[A-Z][A-Z0-9_]{1,63}$/.test(code)) return code;
+	const message = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : undefined;
+	const match = message?.match(SAFE_NESTED_DIAGNOSTIC_PATTERN);
+	return match?.[0]?.slice(0, 64);
+}
+
+function persistenceDiagnostic(error: unknown): string {
+	if (error instanceof AtomicYamlRetargetError) {
+		return "config target changed during save; retry after restoring the original target";
+	}
+	const code = errorCode(error);
+	const cause = errorCause(error);
+	if (error instanceof AtomicYamlReplaceError) {
+		const detail = nestedCauseDiagnostic(cause);
+		return detail ? `atomic replacement failed (${detail})` : "atomic replacement failed";
+	}
+	if (code) {
+		if (cause !== undefined) {
+			const nested = nestedCauseDiagnostic(cause);
+			return nested ? `${code}: ${nested}` : code;
+		}
+		return code;
+	}
+	const nested = nestedCauseDiagnostic(error);
+	if (nested) return nested;
+	return "unknown persistence failure";
+}
+
+async function persistOrExit(): Promise<void> {
+	try {
+		await settings.flushOrThrow();
+	} catch (err) {
+		console.error(chalk.red(`Failed to persist setting: ${persistenceDiagnostic(err)}`));
+		process.exit(1);
+	}
+}
+
+async function handleSet(
+	key: string | undefined,
+	value: string | undefined,
+	flags: { json?: boolean; showSecrets?: boolean },
+): Promise<void> {
+	if (!key || value === undefined) {
+		console.error(chalk.red(`Usage: ${APP_NAME} config set <key> <value>`));
+		console.error(chalk.dim(`\nRun '${APP_NAME} config list' to see available keys`));
+		process.exit(1);
+	}
+
+	const def = findSettingDef(key);
+	if (!def) {
+		console.error(chalk.red(`Unknown setting: ${key}`));
+		console.error(chalk.dim(`\nRun '${APP_NAME} config list' to see available keys`));
+		process.exit(1);
+	}
+
+	try {
+		parseAndSetValue(def.path, value);
+	} catch (err) {
+		console.error(chalk.red(String(err)));
+		process.exit(1);
+	}
+
+	await persistOrExit();
+
+	const newValue = settings.get(def.path);
+	const displayValue = redactConfigValue(def.path, newValue, flags.showSecrets);
+
+	if (flags.json) {
+		console.log(JSON.stringify({ key: def.path, value: displayValue }));
+	} else {
+		console.log(chalk.green(`${theme.status.success} Set ${def.path} = ${formatValue(displayValue)}`));
+	}
+}
+
+async function handleReset(key: string | undefined, flags: { json?: boolean }): Promise<void> {
+	if (!key) {
+		console.error(chalk.red(`Usage: ${APP_NAME} config reset <key>`));
+		console.error(chalk.dim(`\nRun '${APP_NAME} config list' to see available keys`));
+		process.exit(1);
+	}
+
+	const def = findSettingDef(key);
+	if (!def) {
+		console.error(chalk.red(`Unknown setting: ${key}`));
+		console.error(chalk.dim(`\nRun '${APP_NAME} config list' to see available keys`));
+		process.exit(1);
+	}
+
+	const path = def.path as SettingPath;
+	const defaultValue = getDefault(path);
+	if (defaultValue === undefined) settings.unset(path);
+	else settings.set(path, defaultValue as SettingValue<typeof path>);
+
+	await persistOrExit();
+
+	if (flags.json) {
+		console.log(JSON.stringify({ key: def.path, value: defaultValue }));
+	} else {
+		console.log(chalk.green(`${theme.status.success} Reset ${def.path} to ${formatValue(defaultValue)}`));
+	}
+}
+
+function handlePath(): void {
+	console.log(getAgentDir());
+}
+
+/**
+ * Configuration conflicts that no schema check can see: an explicit
+ * `task.eager false` keeps a vendor-separated profile's workers unused, so the
+ * main provider's quota pays for work the layout meant to offload.
+ */
+export function collectConfigAdvisories(): string[] {
+	const profileName = settings.get("modelProfile.default");
+	const profiles = loadEffectiveModelProfiles(ModelsConfigFile.load()?.profiles);
+	const resolvedProfileName = profileName ? resolveModelProfileName(profileName, profiles) : undefined;
+	const delegation = resolveEagerTaskDelegation({
+		settings,
+		profile: resolvedProfileName ? profiles.get(resolvedProfileName) : undefined,
+	});
+	if (!delegation.suppressedByExplicitSetting) return [];
+	return [
+		`task.eager is false while ${delegation.vendorSeparatedRoles.join(" and ")} run on a different provider than the default role; those workers will not be used. Run \`${APP_NAME} config set task.eager true\` or reset task.eager to delegate by default.`,
+	];
+}
+
+function handleDoctor(flags: { json?: boolean }): void {
+	const report = settings.getSchemaReport();
+	const advisories = collectConfigAdvisories();
+	if (flags.json) {
+		console.log(JSON.stringify({ ...report, advisories }, null, 2));
+		return;
+	}
+	if (report.issues.length === 0 && advisories.length === 0) {
+		console.log(chalk.green("Settings schema is healthy."));
+		return;
+	}
+	for (const issue of report.issues) console.log(`${issue.kind}\t${issue.path}\t${issue.detail}`);
+	for (const advisory of advisories) console.log(chalk.yellow(`advisory\ttask.eager\t${advisory}`));
+}
+
+type ConfigDoctorReport = {
+	unknownKeys: string[];
+	invalidValues: Array<{ path: string; value: unknown }>;
+	legacyShapes: string[];
+};
+
+function flattenConfig(value: unknown, prefix = ""): Array<[string, unknown]> {
+	if (prefix && ALL_SETTING_PATHS.includes(prefix as SettingPath)) return [[prefix, value]];
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return prefix ? [[prefix, value]] : [];
+	return Object.entries(value).flatMap(([key, child]) => flattenConfig(child, prefix ? `${prefix}.${key}` : key));
+}
+
+function matchesSettingType(path: SettingPath, value: unknown): boolean {
+	const definition = SETTINGS_SCHEMA[path];
+	switch (definition.type) {
+		case "string":
+		case "enum":
+			return (
+				typeof value === "string" && (definition.type !== "enum" || getEnumValues(path)?.includes(value) === true)
+			);
+		case "number":
+			return typeof value === "number" && Number.isFinite(value);
+		case "boolean":
+			return typeof value === "boolean";
+		case "array":
+			return Array.isArray(value);
+		case "record":
+		case "constrained-record":
+			return value !== null && typeof value === "object" && !Array.isArray(value);
+		case "optional-object":
+			return value !== null && typeof value === "object" && !Array.isArray(value);
+	}
+}
+
+export async function inspectConfigFile(configPath: string): Promise<ConfigDoctorReport> {
+	const report: ConfigDoctorReport = { unknownKeys: [], invalidValues: [], legacyShapes: [] };
+	try {
+		const raw = YAML.parse(await fs.readFile(configPath, "utf8"));
+		if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+			report.legacyShapes.push("config root is not a mapping");
+			return report;
+		}
+		for (const [settingPath, value] of flattenConfig(raw)) {
+			if (!ALL_SETTING_PATHS.includes(settingPath as SettingPath)) report.unknownKeys.push(settingPath);
+			else if (!matchesSettingType(settingPath as SettingPath, value))
+				report.invalidValues.push({ path: settingPath, value: redactConfigValue(settingPath, value) });
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+			report.legacyShapes.push(`unable to parse config: ${String(error)}`);
+	}
+	return report;
+}
+
+// =============================================================================
+// Help
+// =============================================================================
+
+export function printConfigHelp(): void {
+	console.log(`${chalk.bold(`${APP_NAME} config`)} - Manage settings
+
+${chalk.bold("Commands:")}
+  list               List all settings with current values
+  get <key>          Get a specific setting value
+  set <key> <value>  Set a setting value
+  reset <key>        Reset a setting to its default value
+  doctor             Report unknown, invalid, and pending settings migrations
+  path               Print the config directory path
+  init-xdg           Initialize XDG Base Directory structure
+  doctor             Report unknown, invalid, and legacy config entries
+
+${chalk.bold("Options:")}
+  --json             Output as JSON
+  --show-secrets     Show secret-like setting values without redaction (unsafe)
+
+${chalk.bold("Examples:")}
+  ${APP_NAME} config list
+  ${APP_NAME} config get theme
+  ${APP_NAME} config set theme catppuccin-mocha
+  ${APP_NAME} config set compaction.enabled false
+  ${APP_NAME} config set defaultThinkingLevel medium
+  ${APP_NAME} config reset steeringMode
+  ${APP_NAME} config list --json
+  ${APP_NAME} config get auth.broker.token --show-secrets
+  ${APP_NAME} config init-xdg
+  ${APP_NAME} config doctor --json
+
+${chalk.bold("Boolean Values:")}
+  true, false, yes, no, on, off, 1, 0
+`);
+}

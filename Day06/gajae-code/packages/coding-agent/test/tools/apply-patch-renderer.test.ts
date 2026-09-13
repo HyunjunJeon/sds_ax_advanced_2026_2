@@ -1,0 +1,223 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import { editToolRenderer } from "@gajae-code/coding-agent/edit/renderer";
+import { ToolExecutionComponent } from "@gajae-code/coding-agent/modes/components/tool-execution";
+import * as themeModule from "@gajae-code/coding-agent/modes/theme/theme";
+import { toolRenderers } from "@gajae-code/coding-agent/tools/renderers";
+import type { TUI } from "@gajae-code/tui";
+
+async function getUiTheme() {
+	await themeModule.initTheme(false, undefined, undefined, "red-claw", "blue-crab");
+	const theme = await themeModule.getThemeByName("red-claw");
+	expect(theme).toBeDefined();
+	return theme!;
+}
+
+beforeEach(async () => {
+	resetSettingsForTest();
+	await Settings.init({ inMemory: true });
+});
+
+afterEach(() => {
+	resetSettingsForTest();
+});
+
+describe("apply_patch rendering", () => {
+	it("registers apply_patch to use the edit renderer", () => {
+		expect(toolRenderers.apply_patch).toBe(toolRenderers.edit);
+	});
+
+	it("renders apply_patch results through edit UI instead of generic fallback", async () => {
+		await getUiTheme();
+		const uiStub = { requestRender() {} } as unknown as TUI;
+
+		const component = new ToolExecutionComponent(
+			"apply_patch",
+			{
+				input: "*** Begin Patch\n*** Update File: src/demo.ts\n@@\n-old\n+new\n*** End Patch",
+			},
+			{},
+			undefined,
+			uiStub,
+		);
+
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "" }],
+				details: {
+					path: "src/demo.ts",
+					op: "update",
+					diff: "@@\n-old\n+new",
+				},
+			},
+			false,
+		);
+
+		const collapsed = Bun.stripANSI(component.render(140).join("\n"));
+		expect(collapsed).toContain("src/demo.ts");
+		expect(collapsed).not.toContain("+new");
+		expect(collapsed).not.toContain("(no output)");
+
+		component.setExpanded(true);
+		const expanded = Bun.stripANSI(component.render(140).join("\n"));
+		expect(expanded).toContain("src/demo.ts");
+		expect(expanded).toContain("+new");
+		expect(expanded).not.toContain("(no output)");
+	});
+	it("derives call path, operation, and file-count hints from apply_patch input", async () => {
+		const uiTheme = await getUiTheme();
+		const input = [
+			"*** Begin Patch",
+			"*** Update File: src/first.ts",
+			"@@",
+			"-before",
+			"+after",
+			"*** Add File: src/new.ts",
+			"+hello",
+			"*** End Patch",
+		].join("\n");
+
+		const component = editToolRenderer.renderCall(
+			{ input },
+			{ expanded: false, isPartial: true, renderContext: { editMode: "apply_patch" } },
+			uiTheme,
+		);
+		const rendered = Bun.stripANSI(component.render(160).join("\n"));
+
+		expect(rendered).toContain("src/first.ts");
+		expect(rendered).toContain("Edit");
+		expect(rendered).toContain("(+1 more)");
+	});
+
+	it("does not show missing end-marker errors while apply_patch input is streaming", async () => {
+		const uiTheme = await getUiTheme();
+		const input = ["*** Begin Patch", "*** Update File: src/streaming.ts", "@@", "-before", "+after"].join("\n");
+
+		const component = editToolRenderer.renderCall(
+			{ input },
+			{ expanded: false, isPartial: true, renderContext: { editMode: "apply_patch" } },
+			uiTheme,
+		);
+		const rendered = Bun.stripANSI(component.render(160).join("\n"));
+
+		expect(rendered).toContain("src/streaming.ts");
+		expect(rendered).not.toContain("The last line of the patch must be");
+	});
+
+	it("shows an apply_patch parse error preview for malformed input", async () => {
+		const uiTheme = await getUiTheme();
+		const malformedInput = ["*** Begin Patch", "*** Update File: src/bad.ts", "*** End Patch"].join("\n");
+
+		const component = editToolRenderer.renderCall(
+			{ input: malformedInput },
+			{ expanded: true, isPartial: true },
+			uiTheme,
+		);
+		const rendered = Bun.stripANSI(component.render(160).join("\n"));
+
+		expect(rendered).toContain("src/bad.ts");
+		expect(rendered).toContain("is empty");
+	});
+
+	it("shows apply_patch preview diffs after args complete", async () => {
+		await getUiTheme();
+		const uiStub = { requestRender() {} } as unknown as TUI;
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "apply-patch-preview-"));
+		try {
+			await Bun.write(path.join(tmpDir, "preview.ts"), "const value = 1;\n");
+			const input = [
+				"*** Begin Patch",
+				"*** Update File: preview.ts",
+				"@@",
+				"-const value = 1;",
+				"+const value = 2;",
+				"*** End Patch",
+			].join("\n");
+
+			const component = new ToolExecutionComponent("apply_patch", { input }, {}, undefined, uiStub, tmpDir);
+			component.setExpanded(true);
+			const before = Bun.stripANSI(component.render(160).join("\n"));
+			expect(before).not.toContain("(preview)");
+
+			component.setArgsComplete();
+			component.setExpanded(true);
+			await Bun.sleep(50);
+
+			const after = Bun.stripANSI(component.render(160).join("\n"));
+			expect(after).toContain("const value = 2;");
+		} finally {
+			await fs.rm(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refreshes streaming preview immediately on arg updates without scheduling a debounce", async () => {
+		await getUiTheme();
+		const uiStub = { requestRender() {} } as unknown as TUI;
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "apply-patch-instant-preview-"));
+		const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+		try {
+			await Bun.write(path.join(tmpDir, "preview.ts"), "const value = 1;\n");
+			const component = new ToolExecutionComponent("apply_patch", { input: "" }, {}, undefined, uiStub, tmpDir);
+
+			setTimeoutSpy.mockClear();
+			component.updateArgs({
+				input: [
+					"*** Begin Patch",
+					"*** Update File: preview.ts",
+					"@@",
+					"-const value = 1;",
+					"+const value = 2;",
+					"*** End Patch",
+				].join("\n"),
+			});
+
+			expect(setTimeoutSpy).not.toHaveBeenCalled();
+		} finally {
+			setTimeoutSpy.mockRestore();
+			await fs.rm(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("aligns rendered edit diff separators", async () => {
+		await getUiTheme();
+		const uiStub = { requestRender() {} } as unknown as TUI;
+		const component = new ToolExecutionComponent(
+			"edit",
+			{ path: "packages/coding-agent/src/tools/image-gen.ts" },
+			{},
+			undefined,
+			uiStub,
+		);
+
+		component.setExpanded(true);
+		component.updateResult(
+			{
+				content: [{ type: "text", text: "" }],
+				details: {
+					path: "packages/coding-agent/src/tools/image-gen.ts",
+					op: "update",
+					diff: [
+						" 10|}",
+						'+11|import { CODEX_INSTRUCTIONS } from "@gajae-code/ai/providers/openai-codex-responses";',
+						" 12|\t$env,",
+						" 228|\toutput_format: typeof OPENAI_IMAGE_OUTPUT_FORMAT;",
+						"+235|\tinstructions?: string;",
+						' 234|\tinput: Array<{ role: "user"; content: OpenAIInputContent[] }>;',
+					].join("\n"),
+				},
+			},
+			false,
+		);
+
+		component.setExpanded(true);
+		const rendered = Bun.stripANSI(component.render(220).join("\n"));
+		expect(rendered).toContain("  10│}");
+		expect(rendered).toContain(" +11│import");
+		expect(rendered).toContain(" 228│");
+		expect(rendered).toContain("+235│");
+		expect(rendered).toContain(" 234│");
+	});
+});

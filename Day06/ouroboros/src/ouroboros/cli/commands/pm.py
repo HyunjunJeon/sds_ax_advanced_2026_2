@@ -1,0 +1,700 @@
+"""PM command for generating Product Requirements Documents.
+
+This command initiates a guided interview process for PMs to define
+product requirements, with automatic classification of planning vs
+development questions, producing a PMSeed and human-readable PM document.
+
+Usage:
+    ouroboros pm                    Start a new PM interview
+    ouroboros pm --resume <id>     Resume an existing PM session
+"""
+
+import asyncio
+from pathlib import Path
+from typing import Annotated, Any
+
+from rich.prompt import Confirm
+import structlog
+import typer
+
+from ouroboros.bigbang.interview import InterviewRound
+from ouroboros.bigbang.pm_completion import (
+    build_pm_completion_summary,
+    maybe_complete_pm_interview,
+)
+from ouroboros.bigbang.pm_interview import PM_UNCERTAINTY_GUIDANCE
+from ouroboros.cli.formatters import console
+from ouroboros.cli.formatters.panels import print_error, print_info, print_success, print_warning
+from ouroboros.cli.formatters.prompting import multiline_prompt_async
+from ouroboros.cli.logging_setup import configure_cli_logging
+from ouroboros.config import get_clarification_model, get_llm_backend
+from ouroboros.core.owner_only import secure_directory, write_owner_only
+from ouroboros.core.types import Result
+from ouroboros.pm.handoff import build_pm_dev_handoff_command
+from ouroboros.providers.factory import (
+    create_llm_adapter,
+    litellm_missing_dependency_message,
+    resolve_llm_backend,
+    resolve_llm_permission_mode,
+)
+
+app = typer.Typer(
+    name="pm",
+    help="Generate a Product Requirements Document through guided interview.",
+    no_args_is_help=False,
+    invoke_without_command=True,
+)
+
+log = structlog.get_logger()
+_LITELLM_OPTIONAL_IMPORT_ROOTS = frozenset({"httpx", "litellm", "openai"})
+
+
+def _create_pm_litellm_adapter() -> Any:
+    """Construct the PM interview adapter or raise actionable guidance.
+
+    The PM CLI currently relies on the LiteLLM-backed path. On base installs
+    without the optional ``litellm`` extra, importing the adapter crashes with
+    ``ModuleNotFoundError``. Convert that into a user-facing error instead.
+    """
+    try:
+        from ouroboros.providers.litellm_adapter import LiteLLMAdapter
+    except ModuleNotFoundError as exc:
+        _raise_missing_litellm_dependency(exc)
+
+    return LiteLLMAdapter()
+
+
+def _raise_missing_litellm_dependency(exc: ModuleNotFoundError) -> None:
+    """Convert a missing optional LiteLLM import into install guidance."""
+    missing_root = (exc.name or "").split(".", 1)[0]
+    if missing_root in _LITELLM_OPTIONAL_IMPORT_ROOTS or "litellm" in str(exc):
+        msg = litellm_missing_dependency_message(
+            "PM interviews require the optional LiteLLM dependency."
+        )
+        raise RuntimeError(msg) from exc
+    raise exc
+
+
+@app.callback(invoke_without_command=True)
+def pm_command(
+    ctx: typer.Context,
+    resume: Annotated[
+        str | None,
+        typer.Option(
+            "--resume",
+            "-r",
+            help="Resume an existing PM interview session by ID.",
+        ),
+    ] = None,
+    output: Annotated[
+        str | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Output directory for the generated PM document (default: .ouroboros/).",
+        ),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            "-m",
+            help="LLM model to use for the PM interview.",
+        ),
+    ] = None,
+    debug: Annotated[
+        bool,
+        typer.Option(
+            "--debug",
+            help="Enable debug output.",
+        ),
+    ] = False,
+) -> None:
+    """Start or resume a PM interview to generate product requirements.
+
+    This command guides PMs through a structured interview process to
+    define product requirements. Questions are automatically classified
+    as planning (PM-answerable) or development (deferred to dev interview).
+
+    The output is a PMSeed JSON file saved to ~/.ouroboros/seeds/ and
+    a human-readable pm.md saved to the output directory.
+
+    [bold]Examples:[/]
+
+        ouroboros pm                            Start new PM interview
+        ouroboros pm --resume abc123            Resume session
+        ouroboros pm --output ./docs            Save pm.md to ./docs/
+    """
+    if ctx.invoked_subcommand is not None:
+        return
+
+    configure_cli_logging(debug=debug)
+    if debug:
+        print_info("Debug mode enabled - showing verbose logs")
+
+    console.print("\n[bold cyan]Ouroboros PM Generator[/] - Product Requirements Document\n")
+
+    if resume:
+        print_info(f"Resuming PM session: {resume}")
+    else:
+        print_info("Starting new PM interview session...")
+
+    try:
+        resolved_backend = resolve_llm_backend(get_llm_backend())
+        resolved_model = model or get_clarification_model(resolved_backend)
+        permission_mode = resolve_llm_permission_mode(
+            backend=resolved_backend,
+            use_case="interview",
+        )
+
+        console.print(f"  Model: [dim]{resolved_model}[/]\n")
+        if permission_mode == "bypassPermissions":
+            print_warning(
+                "Interview backend "
+                f"'{resolved_backend}' uses bypassPermissions for question generation."
+            )
+
+        asyncio.run(
+            _run_pm_interview(
+                resume_id=resume,
+                model=resolved_model,
+                backend=resolved_backend,
+                debug=debug,
+                output_dir=output,
+            )
+        )
+    except ValueError as exc:
+        print_error(str(exc))
+        raise typer.Exit(code=1) from exc
+    except RuntimeError as exc:
+        print_error(str(exc))
+        raise typer.Exit(code=1) from exc
+    except KeyboardInterrupt:
+        print_info("\nPM interview interrupted. Progress has been saved.")
+        raise typer.Exit(code=0)
+
+
+#: Shown when a brownfield roster meets the direct CLI. One text for both the
+#: start and the resume edge, because they are the same refusal.
+_BROWNFIELD_IS_AN_MCP_ENTRANCE = (
+    "Brownfield PM interviews run through `ooo pm` (MCP), which carries the "
+    "code and data evidence lanes.\n"
+    "This direct CLI has no lanes: it would generate every question from "
+    "memory while the PRD claimed the repositories as grounding.\n\n"
+    "Start or resume the interview with `ooo pm` instead. To run a greenfield "
+    "PM interview here, unregister the repositories first (`ooo brownfield`)."
+)
+
+
+def _load_brownfield_from_db() -> list[dict[str, str]]:
+    """Load the registered brownfield roster.
+
+    Read here to *decide the entrance*, not to feed the interview. A non-empty
+    roster means this command is the wrong door — see
+    :func:`_refuse_brownfield_in_direct_cli`.
+
+    Returns:
+        List of brownfield repo dicts from the database.
+    """
+    from ouroboros.bigbang.brownfield import load_brownfield_repos_as_dicts
+
+    return load_brownfield_repos_as_dicts()
+
+
+def _refuse_brownfield_in_direct_cli(repos: list[dict[str, str]]) -> None:
+    """Stop a direct-CLI PM interview when a brownfield roster is registered.
+
+    RFC #1937 moved repository reading out of the PM engine and into the
+    advisory lanes, which run in the host session that fans out. This command
+    does not fan out — it calls ``ask_next_question`` directly — so a brownfield
+    interview started here would produce questions from memory alone while the
+    Seed carried ``is_brownfield=True`` and the repository paths. That claim is
+    the harm: an ungrounded PRD that reads as a grounded one.
+
+    Two repairs were available and this is the second. Re-grounding the CLI
+    would leave two grounding mechanisms to keep in step permanently; removing
+    the entrance leaves one. The entrance was never a documented user path —
+    ``README.md`` lists ``ooo pm`` as *(via MCP)* with no CLI equivalent — so
+    what is withdrawn is a way to reach a bad state, not a way of working.
+
+    Greenfield is untouched. With no roster registered there is nothing this
+    command could have been grounded against, and it starts as before.
+    """
+    if not repos:
+        return
+    print_error(
+        f"{len(repos)} brownfield repo(s) are registered.\n\n{_BROWNFIELD_IS_AN_MCP_ENTRANCE}"
+    )
+    raise typer.Exit(code=1)
+
+
+def _resume_covers_repositories(state: Any, meta: dict[str, Any] | None) -> bool:
+    """Whether the session being resumed covers a codebase.
+
+    Asked of the repositories each time rather than kept as a flag beside them.
+    A PM session records its roster in two places depending on how it started —
+    ``codebase_paths`` on the state, ``brownfield_repos`` in ``pm_meta`` — and a
+    boolean maintained alongside them is one more thing that can disagree with
+    both. It did: the plugin selection path wrote only ``pm_meta``.
+    """
+    if getattr(state, "is_brownfield", False) or getattr(state, "codebase_paths", None):
+        return True
+    return bool((meta or {}).get("brownfield_repos"))
+
+
+def _check_existing_pm_seeds() -> bool:
+    """Check for existing PM seeds and prompt for overwrite confirmation.
+
+    Scans ``~/.ouroboros/seeds/`` for any ``pm_seed_*.json`` files.
+    If found, displays the existing seeds and asks the user whether to
+    overwrite or abort.
+
+    Returns:
+        True if the user wants to proceed (overwrite), False to abort.
+        Also returns True if no existing seeds are found.
+    """
+    seeds_dir = Path.home() / ".ouroboros" / "seeds"
+
+    if not seeds_dir.is_dir():
+        return True
+
+    existing = sorted(seeds_dir.glob("pm_*.json"))
+
+    if not existing:
+        return True
+
+    # Display existing seeds
+    console.print("\n[bold yellow]Existing PM seed(s) found:[/]\n")
+    for seed_path in existing:
+        console.print(f"  • [dim]{seed_path.name}[/]")
+
+    console.print()
+    should_overwrite = Confirm.ask(
+        "Starting a new PM interview may overwrite existing seed(s). Continue?",
+        default=False,
+    )
+
+    if not should_overwrite:
+        print_info("Aborted. Existing PM seed(s) preserved.")
+
+    return should_overwrite
+
+
+def _save_cli_pm_meta(session_id: str, engine: Any) -> None:
+    """Persist PM-specific metadata so ``--resume`` can restore it.
+
+    Writes to ``~/.ouroboros/data/pm_meta_{session_id}.json`` — the same
+    location used by the MCP handler's ``_save_pm_meta``.
+    """
+    import json
+
+    data_dir = Path.home() / ".ouroboros" / "data"
+    secure_directory(data_dir)
+    meta_path = data_dir / f"pm_meta_{session_id}.json"
+
+    # Build pending_reframe from the engine's reframe map (mirrors MCP _save_pm_meta)
+    pending_reframe: dict[str, str] | None = None
+    if engine._reframe_map:
+        reframed = next(reversed(engine._reframe_map))
+        pending_reframe = {
+            "reframed": reframed,
+            "original": engine._reframe_map[reframed],
+        }
+
+    # Collapse deferred_items into decide_later_items (canonical schema)
+    combined_decide_later = list(engine.decide_later_items)
+    for item in engine.deferred_items:
+        if item not in combined_decide_later:
+            combined_decide_later.append(item)
+
+    meta = {
+        "deferred_items": [],  # Deprecated: merged into decide_later_items
+        "decide_later_items": combined_decide_later,
+        "codebase_context": engine.codebase_context,
+        "pending_reframe": pending_reframe,
+        "cwd": "",
+        "brownfield_repos": list(engine._selected_brownfield_repos),
+        "classifications": [c.output_type.value for c in getattr(engine, "classifications", [])],
+    }
+
+    durability_confirmed = write_owner_only(
+        meta_path,
+        json.dumps(meta, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    if not durability_confirmed:
+        log.warning(
+            "pm.meta_save_durability_unconfirmed",
+            session_id=session_id,
+            path=str(meta_path),
+        )
+
+
+def _make_message_callback(debug: bool):
+    """Create a debug callback for streaming local agent status."""
+    if not debug:
+        return None
+
+    def callback(msg_type: str, content: str) -> None:
+        if msg_type == "thinking":
+            first_line = content.split("\n")[0].strip()
+            display = first_line[:100] + "..." if len(first_line) > 100 else first_line
+            if display:
+                console.print(f"  [dim]thinking:[/] {display}")
+        elif msg_type == "tool_started":
+            console.print(f"  [cyan]tool started:[/] {content}")
+        elif msg_type == "tool":
+            console.print(f"  [yellow]tool:[/] {content}")
+
+    return callback
+
+
+async def _continue_into_dev_interview(
+    seed_path: Path,
+    *,
+    debug: bool,
+    llm_backend: str | None,
+) -> None:
+    """Resolve a PM artifact path into interview context and start the dev interview."""
+    from ouroboros.cli.commands.init import _run_interview
+    from ouroboros.core.initial_context import resolve_initial_context_input
+
+    resolved_context = resolve_initial_context_input(str(seed_path), cwd=Path.cwd())
+    if resolved_context.is_err:
+        print_error(f"Failed to load PM seed for dev interview: {resolved_context.error.message}")
+        raise typer.Exit(code=1)
+
+    await _run_interview(
+        resolved_context.value,
+        resume_id=None,
+        state_dir=None,
+        use_orchestrator=False,
+        debug=debug,
+        workflow_runtime_backend=None,
+        llm_backend=llm_backend,
+    )
+
+
+async def _run_pm_interview(
+    resume_id: str | None,
+    model: str,
+    backend: str | None,
+    debug: bool,
+    output_dir: str | None = None,
+) -> None:
+    """Run the PM interview loop.
+
+    Starts by asking the opening question ("What do you want to build?"),
+    then enters the guided interview loop with question classification.
+
+    Args:
+        resume_id: Optional session ID to resume.
+        model: LLM model identifier.
+        backend: Resolved LLM backend name.
+        debug: Enable debug output.
+        output_dir: Optional output directory for the generated PM document.
+    """
+    from ouroboros.bigbang.pm_interview import PMInterviewEngine
+
+    try:
+        adapter = create_llm_adapter(
+            backend=backend,
+            use_case="interview",
+            allowed_tools=None,
+            max_turns=5,
+            on_message=_make_message_callback(debug),
+            cwd=Path.cwd(),
+        )
+    except ModuleNotFoundError as exc:
+        if backend == "litellm":
+            _raise_missing_litellm_dependency(exc)
+        raise
+    engine = PMInterviewEngine.create(llm_adapter=adapter, model=model)
+
+    # Check for existing PM seeds before starting a new session
+    if not resume_id:
+        if not _check_existing_pm_seeds():
+            raise typer.Exit(code=0)
+
+    # Brownfield is not an entrance here. Checked before anything is created so
+    # no state exists to abandon.
+    if not resume_id:
+        _refuse_brownfield_in_direct_cli(_load_brownfield_from_db())
+
+    if resume_id:
+        # Resume existing session
+        state_result = await engine.load_state(resume_id)
+        if state_result.is_err:
+            print_error(f"Failed to resume session: {state_result.error}")
+            raise typer.Exit(code=1)
+        state = state_result.value
+
+        # Restore PM-specific metadata (deferred items, decide-later, etc.)
+        data_dir = Path.home() / ".ouroboros" / "data"
+        pm_meta_path = data_dir / f"pm_meta_{resume_id}.json"
+        meta: dict[str, Any] | None = None
+        if pm_meta_path.exists():
+            import json
+
+            try:
+                meta = json.loads(pm_meta_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                meta = None
+
+        # The other edge of the same rule. A session started through MCP may
+        # cover repositories, and continuing it here would generate the rest of
+        # its questions ungrounded under a Seed that still claims them. Refusing
+        # at both edges is what makes the property total: this command can
+        # neither create nor continue a PM interview over a codebase.
+        #
+        # Asked of the repositories rather than of a flag beside them. The two
+        # disagreed: a session that selected its roster through the plugin path
+        # held it in ``pm_meta`` alone, so a resume read ``is_brownfield`` as
+        # false, passed here, and restored the roster on the next line.
+        if _resume_covers_repositories(state, meta):
+            print_error(
+                f"Session {resume_id} is a brownfield PM interview.\n\n"
+                f"{_BROWNFIELD_IS_AN_MCP_ENTRANCE}"
+            )
+            raise typer.Exit(code=1)
+
+        if meta is not None:
+            engine.restore_meta(meta)
+        else:
+            if pm_meta_path.exists():
+                print_warning("Could not load PM metadata; continuing without it.")
+            # Still install PM steering without full meta, as when there is none.
+            engine._install_pm_steering()
+
+        print_success(f"Resumed session: {resume_id}")
+    else:
+        # New session — show uncertainty guidance before the first PM answer
+        print_info(PM_UNCERTAINTY_GUIDANCE)
+        opening = engine.get_opening_question()
+        console.print(f"\n[bold yellow]?[/] {opening}\n")
+
+        user_answer = await multiline_prompt_async("Your response")
+
+        if not user_answer.strip():
+            print_error("No response provided. Exiting.")
+            raise typer.Exit(code=1)
+
+        print_info("Starting interview...")
+        # No ``brownfield_repos``: a registered roster was refused above, so
+        # there is never one to pass. ``is_brownfield`` is therefore not a state
+        # this command can reach rather than one it is trusted not to set.
+        state_result = await engine.ask_opening_and_start(user_response=user_answer)
+        if state_result.is_err:
+            print_error(f"Failed to start interview: {state_result.error}")
+            raise typer.Exit(code=1)
+        state = state_result.value
+        print_success(f"Interview started (session: {state.interview_id})")
+
+        # Save pm_meta so --resume can find it later
+        _save_cli_pm_meta(state.interview_id, engine)
+
+    # Interview loop
+    while not state.is_complete:
+        # Check for a pending unanswered question from a previous session
+        if state.rounds and state.rounds[-1].user_response is None:
+            question = state.rounds[-1].question
+        else:
+            print_info("Generating next question...")
+            q_result = await engine.ask_next_question(state)
+            if q_result.is_err:
+                print_error(f"Question generation failed: {q_result.error}")
+                break
+
+            question = q_result.value
+
+        # Append unanswered round so the pending question is persisted
+        # in InterviewState.  This ensures --resume can re-display it.
+        # Skip if we already have this as the last unanswered round (resume case).
+        if not (state.rounds and state.rounds[-1].user_response is None):
+            state.rounds.append(
+                InterviewRound(
+                    round_number=state.current_round_number,
+                    question=question,
+                    user_response=None,
+                )
+            )
+            state.mark_updated()
+
+        console.print(f"\n[bold yellow]?[/] {question}\n")
+
+        # Check if this question was classified as skippable —
+        # if so, show a hint that the user can defer it.
+        classification = engine.get_last_classification()
+        if classification == "decide_later":
+            console.print(
+                "[dim]  💡 This question can be deferred. "
+                'Type "decide later" or "skip" to defer it.[/]\n'
+            )
+        elif classification == "deferred":
+            console.print(
+                "[dim]  💡 This is a technical question that can be deferred to the dev phase. "
+                'Type "defer" or "skip" to defer it.[/]\n'
+            )
+
+        # Persist state + meta AFTER displaying the question but BEFORE
+        # waiting for input so that an interruption preserves the pending
+        # question and --resume shows the same question.
+        save_result = await engine.save_state(state)
+        if isinstance(save_result, Result) and save_result.is_err:
+            print_error(f"Failed to save state: {save_result.error}")
+            break
+        _save_cli_pm_meta(state.interview_id, engine)
+
+        user_response = await multiline_prompt_async("Your response")
+
+        # Allow early exit
+        if user_response.strip().lower() in ("done", "exit", "quit", "/done"):
+            print_info("Finishing interview...")
+            # Remove the synthetic unanswered round before completing
+            # so extraction never sees a question the user didn't answer.
+            if state.rounds and state.rounds[-1].user_response is None:
+                state.rounds.pop()
+
+            completion = await engine.check_completion(state)
+            complete_result = await engine.complete_interview(state)
+            if complete_result.is_err:
+                print_error(f"Failed to complete interview: {complete_result.error}")
+                break
+
+            state = complete_result.value
+            save_result = await engine.save_state(state)
+            if save_result.is_err:
+                print_error(f"Failed to save completed state: {save_result.error}")
+                break
+            _save_cli_pm_meta(state.interview_id, engine)
+
+            decide_later_summary = engine.format_decide_later_summary()
+            summary_text = build_pm_completion_summary(
+                session_id=state.interview_id,
+                completion=completion,
+                stored_ambiguity_score=state.ambiguity_score,
+                deferred_count=0,
+                decide_later_count=len(engine.deferred_items) + len(engine.decide_later_items),
+                decide_later_summary=decide_later_summary,
+            )
+            console.print(f"\n[bold green]{summary_text}[/]\n")
+            break
+
+        # Pop the unanswered round before recording so record_response
+        # can create a proper answered round (mirrors MCP handler pattern).
+        if state.rounds and state.rounds[-1].user_response is None:
+            state.rounds.pop()
+
+        # Handle user-initiated skip (decide later / defer to dev)
+        _lower = user_response.strip().lower()
+        if classification == "decide_later" and _lower in (
+            "decide later",
+            "skip",
+            "[decide_later]",
+        ):
+            record_result = await engine.skip_as_decide_later(state, question)
+            if isinstance(record_result, Result) and record_result.is_err:
+                print_error(f"Failed to skip question: {record_result.error}")
+                break
+            save_result = await engine.save_state(state)
+            if isinstance(save_result, Result) and save_result.is_err:
+                print_error(f"Failed to save state: {save_result.error}")
+                break
+            _save_cli_pm_meta(state.interview_id, engine)
+            continue
+        if classification == "deferred" and _lower in (
+            "defer",
+            "skip",
+            "[deferred]",
+        ):
+            record_result = await engine.skip_as_deferred(state, question)
+            if isinstance(record_result, Result) and record_result.is_err:
+                print_error(f"Failed to defer question: {record_result.error}")
+                break
+            save_result = await engine.save_state(state)
+            if isinstance(save_result, Result) and save_result.is_err:
+                print_error(f"Failed to save state: {save_result.error}")
+                break
+            _save_cli_pm_meta(state.interview_id, engine)
+            continue
+
+        record_result = await engine.record_response(state, user_response, question)
+        if isinstance(record_result, Result) and record_result.is_err:
+            print_error(f"Failed to record response: {record_result.error}")
+            break
+        if isinstance(record_result, Result):
+            state = record_result.value
+
+        state.clear_stored_ambiguity()
+        completion_result = await maybe_complete_pm_interview(state, engine)
+        if completion_result.is_err:
+            print_error(f"Failed to complete interview: {completion_result.error}")
+            break
+
+        state, completion = completion_result.value
+        if completion is not None:
+            save_result = await engine.save_state(state)
+            if save_result.is_err:
+                print_error(f"Failed to save completed state: {save_result.error}")
+                break
+            _save_cli_pm_meta(state.interview_id, engine)
+
+            decide_later_summary = engine.format_decide_later_summary()
+            summary_text = build_pm_completion_summary(
+                session_id=state.interview_id,
+                completion=completion,
+                stored_ambiguity_score=state.ambiguity_score,
+                deferred_count=0,
+                decide_later_count=len(engine.deferred_items) + len(engine.decide_later_items),
+                decide_later_summary=decide_later_summary,
+            )
+            console.print(f"\n[bold green]{summary_text}[/]\n")
+            break
+
+        save_result = await engine.save_state(state)
+        if isinstance(save_result, Result) and save_result.is_err:
+            print_error(f"Failed to save state: {save_result.error}")
+            break
+        _save_cli_pm_meta(state.interview_id, engine)
+
+    # Show decide-later summary at interview end
+    decide_later_summary = engine.format_decide_later_summary()
+    if decide_later_summary:
+        console.print(f"\n[bold yellow]{decide_later_summary}[/]\n")
+
+    # Generate PM seed and document — only if there are actual answered rounds
+    answered_rounds = [r for r in state.rounds if r.user_response is not None]
+    if answered_rounds and state.is_complete:
+        console.print("\n[bold cyan]Generating PM...[/]\n")
+        seed_result = await engine.generate_pm_seed(state)
+        if seed_result.is_ok:
+            seed = seed_result.value
+            seed_path = engine.save_pm_seed(seed)
+            print_success(f"PM seed saved: {seed_path}")
+
+            # Save human-readable pm.md alongside the seed
+            from ouroboros.bigbang.pm_document import save_pm_document
+
+            pm_dir = Path(output_dir) if output_dir else Path.cwd() / ".ouroboros"
+            pm_path = save_pm_document(seed, output_dir=pm_dir)
+            print_success(f"PM document saved: {pm_path}")
+
+            print_info(
+                "The PM seed is a handoff artifact for the dev interview, not the runnable Seed."
+            )
+            print_info(f"Next: {build_pm_dev_handoff_command(seed_path)}")
+
+            continue_to_dev = Confirm.ask(
+                "Continue into the dev interview now?",
+                default=True,
+            )
+            if continue_to_dev:
+                await _continue_into_dev_interview(
+                    seed_path,
+                    debug=debug,
+                    llm_backend=backend,
+                )
+        else:
+            print_error(f"Failed to generate PM: {seed_result.error}")
+    elif state.rounds and not state.is_complete:
+        print_info("Interview not complete — skipping PM generation.")

@@ -1,0 +1,920 @@
+"""Shell command parsing helpers for evidence verification."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import re
+import shlex
+
+from ouroboros.orchestrator.evidence.common import (
+    _normalize_exact_command,
+    _normalized_evidence_text,
+)
+
+
+def _looks_like_test_command(command: str) -> bool:
+    """Return True for common whole-suite or targeted test invocations."""
+    return _test_command_invocation(command) is not None
+
+
+def _test_command_invocation(command: str) -> str | None:
+    """Return the backed inner test invocation for a direct or wrapped command.
+
+    Output plumbing (``2>&1``, ``| tail -20``) is peeled first so a clean
+    invocation can be extracted from a ``<cmd> 2>&1 | tail -20`` runtime
+    command. ``_strip_command_output_plumbing`` is deliberately narrow — only
+    presentation-only tails are peeled — so an evidence-altering filter such
+    as ``| grep passed`` survives the strip and is rejected downstream by
+    ``_test_invocation_from_prefix`` rather than being silently dropped.
+    """
+    normalized = command.strip()
+    if not normalized:
+        return None
+
+    direct_candidate = _strip_command_output_plumbing(normalized)
+    if (
+        _has_trailing_output_filter_pipeline(normalized)
+        and not _output_filter_pipeline_is_pipefail_protected(normalized)
+        and _test_invocation_from_prefix(direct_candidate) is not None
+    ):
+        direct_candidate = normalized
+    direct = _test_invocation_from_prefix(direct_candidate)
+    if direct is not None:
+        return direct
+
+    body = _shell_command_body(normalized)
+    if body is None:
+        return None
+    invocation = _test_invocation_from_shell_body(body)
+    if invocation is not None:
+        return invocation
+    # Nested wrapper (``zsh -lc "zsh -lc '<test cmd>'"``): the body is itself a
+    # wrapper, so look one layer further. Recursion ends when the body is no
+    # longer a shell ``-c`` form.
+    return _test_command_invocation(body)
+
+
+def _test_command_invocation_allowing_output_plumbing(command: str) -> str | None:
+    """Return a test invocation after stripping output plumbing unconditionally.
+
+    This must not be used as command proof. It exists only to classify rejected
+    evidence forms for diagnostics while preserving the #1208 masking guard.
+    """
+    normalized = command.strip()
+    if not normalized:
+        return None
+    direct = _test_invocation_from_prefix(_strip_command_output_plumbing(normalized))
+    if direct is not None:
+        return direct
+    body = _shell_command_body(normalized)
+    if body is None:
+        return None
+    for segment, _pipefail_enabled in _segments_after_safe_shell_preamble_with_pipefail(body):
+        invocation = _test_invocation_from_prefix(_strip_command_output_plumbing(segment))
+        if invocation is not None:
+            return invocation
+        return None
+    return None
+
+
+def _shell_command_body(command: str) -> str | None:
+    """Return the command body when the command starts with a shell wrapper.
+
+    Codex uses POSIX ``sh -lc`` wrappers on Unix and a native
+    ``pwsh.exe -Command`` wrapper on Windows.  Both are transport wrappers;
+    evidence may cite the exact inner command without repeating the wrapper.
+    """
+    if _has_unquoted_status_masking_control(command):
+        return None
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    argv = tuple(parts)
+    return _shell_command_body_from_argv(argv) or _powershell_command_body_from_argv(argv)
+
+
+_POWERSHELL_EXECUTABLES = frozenset({"powershell", "powershell.exe", "pwsh", "pwsh.exe"})
+_POWERSHELL_FLAG_OPTIONS = frozenset(
+    {
+        "-nologo",
+        "-noprofile",
+        "-noninteractive",
+        "-noni",
+        "-sta",
+        "-mta",
+    }
+)
+_POWERSHELL_VALUE_OPTIONS = frozenset(
+    {
+        "-executionpolicy",
+        "-inputformat",
+        "-outputformat",
+        "-windowstyle",
+        "-workingdirectory",
+    }
+)
+
+
+def _powershell_command_body_from_argv(argv: tuple[str, ...]) -> str | None:
+    """Return a PowerShell ``-Command`` body from a narrow wrapper prefix.
+
+    Only non-executing host options are allowed before ``-Command`` and no
+    trailing arguments are accepted.  This keeps aliasing exact and prevents a
+    partial inner command from proving a larger PowerShell script.
+    """
+    if len(argv) < 3:
+        return None
+    executable = Path(argv[0].replace("\\", "/")).name.lower()
+    if executable not in _POWERSHELL_EXECUTABLES:
+        return None
+
+    index = 1
+    while index < len(argv):
+        option = argv[index].lower()
+        if option in {"-command", "-c"}:
+            if index + 2 != len(argv):
+                return None
+            return argv[index + 1].strip()
+        if option in _POWERSHELL_FLAG_OPTIONS:
+            index += 1
+            continue
+        if option in _POWERSHELL_VALUE_OPTIONS:
+            if index + 1 >= len(argv):
+                return None
+            index += 2
+            continue
+        return None
+    return None
+
+
+_SHELL_OPTIONS_WITH_ARGUMENT = frozenset({"-O", "+O", "-o", "+o", "--init-file", "--rcfile"})
+_SHELL_NON_EXECUTING_OPTIONS = frozenset(
+    {
+        "-n",
+        "--noexec",
+        "--version",
+        "--help",
+        "-D",
+        "--dump-strings",
+        "--dump-po-strings",
+        "--pretty-print",
+    }
+)
+
+
+def _shell_command_body_from_argv(argv: tuple[str, ...]) -> str | None:
+    """Return a shell ``-c`` body only while parsing the option prefix.
+
+    Once a script operand is encountered, later values are positional
+    arguments even when they happen to be spelled ``-c``. Options that consume
+    a following value remain within the prefix but cannot expose that value as
+    a command body.
+    """
+    if len(argv) < 3:
+        return None
+    shell_name = Path(argv[0]).name
+    if shell_name not in {"bash", "zsh", "sh"}:
+        return None
+    index = 1
+    while index < len(argv):
+        option = argv[index]
+        if option in _SHELL_NON_EXECUTING_OPTIONS or (
+            option.startswith("-") and not option.startswith("--") and "n" in option[1:]
+        ):
+            return None
+        if option in {"-c", "-lc", "-cl"}:
+            if index + 1 >= len(argv) or index + 2 != len(argv):
+                return None
+            return argv[index + 1].strip()
+        if option in _SHELL_OPTIONS_WITH_ARGUMENT:
+            if index + 1 >= len(argv):
+                return None
+            option_value = argv[index + 1].strip().lower().replace("_", "").replace("-", "")
+            if option == "-o" and option_value == "noexec":
+                return None
+            index += 2
+            continue
+        if option.startswith("-o"):
+            option_value = option[2:].strip().lower().replace("_", "").replace("-", "")
+            if option_value == "noexec":
+                return None
+        if option == "--" or option == "-" or not option.startswith(("-", "+")):
+            return None
+        index += 1
+    return None
+
+
+def _test_invocation_from_shell_body(body: str) -> str | None:
+    """Return a test invocation after conservative shell setup preambles."""
+    segments = tuple(_segments_after_safe_shell_preamble_with_pipefail(body))
+    if len(segments) != 1:
+        return None
+    segment, pipefail_enabled = segments[0]
+    candidate = _strip_command_output_plumbing(segment)
+    if (
+        _has_trailing_output_filter_pipeline(segment)
+        and not pipefail_enabled
+        and _test_invocation_from_prefix(candidate) is not None
+    ):
+        candidate = segment
+    return _test_invocation_from_prefix(candidate)
+
+
+def _single_command_after_safe_shell_preamble(command: str) -> str | None:
+    """Return a wrapped inner command after only safe setup preambles.
+
+    Generic ``commands_run`` evidence may cite the useful command inside a
+    runtime-recorded shell wrapper such as ``cd /work && python scripts/gen.py``.
+    Keep this narrower than substring containment: only ignore setup-only
+    preambles and only when exactly one non-preamble command remains.
+    """
+    body = _shell_command_body(command)
+    if body is None:
+        return None
+    segments = tuple(_segments_after_safe_shell_preamble(body))
+    if len(segments) != 1:
+        return None
+    segment = segments[0]
+    stripped = _strip_command_output_plumbing(segment)
+    if (
+        _has_trailing_output_filter_pipeline(segment)
+        and not _output_filter_pipeline_is_pipefail_protected(body)
+        and _looks_like_test_command(stripped)
+    ):
+        return None
+    return _normalized_evidence_text(stripped)
+
+
+def _segments_after_safe_shell_preamble(body: str) -> tuple[str, ...]:
+    """Return non-preamble shell segments after setup-only commands."""
+    return tuple(
+        segment
+        for segment, _pipefail_enabled in _segments_after_safe_shell_preamble_with_pipefail(body)
+    )
+
+
+def _segments_after_safe_shell_preamble_with_pipefail(body: str) -> tuple[tuple[str, bool], ...]:
+    """Return non-preamble segments with pipefail state active before each one."""
+    remaining: list[tuple[str, bool]] = []
+    pipefail_enabled = False
+    for segment in re.split(r"\s*&&\s*", body.strip()):
+        normalized_segment = segment.strip()
+        if not normalized_segment:
+            continue
+        if not remaining and _is_safe_test_command_preamble(normalized_segment):
+            if _is_pipefail_preamble(normalized_segment):
+                pipefail_enabled = True
+            continue
+        remaining.append((normalized_segment, pipefail_enabled))
+    return tuple(remaining)
+
+
+def _is_safe_test_command_preamble(segment: str) -> bool:
+    """Return True for shell setup segments that do not execute tests themselves."""
+    try:
+        parts = shlex.split(segment)
+    except ValueError:
+        return False
+    if not parts:
+        return True
+    if parts[0] == "cd" and len(parts) == 2:
+        return True
+    if _is_pipefail_parts(parts):
+        return True
+    if parts[0] == "export" and len(parts) > 1:
+        return all(_is_env_assignment(part) for part in parts[1:])
+    return all(_is_env_assignment(part) for part in parts)
+
+
+def _is_python_executable(value: str) -> bool:
+    """Return True for standard versioned Python interpreter names."""
+    executable = Path(value).name.lower()
+    return bool(re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable))
+
+
+def _is_env_assignment(value: str) -> bool:
+    """Return True for a simple shell environment assignment token."""
+    return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", value))
+
+
+def _strip_env_prefix(parts: list[str]) -> list[str]:
+    """Remove leading env assignment tokens before command recognition."""
+    index = 0
+    if parts and parts[0] == "env":
+        index = 1
+    while index < len(parts) and _is_env_assignment(parts[index]):
+        index += 1
+    return parts[index:]
+
+
+def _has_gradle_or_maven_test_skip(parts: list[str]) -> bool:
+    """Return True when a Gradle/Maven command explicitly disables tests."""
+
+    def maven_skip_property_disables_tests(value: str) -> bool:
+        normalized_value = value.lower()
+        if normalized_value in {"skiptests", "maven.test.skip"}:
+            return True
+        if normalized_value.startswith("skiptests=") or normalized_value.startswith(
+            "maven.test.skip="
+        ):
+            _, _, property_value = normalized_value.partition("=")
+            return property_value not in {"false", "0", "no", "off"}
+        return False
+
+    for index, part in enumerate(parts):
+        normalized = part.lower()
+        if normalized == "-d" and index + 1 < len(parts):
+            if maven_skip_property_disables_tests(parts[index + 1]):
+                return True
+        if normalized == "--define" and index + 1 < len(parts):
+            if maven_skip_property_disables_tests(parts[index + 1]):
+                return True
+        if normalized.startswith("--define="):
+            _, _, define_value = normalized.partition("=")
+            if maven_skip_property_disables_tests(define_value):
+                return True
+        if normalized.startswith("-d") and maven_skip_property_disables_tests(normalized[2:]):
+            return True
+        if normalized == "--exclude-task" and index + 1 < len(parts):
+            excluded_task = parts[index + 1].lower().lstrip(":")
+            if excluded_task == "test" or excluded_task.endswith(":test"):
+                return True
+        if normalized.startswith("--exclude-task="):
+            _, _, excluded_task = normalized.partition("=")
+            excluded_task = excluded_task.lstrip(":")
+            if excluded_task == "test" or excluded_task.endswith(":test"):
+                return True
+        if normalized == "-x" and index + 1 < len(parts):
+            excluded_task = parts[index + 1].lower().lstrip(":")
+            if excluded_task == "test" or excluded_task.endswith(":test"):
+                return True
+        if normalized.startswith("-x") and len(normalized) > 2:
+            excluded_task = normalized[2:].lstrip(":")
+            if excluded_task == "test" or excluded_task.endswith(":test"):
+                return True
+    return False
+
+
+def _has_unquoted_status_masking_control(command: str) -> bool:
+    """Return whether shell control syntax can hide a test command's status."""
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char in {"|", ";", "\n", "\r"}:
+            return True
+        if char == "&":
+            previous = command[index - 1] if index > 0 else ""
+            following = command[index + 1] if index + 1 < len(command) else ""
+            if previous == "&" or following == "&":
+                return True
+            if previous not in {">", "<"} and following != ">":
+                return True
+    return False
+
+
+_UV_VALUE_OPTIONS = frozenset(
+    {
+        "--allow-insecure-host",
+        "--cache-dir",
+        "--color",
+        "--config-file",
+        "--config-setting",
+        "--config-settings-package",
+        "--default-index",
+        "--directory",
+        "--env-file",
+        "--exclude-newer",
+        "--exclude-newer-package",
+        "--extra",
+        "--extra-index-url",
+        "--find-links",
+        "--fork-strategy",
+        "--from",
+        "--group",
+        "--index",
+        "--index-strategy",
+        "--index-url",
+        "--keyring-provider",
+        "--link-mode",
+        "--no-binary-package",
+        "--no-build-isolation-package",
+        "--no-build-package",
+        "--no-editable-package",
+        "--no-extra",
+        "--no-group",
+        "--no-sources-package",
+        "--only-group",
+        "--package",
+        "--prerelease",
+        "--project",
+        "--python",
+        "--python-platform",
+        "--preview-features",
+        "--refresh-package",
+        "--reinstall-package",
+        "--resolution",
+        "--upgrade-group",
+        "--upgrade-package",
+        "--with",
+        "--with-editable",
+        "--with-requirements",
+    }
+)
+_UV_FLAG_OPTIONS = frozenset(
+    {
+        "--active",
+        "--all-extras",
+        "--all-groups",
+        "--all-packages",
+        "--compile-bytecode",
+        "--exact",
+        "--frozen",
+        "--isolated",
+        "--locked",
+        "--managed-python",
+        "--native-tls",
+        "--no-binary",
+        "--no-build",
+        "--no-build-isolation",
+        "--no-cache",
+        "--no-config",
+        "--no-default-groups",
+        "--no-dev",
+        "--no-editable",
+        "--no-env-file",
+        "--no-index",
+        "--no-managed-python",
+        "--no-progress",
+        "--no-project",
+        "--no-python-downloads",
+        "--no-sources",
+        "--no-sync",
+        "--offline",
+        "--only-dev",
+        "--quiet",
+        "--refresh",
+        "--reinstall",
+        "--system-certs",
+        "--upgrade",
+        "--verbose",
+    }
+)
+_UV_SHORT_VALUE_OPTIONS = frozenset({"C", "f", "i", "p", "P", "w"})
+_UV_SHORT_FLAG_OPTIONS = frozenset({"n", "q", "U", "v"})
+
+
+def _uv_run_pytest_parts(parts: list[str]) -> list[str] | None:
+    """Parse a ``uv run``/``uvx`` prefix and return pytest plus its arguments."""
+    if len(parts) >= 3 and parts[:2] == ["uv", "run"]:
+        index = 2
+    elif len(parts) >= 2 and parts[0] == "uvx":
+        index = 1
+    else:
+        return None
+    while index < len(parts):
+        token = parts[index]
+        if token == "--":
+            index += 1
+            break
+        if not token.startswith("-") or token == "-":
+            break
+        if token in {"--help", "-h", "--version", "-V", "--script", "-s", "--gui-script"}:
+            return None
+        if token in {"--module", "-m"}:
+            index += 1
+            continue
+        if token.startswith("--"):
+            option, separator, attached = token.partition("=")
+            if option in _UV_FLAG_OPTIONS:
+                if separator:
+                    return None
+                index += 1
+                continue
+            if option not in _UV_VALUE_OPTIONS:
+                return None
+            index += 1
+            if separator:
+                if not attached:
+                    return None
+            else:
+                if index >= len(parts) or parts[index] == "--" or parts[index].startswith("-"):
+                    return None
+                index += 1
+            continue
+        cluster = token[1:]
+        position = 0
+        while position < len(cluster):
+            option = cluster[position]
+            if option in {"h", "s"}:
+                return None
+            if option == "m" or option in _UV_SHORT_FLAG_OPTIONS:
+                position += 1
+                continue
+            if option not in _UV_SHORT_VALUE_OPTIONS:
+                return None
+            if position + 1 == len(cluster):
+                index += 1
+                if index >= len(parts) or parts[index] == "--" or parts[index].startswith("-"):
+                    return None
+            position = len(cluster)
+        index += 1
+    if index >= len(parts):
+        return None
+    if parts[index] in {"pytest", "py.test"}:
+        return parts[index:]
+    if (
+        len(parts) >= index + 3
+        and _is_python_executable(parts[index])
+        and parts[index + 1 : index + 3] == ["-m", "pytest"]
+    ):
+        return parts[index:]
+    return None
+
+
+def _test_invocation_from_prefix(command: str) -> str | None:
+    """Return a normalized test invocation only when it starts the command text.
+
+    Refuses to extract from commands that still contain a residual shell pipe
+    after presentation plumbing has been peeled (``pytest x | grep passed``).
+    A residual pipe means the runtime command is followed by an
+    evidence-transforming filter (``grep`` / ``wc`` / ``tee``); treating the
+    bare prefix as the clean test invocation there would let a filtered run
+    silently back a clean ``tests_passed`` / ``commands_run`` claim via the
+    ``startswith`` widening in ``_runtime_message_supports_command_claim``.
+    """
+    if _has_unquoted_status_masking_control(command):
+        return None
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.replace('"', "").replace("'", "").split()
+    parts = _strip_env_prefix(parts)
+    if not parts:
+        return None
+    if any(part in {"|", "||", ";", "&"} for part in parts):
+        return None
+    uv_pytest_parts = _uv_run_pytest_parts(parts)
+    if uv_pytest_parts is not None:
+        if _has_non_executing_test_mode(uv_pytest_parts):
+            return None
+        return _normalized_evidence_text(" ".join(parts))
+    if _has_non_executing_test_mode(parts):
+        return None
+
+    if parts[0] in {"pytest", "py.test", "tox", "nox"}:
+        return _normalized_evidence_text(" ".join(parts))
+    if len(parts) >= 2 and parts[0] in {"npm", "pnpm", "yarn"} and parts[1] == "test":
+        return _normalized_evidence_text(" ".join(parts))
+    if (
+        len(parts) >= 3
+        and _is_python_executable(parts[0])
+        and parts[1] == "-m"
+        and parts[2] in {"pytest", "unittest"}
+    ):
+        return _normalized_evidence_text(" ".join(parts))
+    executable = Path(parts[0]).name
+    if (
+        executable in {"gradle", "gradlew", "mvn", "mvnw"}
+        and not _has_gradle_or_maven_test_skip(parts[1:])
+        and any(part in {"test", "check", "verify"} or part.endswith(":test") for part in parts[1:])
+    ):
+        return _normalized_evidence_text(" ".join(parts))
+    return None
+
+
+_GENERIC_NON_EXECUTING_TEST_OPTIONS = frozenset({"-h", "--help", "-V", "--version", "--dry-run"})
+_PYTEST_NON_EXECUTING_OPTIONS = frozenset(
+    {
+        "--collect-only",
+        "--collectonly",
+        "--co",
+        "--fixtures",
+        "--fixtures-per-test",
+        "--funcargs",
+        "--markers",
+        "--setup-only",
+        "--setup-plan",
+        "--setuponly",
+        "--setupplan",
+    }
+)
+
+
+def _has_non_executing_test_mode(parts: list[str]) -> bool:
+    """Return whether a recognized test runner is configured not to run tests."""
+    if any(part in _GENERIC_NON_EXECUTING_TEST_OPTIONS for part in parts[1:]):
+        return True
+
+    runner_parts = parts
+    if len(parts) >= 3 and (
+        parts[:3] == ["uv", "run", "pytest"]
+        or (
+            _is_python_executable(parts[0])
+            and parts[1] == "-m"
+            and parts[2] in {"pytest", "unittest"}
+        )
+    ):
+        runner_parts = parts[2:]
+
+    runner = Path(runner_parts[0]).name if runner_parts else ""
+    options = runner_parts[1:]
+    if runner in {"pytest", "py.test"} and any(
+        option in _PYTEST_NON_EXECUTING_OPTIONS for option in options
+    ):
+        return True
+    if runner == "tox" and any(
+        option in {"-l", "--listenvs", "--showconfig"} for option in options
+    ):
+        return True
+    if runner == "nox" and any(option in {"-l", "--list"} for option in options):
+        return True
+    return runner in {"gradle", "gradlew"} and "-m" in options
+
+
+def _unittest_command_invocation(command: str) -> str | None:
+    """Return the embedded ``python -m unittest`` invocation, if present."""
+    invocation = _test_command_invocation(command)
+    if invocation is None:
+        return None
+    parts = invocation.split()
+    if len(parts) >= 3 and _is_python_executable(parts[0]) and parts[1:3] == ["-m", "unittest"]:
+        return invocation
+    return None
+
+
+def _looks_like_unittest_command(command: str) -> bool:
+    """Return True when a shell command invokes stdlib unittest."""
+    return _unittest_command_invocation(command) is not None
+
+
+# Output-only shell filters: a trailing pipe into one of these is presentation
+# or paging, not the work an evidence claim is about.
+#
+# Deliberately narrow: only filters that pass the output stream through (or
+# truncate it positionally) are allowed. ``grep``/``egrep``/``fgrep`` are
+# excluded because they can hide failure lines and make a filtered run back a
+# clean ``commands_run`` / ``tests_passed`` claim (e.g. ``pytest ... | grep
+# passed``). ``tee`` and ``wc`` are excluded for the same reason: ``tee`` can
+# redirect the stream and ``wc`` collapses it to a count, both of which alter
+# what the runtime would have observed and so weaken anti-fabrication.
+_OUTPUT_FILTER_COMMANDS = frozenset({"tail", "head", "cat", "less", "more"})
+
+# Trailing shell output redirection (``2>&1``, ``> log``, ``2> err``, ``&> out``).
+_TRAILING_REDIRECT_RE = re.compile(
+    r"\s*(?:[0-9]*>{1,2}\s*(?:&[0-9]+|[^\s|]+)|&>{1,2}\s*[^\s|]+)\s*$"
+)
+
+
+def _top_level_shell_character_positions(command: str, character: str) -> tuple[int, ...]:
+    """Return unquoted occurrences outside shell grouping and substitutions."""
+    positions: list[int] = []
+    quote: str | None = None
+    escaped = False
+    nesting: list[str] = []
+    closing = {"(": ")", "{": "}"}
+    for index, char in enumerate(command):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            continue
+        if char in closing:
+            nesting.append(closing[char])
+            continue
+        if nesting and char == nesting[-1]:
+            nesting.pop()
+            continue
+        if not nesting and char == character:
+            positions.append(index)
+    return tuple(positions)
+
+
+def _normalized_shell_words_text(command: str) -> str | None:
+    """Return a quote-insensitive normalized argv spelling for one shell command.
+
+    This keeps command evidence matching exact at the argv level while allowing
+    common shell spelling differences such as ``--tests "ClassName"`` versus
+    ``--tests ClassName``. Commands that cannot be parsed, still contain a
+    pipeline, or contain shell control operators are left to the stricter raw
+    aliases.
+    """
+    text = command.strip()
+    if not text:
+        return None
+    try:
+        parts = shlex.split(text)
+    except ValueError:
+        return None
+    if not parts or any(part in {"|", "&&", ";", "||"} for part in parts):
+        return None
+    return _normalized_evidence_text(" ".join(parts))
+
+
+def _strip_command_output_plumbing(command: str) -> str:
+    """Return a command with trailing output redirection and pager pipes removed.
+
+    Agents routinely run ``<cmd> 2>&1 | tail -20`` while their ``commands_run``
+    evidence cites the clean ``<cmd>``. The trailing redirection and the
+    output-only pager pipe are presentation plumbing, not the work being
+    claimed, so they must not block a match. Deliberately conservative:
+
+    - Only trailing output redirections (``2>&1``, ``> log``, ``2> err``,
+      ``&> out``) and pipes into a pager-style filter listed in
+      ``_OUTPUT_FILTER_COMMANDS`` (``tail``/``head``/``cat``/``less``/``more``)
+      are dropped. These pass the underlying stream through (or truncate it
+      positionally), so the runtime evidence is unchanged in kind.
+    - Filters that *transform* the stream — ``grep`` family, ``wc``, ``tee`` —
+      are intentionally not stripped, because they can hide failure lines,
+      collapse the stream to a count, or divert it to a file, which would let
+      a filtered run back a clean ``commands_run`` / ``tests_passed`` claim.
+    - Meaningful pipelines such as ``a | python process.py`` are kept, so a
+      partial ``a`` claim is still not proven by an ``a | python process.py``
+      runtime command.
+    """
+    text = command.strip()
+    if not text:
+        return text
+    # Peel output-only filter pipes from the tail (``... | tail -n 20``).
+    while True:
+        pipe_positions = tuple(
+            position
+            for position in _top_level_shell_character_positions(text, "|")
+            if (position == 0 or text[position - 1] != "|")
+            and (position + 1 >= len(text) or text[position + 1] != "|")
+        )
+        if not pipe_positions:
+            break
+        pipe_position = pipe_positions[-1]
+        head = text[:pipe_position]
+        tail_segment = text[pipe_position + 1 :]
+        tail_tokens = tail_segment.split()
+        if tail_tokens and tail_tokens[0].lower() in _OUTPUT_FILTER_COMMANDS:
+            text = head.strip()
+            continue
+        break
+    # Peel trailing output redirections, possibly several (``2>&1 > log``).
+    prev: str | None = None
+    while prev != text:
+        prev = text
+        match = _TRAILING_REDIRECT_RE.search(text)
+        if match is None:
+            break
+        redirect_positions = _top_level_shell_character_positions(text, ">")
+        if not any(match.start() <= position < match.end() for position in redirect_positions):
+            break
+        text = text[: match.start()].strip()
+    return text
+
+
+def _has_trailing_output_filter_pipeline(command: str) -> bool:
+    """Return True when ``command`` ends in a pager-style output pipe."""
+    text = command.strip()
+    while "|" in text:
+        head, _, tail_segment = text.rpartition("|")
+        tail_tokens = tail_segment.split()
+        if tail_tokens and tail_tokens[0].lower() in _OUTPUT_FILTER_COMMANDS:
+            return True
+        text = head.strip()
+    return False
+
+
+def _output_filter_pipeline_is_pipefail_protected(command: str) -> bool:
+    """Return True when pipefail is enabled before the first stripped pipeline."""
+    pipefail_enabled = False
+    for segment in re.split(r"\s*(?:&&|;)\s*", command.strip()):
+        normalized_segment = segment.strip()
+        if not normalized_segment:
+            continue
+        if _is_pipefail_preamble(normalized_segment):
+            pipefail_enabled = True
+            continue
+        if _has_trailing_output_filter_pipeline(normalized_segment):
+            return pipefail_enabled
+    return False
+
+
+def _uses_pipefail(command: str) -> bool:
+    """Return True when shell text explicitly preserves upstream pipe status."""
+    for segment in re.split(r"\s*(?:&&|;)\s*", command.strip()):
+        try:
+            parts = shlex.split(segment)
+        except ValueError:
+            continue
+        if _is_pipefail_parts(parts):
+            return True
+    return False
+
+
+def _is_pipefail_preamble(segment: str) -> bool:
+    try:
+        parts = shlex.split(segment)
+    except ValueError:
+        return False
+    return _is_pipefail_parts(parts)
+
+
+def _is_pipefail_parts(parts: list[str]) -> bool:
+    return parts == ["set", "-o", "pipefail"]
+
+
+def _normalized_command_claim_aliases(command: str) -> tuple[str, ...]:
+    """Return normalized command forms that a concise evidence claim may use.
+
+    Structured Bash tool inputs may wrap the user command as
+    ``/bin/zsh -lc '<body>'``.  The wrapper itself is runtime-backed, so an
+    evidence claim may cite the exact shell body without re-stating the wrapper.
+    Keep this alias exact: test-command-specific helpers handle conservative
+    setup preambles, while generic ``commands_run`` claims should not be proven
+    by partial substrings of arbitrary shell scripts.
+    """
+    normalized = _normalized_evidence_text(command)
+    aliases = [normalized] if normalized else []
+
+    def append_alias(candidate: str | None) -> None:
+        if candidate and candidate not in aliases:
+            aliases.append(candidate)
+
+    append_alias(_normalized_shell_words_text(command))
+    # A leaf sometimes nests the wrapper -- ``/bin/zsh -lc "/bin/zsh -lc
+    # '<body>'"`` (observed on codex when it re-issues a command it read from
+    # a seed). Each layer is the same runtime-backed wrapper around the same
+    # argv vector, so peel until the body is no longer a shell ``-c`` form.
+    # Bounded so a pathological input cannot loop; each layer must parse as
+    # an exact wrapper, so this never widens proof to arbitrary substrings.
+    shell_body = _shell_command_body(command)
+    for _ in range(4):
+        normalized_shell_body = _normalized_evidence_text(shell_body) if shell_body else None
+        append_alias(normalized_shell_body)
+        append_alias(_normalized_shell_words_text(shell_body) if shell_body else None)
+        inner_body = _shell_command_body(shell_body) if shell_body else None
+        if not inner_body or inner_body == shell_body:
+            break
+        shell_body = inner_body
+    test_invocation = _test_command_invocation(command)
+    append_alias(test_invocation)
+    # A recorded command may append output plumbing (``... 2>&1 | tail -20``)
+    # that a concise ``commands_run`` claim omits. Add plumbing-stripped variants
+    # so the two still match. Alias matching stays exact (set intersection), so
+    # this does not widen proof to arbitrary substrings. Also add argv-normalized
+    # plumbing-stripped forms so quoted arguments in the runtime command match
+    # unquoted evidence claims for the same argv vector.
+    for base in tuple(aliases):
+        stripped_raw = _strip_command_output_plumbing(base)
+        stripped = _normalized_evidence_text(stripped_raw)
+        if (
+            stripped
+            and stripped != base
+            and _has_trailing_output_filter_pipeline(base)
+            and _looks_like_test_command(stripped)
+            and not _output_filter_pipeline_is_pipefail_protected(base)
+        ):
+            continue
+        append_alias(stripped)
+        append_alias(_normalized_shell_words_text(stripped_raw))
+    return tuple(aliases)
+
+
+def _runtime_command_evidence_aliases(command: str) -> tuple[str, ...]:
+    """Return exact runtime command aliases for sibling reconciliation."""
+    aliases = [_normalize_exact_command(command)]
+    single_inner_command = _single_exact_command_after_safe_shell_preamble(command)
+    if single_inner_command and single_inner_command not in aliases:
+        aliases.append(single_inner_command)
+    return tuple(alias for alias in aliases if alias)
+
+
+def _single_exact_command_after_safe_shell_preamble(command: str) -> str | None:
+    """Return one wrapped inner command without lowercasing exact evidence."""
+    body = _shell_command_body(command)
+    if body is None:
+        return None
+    segments = tuple(_segments_after_safe_shell_preamble(body))
+    if len(segments) != 1:
+        return None
+    return _normalize_exact_command(segments[0])

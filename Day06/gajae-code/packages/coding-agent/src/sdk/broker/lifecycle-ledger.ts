@@ -1,0 +1,959 @@
+import { createHash } from "node:crypto";
+import * as fsSync from "node:fs";
+import * as fs from "node:fs/promises";
+import path from "node:path";
+import type { SdkStartupFailure, SdkStartupRollbackResult } from "../startup-capability";
+import { parseLifecycleJson } from "./lifecycle-codec";
+import { assertSupportedStateVersion, SDK_STATE_VERSION } from "./state-version";
+
+export type LifecycleState =
+	| "accepted"
+	| "effect_started"
+	| "awaiting_ready"
+	| "terminal_ok"
+	| "terminal_error"
+	| "terminal_uncertain";
+export interface LifecycleWorktreeIntent {
+	repoRoot: string;
+	worktreePath: string;
+	detached: boolean;
+	baseRef: string;
+	branchName?: string;
+}
+
+export interface LifecycleEffectIntent {
+	sessionId: string;
+	stateRoot: string;
+	childOwnershipEstablished?: boolean;
+	worktree?: LifecycleWorktreeIntent;
+}
+
+/** Durable lifecycle effects retained for exact replay; never implies rollback authority. */
+export interface LifecycleCleanupProof {
+	processExited: true;
+	endpointRemoved: true;
+	hostUnregistered:
+		| { state: "unregistered"; indexSeq: number; lifecycleRequestId?: string }
+		| { state: "not_registered" };
+	rollback: {
+		endpointGeneration: number | null;
+		fenced: true;
+		runtimeRemoved: true;
+		hostStopped: true;
+		brokerRegistrationReleased: true;
+	};
+}
+
+export interface LifecycleStartupFailureReceipt extends SdkStartupFailure {
+	artifactDigest: string;
+	rollback: SdkStartupRollbackResult;
+	cleanupProof?: LifecycleCleanupProof;
+}
+
+export interface LifecycleDurableEffectsReceipt {
+	worktree?: {
+		cwdDigest: string;
+		created: boolean;
+		reused: boolean;
+		createdBranch: boolean;
+		branchDigest?: string;
+	};
+	transcript?: {
+		identityDigest: string;
+		contentDigest: string;
+	};
+	startup?: LifecycleStartupFailureReceipt;
+	timings?: {
+		worktreePreparationMs?: number;
+		dependencyPreparationMs?: number;
+		spawnAuthorizedAtOffsetMs?: number;
+	};
+	digest?: string;
+}
+
+export interface LifecycleLedgerEntry {
+	operationKey?: string;
+	fingerprint?: string;
+	version: typeof SDK_STATE_VERSION;
+	identity: string;
+	requestHash: string;
+	state: LifecycleState;
+	intendedSessionId?: string;
+	resultSessionId?: string;
+	effectMarker?: string;
+	effectIntent?: LifecycleEffectIntent;
+	durableEffects?: LifecycleDurableEffectsReceipt;
+	startupFailure?: LifecycleStartupFailureReceipt;
+
+	endpointGeneration?: number;
+	responseDigest?: string;
+	response?: unknown;
+	unresolvedCleanupResponse?: unknown;
+	unresolvedCleanupResponseDigest?: string;
+	uncertainCleanupSessionId?: string;
+	uncertainCleanupSessionIds?: string[];
+	ts: number;
+}
+export type BeginResult =
+	| { kind: "new"; entry: LifecycleLedgerEntry }
+	| { kind: "replay"; entry: LifecycleLedgerEntry }
+	| { kind: "idempotency_conflict" }
+	| { kind: "terminal_uncertain"; entry: LifecycleLedgerEntry }
+	| { kind: "in_progress"; entry: LifecycleLedgerEntry };
+const terminal = (s: LifecycleState) => s === "terminal_ok" || s === "terminal_error";
+const final = (s: LifecycleState) => terminal(s) || s === "terminal_uncertain";
+export interface LifecycleLedgerLimits {
+	maxBytes?: number;
+	maxLineBytes?: number;
+	maxRows?: number;
+	/**
+	 * Cap for the `.corrupt` quarantine sidecar. Reaching it rotates one
+	 * generation aside instead of appending forever.
+	 */
+	maxCorruptBytes?: number;
+}
+function canonicalCleanupSessionId(value: unknown): value is string {
+	return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
+}
+
+const DEFAULT_LIFECYCLE_LEDGER_LIMITS: Required<LifecycleLedgerLimits> = {
+	maxBytes: 64 * 1024 * 1024,
+	maxLineBytes: 8 * 1024 * 1024,
+	maxRows: 10_000,
+	maxCorruptBytes: 8 * 1024 * 1024,
+};
+
+/** Appended when a quarantined row is clipped to the sidecar cap. */
+const LIFECYCLE_QUARANTINE_TRUNCATION_MARKER = "\n[gjc: quarantined row truncated at the corrupt-ledger cap]";
+const MAX_LIFECYCLE_LEDGER_JSON_DEPTH = 64;
+const MAX_LIFECYCLE_LEDGER_JSON_FIELDS = 1024;
+
+function isBoundedLedgerJson(value: unknown, depth = 0, budget = { fields: 0 }): boolean {
+	if (depth > MAX_LIFECYCLE_LEDGER_JSON_DEPTH) return false;
+	if (value === null || typeof value !== "object") return true;
+	if (Array.isArray(value)) {
+		if (value.length > MAX_LIFECYCLE_LEDGER_JSON_FIELDS) return false;
+		return value.every(item => isBoundedLedgerJson(item, depth + 1, budget));
+	}
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record);
+	budget.fields += keys.length;
+	return (
+		budget.fields <= MAX_LIFECYCLE_LEDGER_JSON_FIELDS &&
+		keys.every(key => isBoundedLedgerJson(record[key], depth + 1, budget))
+	);
+}
+
+function isLifecycleLedgerEntry(value: unknown): value is LifecycleLedgerEntry {
+	if (typeof value !== "object" || value === null || Array.isArray(value) || !isBoundedLedgerJson(value)) return false;
+	const entry = value as Partial<LifecycleLedgerEntry>;
+	return (
+		entry.version === SDK_STATE_VERSION &&
+		typeof entry.identity === "string" &&
+		entry.identity.length > 0 &&
+		typeof entry.requestHash === "string" &&
+		entry.requestHash.length > 0 &&
+		(entry.state === "accepted" ||
+			entry.state === "effect_started" ||
+			entry.state === "awaiting_ready" ||
+			entry.state === "terminal_ok" ||
+			entry.state === "terminal_error" ||
+			entry.state === "terminal_uncertain") &&
+		typeof entry.ts === "number" &&
+		Number.isSafeInteger(entry.ts) &&
+		(entry.operationKey === undefined || typeof entry.operationKey === "string") &&
+		(entry.fingerprint === undefined || typeof entry.fingerprint === "string")
+	);
+}
+function canonicalJson(value: unknown): string {
+	if (typeof value === "bigint") return JSON.stringify(value.toString());
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	const record = value as Record<string, unknown>;
+	return `{${Object.keys(record)
+		.filter(key => record[key] !== undefined)
+		.sort()
+		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+		.join(",")}}`;
+}
+function pendingCleanupSessionId(response: unknown): string | undefined {
+	if (!response || typeof response !== "object") return undefined;
+	const cleanup = (response as { error?: { cleanup?: { sessionId?: unknown } } }).error?.cleanup;
+	return canonicalCleanupSessionId(cleanup?.sessionId) ? cleanup.sessionId : undefined;
+}
+
+function hasValidTerminalDigests(entry: LifecycleLedgerEntry): boolean {
+	const response = entry.response as { ok?: unknown; error?: { code?: unknown; cleanup?: unknown } } | undefined;
+	const cleanupPendingResponse =
+		response?.ok === false && response.error?.code === "cleanup_pending" && response.error.cleanup !== undefined;
+	const responseDigestRequired =
+		cleanupPendingResponse ||
+		((terminal(entry.state) || entry.state === "terminal_uncertain") &&
+			(entry.state !== "terminal_uncertain" || entry.response !== undefined));
+	if (cleanupPendingResponse) {
+		const cleanupSessionId = (response.error?.cleanup as { sessionId?: unknown }).sessionId;
+		if (!canonicalCleanupSessionId(entry.intendedSessionId) || cleanupSessionId !== entry.intendedSessionId)
+			return false;
+	}
+	const expectedResponseDigest =
+		entry.response === undefined
+			? undefined
+			: createHash("sha256")
+					.update(
+						canonicalJson(
+							cleanupPendingResponse
+								? { intendedSessionId: entry.intendedSessionId, response: entry.response }
+								: entry.response,
+						),
+					)
+					.digest("hex");
+	if (entry.responseDigest !== undefined) {
+		if (entry.response === undefined || entry.responseDigest !== expectedResponseDigest) return false;
+	} else if (responseDigestRequired) return false;
+	if (entry.unresolvedCleanupResponse !== undefined || entry.unresolvedCleanupResponseDigest !== undefined) {
+		const unresolvedResponse = entry.unresolvedCleanupResponse as {
+			error?: { cleanup?: { sessionId?: unknown } };
+		};
+		if (
+			entry.unresolvedCleanupResponse === undefined ||
+			typeof entry.unresolvedCleanupResponseDigest !== "string" ||
+			unresolvedResponse.error?.cleanup?.sessionId !== entry.intendedSessionId ||
+			entry.unresolvedCleanupResponseDigest !==
+				createHash("sha256")
+					.update(
+						canonicalJson({
+							intendedSessionId: entry.intendedSessionId,
+							response: entry.unresolvedCleanupResponse,
+						}),
+					)
+					.digest("hex")
+		)
+			return false;
+	}
+	if (!entry.durableEffects) return true;
+	const { digest, ...body } = entry.durableEffects;
+	return typeof digest === "string" && digest === createHash("sha256").update(canonicalJson(body)).digest("hex");
+}
+export class LifecycleLedger {
+	#file: string;
+	#corruptFile: string;
+	#entries: LifecycleLedgerEntry[] = [];
+	#byIdentity = new Map<string, LifecycleLedgerEntry>();
+	#limits: Required<LifecycleLedgerLimits>;
+	#rowCount = 0;
+	#byteCount = 0;
+	#warnings: string[] = [];
+	#mutationTail: Promise<void> = Promise.resolve();
+
+	async #mutate<T>(operation: () => Promise<T>): Promise<T> {
+		const previous = this.#mutationTail;
+		const completion = Promise.withResolvers<void>();
+		this.#mutationTail = previous.then(() => completion.promise);
+		await previous;
+		try {
+			return await operation();
+		} finally {
+			completion.resolve();
+		}
+	}
+
+	constructor(agentDir: string, limits: LifecycleLedgerLimits = {}) {
+		this.#file = path.join(agentDir, "sdk", "lifecycle-ledger.jsonl");
+		this.#corruptFile = `${this.#file}.corrupt`;
+		this.#limits = {
+			maxBytes: limits.maxBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxBytes,
+			maxLineBytes: limits.maxLineBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxLineBytes,
+			maxRows: limits.maxRows ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxRows,
+			maxCorruptBytes: limits.maxCorruptBytes ?? DEFAULT_LIFECYCLE_LEDGER_LIMITS.maxCorruptBytes,
+		};
+	}
+	async open(): Promise<this> {
+		return this.#mutate(async () => this.#open());
+	}
+
+	async #open(): Promise<this> {
+		await fs.mkdir(path.dirname(this.#file), { recursive: true, mode: 0o700 });
+		this.#entries = [];
+		this.#byIdentity.clear();
+		this.#warnings = [];
+		this.#rowCount = 0;
+		this.#byteCount = 0;
+		const invalidIdentities = new Set<string>();
+		const syntheticUncertain = new Map<string, LifecycleLedgerEntry>();
+		const uncertainAfterCorruption = new Set<string>();
+		const source = await this.#readBoundedSource();
+		let tornTail = false;
+		if (source) {
+			this.#byteCount = source.length;
+			tornTail = source.length > 0 && source.at(-1) !== 0x0a;
+			let lineStart = 0;
+			for (let offset = 0; offset <= source.length; offset += 1) {
+				if (offset !== source.length && source[offset] !== 0x0a) continue;
+				const line = source.subarray(lineStart, offset);
+				lineStart = offset + 1;
+				if (line.length === 0) continue;
+				this.#rowCount += 1;
+				if (this.#rowCount > this.#limits.maxRows)
+					await this.#rejectOversizedSource("Lifecycle ledger exceeds the maximum row count.");
+				if (line.length > this.#limits.maxLineBytes)
+					await this.#rejectOversizedSource("Lifecycle ledger row exceeds the maximum byte length.");
+				try {
+					const value = parseLifecycleJson(line);
+					assertSupportedStateVersion(this.#file, value);
+					if (!isLifecycleLedgerEntry(value)) throw new Error("invalid ledger entry");
+					const entry = value;
+					const prior = this.#byIdentity.get(entry.identity);
+					const invalidHistory =
+						invalidIdentities.has(entry.identity) ||
+						uncertainAfterCorruption.has(entry.identity) ||
+						!hasValidTerminalDigests(entry) ||
+						!this.#isValidHistoryContinuation(prior, entry);
+					if (invalidHistory) {
+						await this.#quarantine(line);
+						invalidIdentities.add(entry.identity);
+						if (!syntheticUncertain.has(entry.identity)) {
+							const uncertain = this.#uncertainFrom(prior ?? entry, prior !== undefined);
+							const nestedCleanupSessionId =
+								pendingCleanupSessionId(entry.unresolvedCleanupResponse) ??
+								pendingCleanupSessionId(entry.response) ??
+								entry.intendedSessionId;
+							if (canonicalCleanupSessionId(nestedCleanupSessionId))
+								uncertain.uncertainCleanupSessionId = nestedCleanupSessionId;
+							uncertain.uncertainCleanupSessionIds = [
+								entry.intendedSessionId,
+								pendingCleanupSessionId(entry.response),
+								pendingCleanupSessionId(entry.unresolvedCleanupResponse),
+								nestedCleanupSessionId,
+							].filter(
+								(candidate, index, candidates): candidate is string =>
+									canonicalCleanupSessionId(candidate) && candidates.indexOf(candidate) === index,
+							);
+							// No blanket fence: the synthetic marker stays scoped to the
+							// session ids the quarantined row actually named (#5364).
+							// Rows that named nothing fence nothing; resurrecting a
+							// maximally-destructive flag here is the poison shape.
+							syntheticUncertain.set(entry.identity, uncertain);
+						}
+						continue;
+					}
+					this.#entries.push(entry);
+					this.#byIdentity.set(entry.identity, entry);
+				} catch (error) {
+					if (error instanceof Error && "code" in error && error.code === "unsupported_state_version") throw error;
+					for (const [identity, latest] of this.#byIdentity) {
+						if (!final(latest.state)) uncertainAfterCorruption.add(identity);
+					}
+					await this.#quarantine(line);
+				}
+			}
+		}
+		if (tornTail) await this.#sealTornTail();
+		for (const [identity, uncertain] of syntheticUncertain) {
+			this.#byIdentity.set(identity, uncertain);
+			if (this.#entries.some(entry => entry.identity === identity && entry.state === "accepted"))
+				await this.#append(uncertain);
+		}
+		for (const identity of uncertainAfterCorruption) {
+			const entry = this.#byIdentity.get(identity);
+			if (entry && !final(entry.state)) await this.#append(this.#uncertainFrom(entry));
+		}
+		// Effects may have completed after the last durable marker; do not retry them after a restart.
+		for (const entry of [...this.#byIdentity.values()]) {
+			if ((entry.state === "effect_started" && !this.#isCleanupPending(entry)) || entry.state === "awaiting_ready")
+				await this.#append(this.#uncertainFrom(entry));
+		}
+		return this;
+	}
+	/**
+	 * Reads the durable terminal record for one request without recovering or changing the ledger.
+	 *
+	 * This intentionally accepts an unrelated unterminated final write: concurrent
+	 * appenders may have started a different row after this request's synced terminal
+	 * row. Complete rows are still decoded and validated strictly, and any incomplete
+	 * tail that identifies this request withholds proof.
+	 *
+	 * `terminal_uncertain` is a durable terminal record too: an operation that concluded
+	 * uncertainly persists that conclusion, and refusing to read it back would report a
+	 * synced row as unpersisted and replace its true reason with a generic one.
+	 */
+	async readTerminal(identity: string, requestHash: string): Promise<LifecycleLedgerEntry | undefined> {
+		const source = await this.#readBoundedSourceReadOnly();
+		if (!source) return undefined;
+		let prior: LifecycleLedgerEntry | undefined;
+		let latest: LifecycleLedgerEntry | undefined;
+		let rows = 0;
+		let lineStart = 0;
+		const finalNewline = source.length > 0 && source.at(-1) === 0x0a;
+		const completeLength = finalNewline ? source.length : source.lastIndexOf(0x0a) + 1;
+		for (let offset = 0; offset < completeLength; offset += 1) {
+			if (source[offset] !== 0x0a) continue;
+			const line = source.subarray(lineStart, offset);
+			lineStart = offset + 1;
+			if (line.length === 0) continue;
+			rows += 1;
+			if (rows > this.#limits.maxRows || line.length > this.#limits.maxLineBytes) return undefined;
+			let entry: LifecycleLedgerEntry;
+			try {
+				const value = parseLifecycleJson(line);
+				assertSupportedStateVersion(this.#file, value);
+				if (!isLifecycleLedgerEntry(value)) return undefined;
+				entry = value;
+			} catch {
+				return undefined;
+			}
+			if (entry.identity !== identity) continue;
+			if (
+				entry.requestHash !== requestHash ||
+				!hasValidTerminalDigests(entry) ||
+				!this.#isValidHistoryContinuation(prior, entry)
+			)
+				return undefined;
+			prior = entry;
+			latest = entry;
+		}
+		if (!finalNewline) {
+			const tail = source.subarray(completeLength);
+			// LifecycleLedger writes JSON.stringify entries, so this marker is exact for
+			// a partially persisted row from this identity without inspecting arbitrary
+			// malformed data as a valid record.
+			const identityMarker = Buffer.from(`"identity":${JSON.stringify(identity)}`);
+			if (tail.includes(identityMarker)) return undefined;
+		}
+		return latest && final(latest.state) ? latest : undefined;
+	}
+
+	/**
+	 * A recovery pass appends `terminal_uncertain` for every row it finds mid-flight, so a
+	 * long-running operation can have that marker interleaved before its own terminal row
+	 * lands. The marker records unresolved work, not a proven outcome: the owner that ran
+	 * the effects stays authoritative and may still resolve it. A proven terminal row is
+	 * immutable and admits no successor.
+	 */
+	#isValidHistoryContinuation(previous: LifecycleLedgerEntry | undefined, next: LifecycleLedgerEntry): boolean {
+		if (!previous) return next.state === "accepted";
+		if (previous.requestHash !== next.requestHash || terminal(previous.state)) return false;
+		if (previous.state === "terminal_uncertain") return final(next.state);
+		if (previous.state === "accepted") return true;
+		return next.state === "effect_started" || next.state === "awaiting_ready" || final(next.state);
+	}
+	#isCleanupPending(entry: LifecycleLedgerEntry): boolean {
+		if (!entry.response || typeof entry.response !== "object") return false;
+		const response = entry.response as { ok?: unknown; error?: { code?: unknown; cleanup?: unknown } };
+		return (
+			response.ok === false && response.error?.code === "cleanup_pending" && response.error.cleanup !== undefined
+		);
+	}
+	#isSessionDeleteCleanupPending(entry: LifecycleLedgerEntry): boolean {
+		if (!this.#isCleanupPending(entry)) return false;
+		const response = entry.response as {
+			error?: {
+				cleanup?: {
+					phase?: unknown;
+					sessionId?: unknown;
+					sessionsRoot?: unknown;
+					transcriptPath?: unknown;
+					cwd?: unknown;
+				};
+			};
+		};
+		const cleanup = response.error?.cleanup;
+		return (
+			(cleanup?.phase === "artifacts" || cleanup?.phase === "transcript" || cleanup?.phase === "metadata") &&
+			typeof cleanup.sessionId === "string" &&
+			typeof cleanup.sessionsRoot === "string" &&
+			typeof cleanup.transcriptPath === "string" &&
+			typeof cleanup.cwd === "string"
+		);
+	}
+
+	#matchesSessionDeleteTarget(
+		entry: LifecycleLedgerEntry,
+		target: { sessionId: string; sessionsRoot?: string; transcriptPath: string; cwd: string },
+	): boolean {
+		if (!this.#isSessionDeleteCleanupPending(entry)) return false;
+		const response = entry.response as {
+			error: { cleanup: { sessionId: string; sessionsRoot: string; transcriptPath: string; cwd: string } };
+		};
+		const cleanup = response.error.cleanup;
+		return (
+			cleanup.sessionId === target.sessionId &&
+			(target.sessionsRoot === undefined || cleanup.sessionsRoot === target.sessionsRoot) &&
+			cleanup.transcriptPath === target.transcriptPath &&
+			cleanup.cwd === target.cwd
+		);
+	}
+
+	#uncertainFrom(entry: LifecycleLedgerEntry, trusted = true): LifecycleLedgerEntry {
+		if (trusted) return { ...entry, state: "terminal_uncertain", ts: Date.now() };
+		return {
+			version: SDK_STATE_VERSION,
+			identity: entry.identity,
+			requestHash: entry.requestHash,
+			state: "terminal_uncertain",
+			ts: Date.now(),
+		};
+	}
+	async #readBoundedSource(): Promise<Buffer | undefined> {
+		let handle: fs.FileHandle | undefined;
+		try {
+			handle = await fs.open(this.#file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+			const stat = await handle.stat({ bigint: true });
+			if (!stat.isFile() || stat.size > BigInt(this.#limits.maxBytes))
+				await this.#rejectOversizedSource("Lifecycle ledger exceeds the maximum file byte length.");
+			const bytes = Buffer.alloc(Number(stat.size) + 1);
+			const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+			if (bytesRead > this.#limits.maxBytes)
+				await this.#rejectOversizedSource("Lifecycle ledger exceeds the maximum file byte length.");
+			return bytes.subarray(0, bytesRead);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		} finally {
+			if (handle) await handle.close();
+		}
+	}
+	async #readBoundedSourceReadOnly(): Promise<Buffer | undefined> {
+		let handle: fs.FileHandle | undefined;
+		try {
+			handle = await fs.open(this.#file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+			const stat = await handle.stat({ bigint: true });
+			if (!stat.isFile() || stat.size > BigInt(this.#limits.maxBytes)) return undefined;
+			const bytes = Buffer.alloc(Number(stat.size) + 1);
+			const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+			if (bytesRead > this.#limits.maxBytes) return undefined;
+			return bytes.subarray(0, bytesRead);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			return undefined;
+		} finally {
+			if (handle) await handle.close();
+		}
+	}
+	async #rejectOversizedSource(reason: string): Promise<never> {
+		await this.#quarantine(reason);
+		throw new Error(reason);
+	}
+	async #openAppendRegular(file: string): Promise<fs.FileHandle> {
+		const handle = await fs.open(
+			file,
+			fsSync.constants.O_WRONLY | fsSync.constants.O_APPEND | fsSync.constants.O_CREAT | fsSync.constants.O_NOFOLLOW,
+			0o600,
+		);
+		try {
+			if (!(await handle.stat()).isFile()) throw new Error("Lifecycle ledger write target is not a regular file.");
+			return handle;
+		} catch (error) {
+			await handle.close();
+			throw error;
+		}
+	}
+	async #sealTornTail(): Promise<void> {
+		const h = await this.#openAppendRegular(this.#file);
+		try {
+			await h.writeFile("\n");
+			await h.sync();
+			this.#byteCount += 1;
+		} finally {
+			await h.close();
+		}
+	}
+	/**
+	 * Rotate the quarantine sidecar aside once it would exceed its cap.
+	 *
+	 * Quarantine is diagnostic, not durable state: an unreadable ledger
+	 * re-quarantines its whole contents on every open, so a plain append grows
+	 * the sidecar without bound (a 126 MB `.corrupt` next to a 6 MB live ledger,
+	 * #3963). One retained generation keeps the newest evidence while bounding
+	 * the pair at twice the cap.
+	 */
+	async #rotateCorruptWhenFull(incomingBytes: number): Promise<void> {
+		let size: number;
+		try {
+			const stat = await fs.lstat(this.#corruptFile);
+			// A non-regular quarantine path is never rotated; the append guard rejects it.
+			if (!stat.isFile()) return;
+			size = stat.size;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
+		}
+		if (size + incomingBytes <= this.#limits.maxCorruptBytes) return;
+		await fs.rename(this.#corruptFile, `${this.#corruptFile}.1`);
+	}
+
+	async #quarantine(line: string | Uint8Array): Promise<void> {
+		const payload =
+			typeof line === "string" ? Buffer.from(line) : Buffer.from(line.buffer, line.byteOffset, line.byteLength);
+		// A single quarantined row can be as large as the whole ledger, so the
+		// write itself is capped too; otherwise one oversized row would blow past
+		// the rotation bound it just triggered.
+		const truncated = payload.length > this.#limits.maxCorruptBytes;
+		const retained = truncated ? payload.subarray(0, this.#limits.maxCorruptBytes) : payload;
+		await this.#rotateCorruptWhenFull(retained.length + 1);
+		const h = await this.#openAppendRegular(this.#corruptFile);
+		try {
+			await h.writeFile(retained);
+			await h.writeFile(truncated ? `${LIFECYCLE_QUARANTINE_TRUNCATION_MARKER}\n` : "\n");
+			await h.sync();
+		} finally {
+			await h.close();
+		}
+		this.#warnings.push("Malformed lifecycle ledger entry quarantined");
+	}
+	async #syncDirectory(): Promise<void> {
+		const directory = await fs.open(path.dirname(this.#file), fsSync.constants.O_RDONLY);
+		try {
+			await directory.sync();
+		} finally {
+			await directory.close();
+		}
+	}
+	async #compact(replacement?: LifecycleLedgerEntry): Promise<boolean> {
+		const anchors = new Map<string, LifecycleLedgerEntry>();
+		for (const entry of this.#entries) {
+			const latest = replacement?.identity === entry.identity ? replacement : this.#byIdentity.get(entry.identity);
+			if (entry.state === "accepted" && !anchors.has(entry.identity) && entry.requestHash === latest?.requestHash)
+				anchors.set(entry.identity, entry);
+		}
+		const snapshot: LifecycleLedgerEntry[] = [];
+		const compacted = new Map(this.#byIdentity);
+		if (replacement) compacted.set(replacement.identity, replacement);
+		for (const [identity, latest] of compacted) {
+			const anchor = anchors.get(identity);
+			if (!anchor) throw new Error("Lifecycle ledger compaction requires an accepted identity anchor.");
+			snapshot.push(anchor);
+			if (latest.state !== "accepted") snapshot.push(latest);
+		}
+		const contents = Buffer.from(snapshot.map(entry => `${JSON.stringify(entry)}\n`).join(""));
+		if (
+			snapshot.length > this.#limits.maxRows ||
+			contents.length > this.#limits.maxBytes ||
+			snapshot.some(entry => Buffer.byteLength(JSON.stringify(entry)) > this.#limits.maxLineBytes)
+		)
+			throw new Error("Lifecycle ledger compaction exceeds configured bounds.");
+		const temporary = path.join(
+			path.dirname(this.#file),
+			`.lifecycle-ledger.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
+		);
+		let renamed = false;
+		try {
+			const h = await fs.open(
+				temporary,
+				fsSync.constants.O_WRONLY |
+					fsSync.constants.O_CREAT |
+					fsSync.constants.O_EXCL |
+					fsSync.constants.O_NOFOLLOW,
+				0o600,
+			);
+			try {
+				await h.writeFile(contents);
+				await h.sync();
+			} finally {
+				await h.close();
+			}
+			await fs.rename(temporary, this.#file);
+			renamed = true;
+			await this.#syncDirectory();
+			this.#entries = snapshot;
+			this.#byIdentity = compacted;
+			this.#rowCount = snapshot.length;
+			this.#byteCount = contents.length;
+		} finally {
+			if (!renamed) await fs.unlink(temporary).catch(() => {});
+		}
+		return replacement !== undefined;
+	}
+	findByOperationKey(operationKey: string): LifecycleLedgerEntry | undefined {
+		return [...this.#byIdentity.values()].find(entry => entry.operationKey === operationKey);
+	}
+	/**
+	 * Legacy target-inclusive rows predate the operation/key index. Their opaque
+	 * identities cannot establish that a different target is safe, so callers
+	 * must reject rather than create a second admission.
+	 */
+	hasLegacyIdentity(): boolean {
+		return [...this.#byIdentity.values()].some(entry => entry.operationKey === undefined);
+	}
+	async migrateIdentity(
+		from: string,
+		to: string,
+		metadata: { operationKey: string; fingerprint: string },
+	): Promise<LifecycleLedgerEntry | undefined> {
+		return this.#mutate(async () => {
+			if (this.#byIdentity.has(to)) return this.#byIdentity.get(to);
+			const entry = this.#byIdentity.get(from);
+			if (!entry) return undefined;
+			const migrated = await this.#append({ ...entry, identity: to, ...metadata, ts: Date.now() });
+			// Retire the legacy row so hasLegacyIdentity() returns false and future
+			// unrelated lifecycle requests are not globally blocked. The legacy
+			// identity gets a metadata-bearing replacement row in the append-only
+			// log, superseding the original metadata-free entry in #byIdentity.
+			if (entry.operationKey === undefined) await this.#append({ ...entry, ...metadata, ts: Date.now() });
+			return migrated;
+		});
+	}
+	get warnings(): readonly string[] {
+		return this.#warnings;
+	}
+	async #append(entry: LifecycleLedgerEntry): Promise<LifecycleLedgerEntry> {
+		const line = Buffer.from(
+			`${JSON.stringify(entry, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value))}\n`,
+		);
+		if (line.length - 1 > this.#limits.maxLineBytes)
+			throw new Error("Lifecycle ledger row exceeds the maximum byte length.");
+		let replacementCompacted = false;
+		if (this.#rowCount + 1 > this.#limits.maxRows || this.#byteCount + line.length > this.#limits.maxBytes)
+			replacementCompacted = await this.#compact(this.#byIdentity.has(entry.identity) ? entry : undefined);
+		if (replacementCompacted) return entry;
+		if (this.#rowCount + 1 > this.#limits.maxRows || this.#byteCount + line.length > this.#limits.maxBytes)
+			throw new Error("Lifecycle ledger append exceeds configured bounds.");
+		const h = await this.#openAppendRegular(this.#file);
+		try {
+			await h.writeFile(line);
+			await h.sync();
+		} finally {
+			await h.close();
+		}
+		this.#entries.push(entry);
+		this.#byIdentity.set(entry.identity, entry);
+		this.#rowCount += 1;
+		this.#byteCount += line.length;
+		return entry;
+	}
+	async begin(
+		identity: string,
+		requestHash: string,
+		metadata: { operationKey?: string; fingerprint?: string } = {},
+	): Promise<BeginResult> {
+		return this.#mutate(async () => this.#begin(identity, requestHash, metadata));
+	}
+
+	async #begin(
+		identity: string,
+		requestHash: string,
+		metadata: { operationKey?: string; fingerprint?: string },
+	): Promise<BeginResult> {
+		const prior = this.#byIdentity.get(identity);
+		if (!prior)
+			return {
+				kind: "new",
+				entry: await this.#append({
+					version: SDK_STATE_VERSION,
+					identity,
+					requestHash,
+					operationKey: metadata.operationKey,
+					fingerprint: metadata.fingerprint,
+					state: "accepted",
+					ts: Date.now(),
+				}),
+			};
+		if (
+			prior.requestHash !== requestHash ||
+			(prior.operationKey !== undefined &&
+				metadata.operationKey !== undefined &&
+				prior.operationKey !== metadata.operationKey)
+		)
+			return { kind: "idempotency_conflict" };
+		if (terminal(prior.state) || (prior.state === "effect_started" && this.#isCleanupPending(prior)))
+			return { kind: "replay", entry: prior };
+		if (prior.state === "terminal_uncertain") return { kind: "terminal_uncertain", entry: prior };
+		// Accepted proves admission only. The effect_started marker is the boundary
+		// after which retrying the operation is unsafe.
+		if (prior.state === "accepted") return { kind: "new", entry: prior };
+		return { kind: "in_progress", entry: prior };
+	}
+	async transition(
+		identity: string,
+		state: LifecycleState,
+		fields: Omit<Partial<LifecycleLedgerEntry>, "identity" | "requestHash" | "state" | "ts"> = {},
+	): Promise<LifecycleLedgerEntry> {
+		return this.#mutate(async () => {
+			const previous = this.#byIdentity.get(identity);
+			if (!previous) throw new Error("Unknown lifecycle identity");
+			const next = {
+				...previous,
+				...fields,
+				state,
+				ts: Date.now(),
+				...(fields.response !== undefined ? { response: fields.response } : {}),
+			};
+			if (this.#isCleanupPending(next)) {
+				next.unresolvedCleanupResponse = undefined;
+				next.unresolvedCleanupResponseDigest = undefined;
+			} else if (state === "terminal_ok") {
+				next.unresolvedCleanupResponse = undefined;
+				next.unresolvedCleanupResponseDigest = undefined;
+			} else if (this.#isCleanupPending(previous)) {
+				next.unresolvedCleanupResponse = previous.response;
+				next.unresolvedCleanupResponseDigest = createHash("sha256")
+					.update(
+						canonicalJson({
+							intendedSessionId: previous.intendedSessionId,
+							response: previous.response,
+						}),
+					)
+					.digest("hex");
+			}
+			if (this.#isCleanupPending(next)) {
+				const cleanupSessionId = (next.response as { error?: { cleanup?: { sessionId?: unknown } } }).error?.cleanup
+					?.sessionId;
+				if (!canonicalCleanupSessionId(cleanupSessionId))
+					throw new Error("Cleanup response lacks a canonical session fence");
+				if (next.intendedSessionId === undefined) next.intendedSessionId = cleanupSessionId;
+				else if (next.intendedSessionId !== cleanupSessionId)
+					throw new Error("Cleanup response session does not match its outer lifecycle fence");
+				next.responseDigest = createHash("sha256")
+					.update(canonicalJson({ intendedSessionId: next.intendedSessionId, response: next.response }))
+					.digest("hex");
+			} else if (fields.response !== undefined && fields.responseDigest === undefined)
+				next.responseDigest = createHash("sha256").update(canonicalJson(next.response)).digest("hex");
+			else if (
+				(terminal(state) || state === "terminal_uncertain") &&
+				next.response !== undefined &&
+				next.responseDigest === undefined
+			)
+				next.responseDigest = createHash("sha256").update(canonicalJson(next.response)).digest("hex");
+			if (next.durableEffects && next.durableEffects.digest === undefined) {
+				const { digest: _digest, ...body } = next.durableEffects;
+				next.durableEffects = {
+					...body,
+					digest: createHash("sha256").update(canonicalJson(body)).digest("hex"),
+				};
+			}
+			return this.#append(next);
+		});
+	}
+	async assertSupportedStateVersions(): Promise<void> {
+		const source = await this.#readBoundedSource();
+		if (!source) return;
+		let lineStart = 0;
+		for (let offset = 0; offset <= source.length; offset += 1) {
+			if (offset !== source.length && source[offset] !== 0x0a) continue;
+			const line = source.subarray(lineStart, offset);
+			lineStart = offset + 1;
+			if (line.length === 0 || line.length > this.#limits.maxLineBytes) continue;
+			try {
+				assertSupportedStateVersion(this.#file, parseLifecycleJson(line));
+			} catch (error) {
+				if (error instanceof Error && "code" in error && error.code === "unsupported_state_version") throw error;
+			}
+		}
+	}
+	findCleanupPendingByDeleteTarget(
+		target: { sessionId: string; sessionsRoot?: string; transcriptPath: string; cwd: string },
+		excludingIdentity: string,
+	): LifecycleLedgerEntry | undefined {
+		let latestPending: LifecycleLedgerEntry | undefined;
+		for (const current of this.#byIdentity.values()) {
+			if (
+				current.identity === excludingIdentity ||
+				current.state === "terminal_ok" ||
+				current.intendedSessionId !== target.sessionId
+			)
+				continue;
+			if (current.unresolvedCleanupResponse !== undefined) {
+				const retained = { ...current, response: current.unresolvedCleanupResponse };
+				if (this.#matchesSessionDeleteTarget(retained, target)) {
+					if (!latestPending || retained.ts > latestPending.ts) latestPending = retained;
+					continue;
+				}
+			}
+			for (let index = this.#entries.length - 1; index >= 0; index -= 1) {
+				const historical = this.#entries[index];
+				if (
+					!historical ||
+					historical.identity !== current.identity ||
+					historical.intendedSessionId !== target.sessionId ||
+					!this.#matchesSessionDeleteTarget(historical, target)
+				)
+					continue;
+				if (!latestPending || historical.ts > latestPending.ts) latestPending = historical;
+				break;
+			}
+		}
+		return latestPending;
+	}
+
+	findCleanupPendingBySessionId(sessionId: string, excludingIdentity: string): LifecycleLedgerEntry | undefined {
+		for (const current of this.#byIdentity.values()) {
+			if (current.identity === excludingIdentity) continue;
+			if (pendingCleanupSessionId(current.response) === sessionId) return current;
+			if (pendingCleanupSessionId(current.unresolvedCleanupResponse) === sessionId) return current;
+		}
+		return undefined;
+	}
+
+	hasUncertainCleanupForSession(sessionId: string, excludingIdentity: string): boolean {
+		for (const current of this.#byIdentity.values()) {
+			if (current.state !== "terminal_uncertain") continue;
+			if (current.identity === excludingIdentity) continue;
+			const fencedSessions = [
+				current.uncertainCleanupSessionId,
+				current.intendedSessionId,
+				pendingCleanupSessionId(current.response),
+				pendingCleanupSessionId(current.unresolvedCleanupResponse),
+				...(current.uncertainCleanupSessionIds ?? []),
+			];
+			// An unbound uncertain entry names no session: it fences nothing.
+			// Fencing all ids on zero evidence is what made one refusal
+			// self-amplify into a permanent blanket fence (#5364).
+			if (fencedSessions.includes(sessionId)) return true;
+		}
+		return false;
+	}
+
+	get(identity: string): LifecycleLedgerEntry | undefined {
+		return this.#byIdentity.get(identity);
+	}
+
+	listUncertainCreatesBySessionId(
+		sessionId: string,
+		effectMarker?: string,
+		remoteCreateKey?: string,
+	): LifecycleLedgerEntry[] {
+		const matches: LifecycleLedgerEntry[] = [];
+		for (const current of this.#byIdentity.values()) {
+			const effectIntent = current.effectIntent;
+			if (
+				current.state === "terminal_uncertain" &&
+				current.intendedSessionId === sessionId &&
+				current.operationKey?.startsWith("session.create\u0000") &&
+				effectIntent?.sessionId === sessionId &&
+				typeof effectIntent.stateRoot === "string" &&
+				path.isAbsolute(effectIntent.stateRoot) &&
+				effectIntent.childOwnershipEstablished === true &&
+				(effectMarker === undefined || current.effectMarker === effectMarker) &&
+				(remoteCreateKey === undefined || current.operationKey === `session.create\u0000${remoteCreateKey}`)
+			)
+				matches.push(current);
+		}
+		return matches;
+	}
+
+	findPendingCleanupByTarget(
+		sessionId: string,
+		cwd: string,
+		transcriptPath: string,
+	): LifecycleLedgerEntry | undefined {
+		const expectedCwd = path.resolve(cwd);
+		const expectedTranscript = path.resolve(transcriptPath);
+		let latest: LifecycleLedgerEntry | undefined;
+		for (const entry of this.#byIdentity.values()) {
+			if (entry.state !== "effect_started" || !this.#isCleanupPending(entry)) continue;
+			const response = entry.response as {
+				error?: { cleanup?: { sessionId?: unknown; cwd?: unknown; transcriptPath?: unknown } };
+			};
+			const cleanup = response.error?.cleanup;
+			if (
+				cleanup?.sessionId !== sessionId ||
+				typeof cleanup.cwd !== "string" ||
+				typeof cleanup.transcriptPath !== "string" ||
+				path.resolve(cleanup.cwd) !== expectedCwd ||
+				path.resolve(cleanup.transcriptPath) !== expectedTranscript
+			)
+				continue;
+			if (!latest || entry.ts > latest.ts) latest = entry;
+		}
+		return latest;
+	}
+}

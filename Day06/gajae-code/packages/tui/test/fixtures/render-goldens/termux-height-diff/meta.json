@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "fixtureName": "termux-height-diff",
+  "terminalWidth": 42,
+  "terminalHeight": 6,
+  "capabilities": {
+    "kittyProtocolActive": true,
+    "hyperlinks": true,
+    "imageProtocol": null
+  },
+  "coverage": [
+    "Termux height branch",
+    "TERMUX_VERSION env branch",
+    "height change without full scrollback clear",
+    "differential render after resize"
+  ],
+  "artifacts": {
+    "viewport": {
+      "file": "viewport.txt",
+      "sha256": "14be8823c0839bc226e9534a8e7364577916123967b5dd83c6a6ac8aa2a60e95"
+    },
+    "scrollback": {
+      "file": "scrollback.txt",
+      "sha256": "783fb9d86be23f0be8d75a8a9ab368508808bbcfeedd9c9b8b9aeaf93952a3bb"
+    },
+    "writelog": {
+      "file": "writelog.bin",
+      "sha256": "ac23e076927f95f1be7e928088d62e95a8ddf4af62045535aa296b20116f125e"
+    }
+  }
+}

@@ -1,0 +1,28 @@
+profile: code
+schema_version: 1
+axis: testable_unit
+min_unit: "a cohesive change verified by one test-command run — typically a function or module plus its tests; never split below a single function"
+cut_signal: "sub-AC produces an independently runnable test"
+max_branching: 5
+must_produce:
+  - tests_passed
+  - files_touched
+evidence_schema:
+  required:
+    - files_touched
+    - commands_run
+    - tests_passed
+  rejected_if:
+    - "tests_passed == []"
+verifier_capability: subprocess_test_runner
+verifier_focus: >
+  Run the project's test command. Confirm tests_passed list matches reality.
+  Reject claims about files or symbols that do not exist on disk.
+suggested_tools:
+  - Read
+  - Edit
+  - Write
+  - Bash
+  - Glob
+  - Grep
+suggested_model_tier: medium

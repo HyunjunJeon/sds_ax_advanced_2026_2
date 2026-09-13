@@ -1,0 +1,541 @@
+"""Anthropic SDK adapter for direct Claude API access.
+
+This module provides the AnthropicAdapter class that implements the LLMAdapter
+protocol using the official Anthropic Python SDK. This is the recommended default
+for Ouroboros MCP server — no OpenRouter or LiteLLM dependency required.
+"""
+
+from dataclasses import replace
+import json
+import os
+from typing import Any
+
+import structlog
+
+from ouroboros.core.errors import ProviderError
+from ouroboros.core.security import MAX_LLM_RESPONSE_LENGTH, InputValidator
+from ouroboros.core.types import Result
+from ouroboros.events.io_recorder import IOJournalRecorder, get_current_io_journal_recorder
+from ouroboros.providers.base import (
+    CompletionConfig,
+    CompletionResponse,
+    Message,
+    MessageRole,
+    UsageInfo,
+)
+from ouroboros.providers.frugality_attestation import (
+    PreparedFrugalityCompletion,
+    credential_authority_digest,
+    effective_completion_request,
+)
+from ouroboros.providers.profiles import resolve_completion_profile_result
+
+log = structlog.get_logger()
+
+DEFAULT_MODEL = "claude-sonnet-4-6"
+
+
+def _is_fable_or_mythos_5(model: str) -> bool:
+    normalized = model.lower()
+    return "fable-5" in normalized or "mythos-5" in normalized
+
+
+def _requires_adaptive_thinking_for_effort(model: str) -> bool:
+    """Return whether ``output_config.effort`` needs an explicit thinking mode.
+
+    Claude 5-series Fable/Mythos models run adaptive thinking by default and do
+    not require the ``thinking`` request field. Current Claude 4.6/4.7/4.8
+    effort examples pair ``output_config.effort`` with
+    ``thinking={"type": "adaptive"}``, so older model families get the
+    explicit envelope when the effort dial is set.
+    """
+    return not _is_fable_or_mythos_5(model)
+
+
+def _supports_sampling_and_prefill(model: str) -> bool:
+    """Return whether optional sampling knobs and assistant prefill are allowed."""
+    return not _is_fable_or_mythos_5(model)
+
+
+def _response_format_instruction(response_format: dict[str, object]) -> str:
+    """Translate Anthropic response_format into prompt steering without prefill."""
+    import json
+
+    fmt_type = response_format.get("type")
+    if fmt_type == "json_schema":
+        schema = response_format.get("json_schema", {})
+        schema_json = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+        return (
+            "Respond only with valid JSON that conforms to this JSON schema. "
+            f"Do not include prose or Markdown.\nSchema: {schema_json}"
+        )
+
+    return "Respond only with a valid JSON object. Do not include prose or Markdown."
+
+
+def _serialise_prompt_for_hash(
+    api_messages: list[dict[str, str]],
+    system_parts: list[str],
+    request_options: dict[str, Any] | None = None,
+) -> str:
+    """Build a deterministic string representation of a request for hashing.
+
+    Used by the I/O Journal recorder (#517) to compute ``prompt_hash``
+    without depending on any provider-specific message format. The
+    string itself is **not** the wire payload — it just needs to be
+    stable for the same input so identical prompts collapse to the same
+    hash across runs.
+    """
+    import json
+
+    payload: dict[str, Any] = {"messages": api_messages}
+    if system_parts:
+        payload["system"] = "\n\n".join(system_parts)
+    if request_options:
+        payload["request_options"] = {
+            key: value for key, value in request_options.items() if value is not None
+        }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _record_completion(call: Any, parsed: CompletionResponse) -> None:
+    """Populate the recorder's LLMCallRecord from a parsed completion.
+
+    Kept as a free function so the recording fields stay close to the
+    parser; the adapter does not need to know about the recorder's
+    internal field names beyond what shows up here.
+    """
+    call.record_completion(
+        completion_text=parsed.content,
+        finish_reason=parsed.finish_reason,
+        token_count_in=parsed.usage.prompt_tokens if parsed.usage else None,
+        token_count_out=parsed.usage.completion_tokens if parsed.usage else None,
+    )
+
+
+class AnthropicAdapter:
+    """LLM adapter using the official Anthropic Python SDK.
+
+    Calls the Claude API directly without LiteLLM or OpenRouter intermediaries.
+    API key is resolved from constructor param or ANTHROPIC_API_KEY env var.
+
+    Example:
+        adapter = AnthropicAdapter()
+        result = await adapter.complete(
+            messages=[Message(role=MessageRole.USER, content="Hello!")],
+            config=CompletionConfig(model="claude-sonnet-4-6"),
+        )
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        timeout: float = 120.0,
+        max_retries: int = 2,
+        default_model: str = DEFAULT_MODEL,
+        io_recorder: IOJournalRecorder | None = None,
+    ) -> None:
+        """Initialize the Anthropic adapter.
+
+        Args:
+            api_key: Optional API key (overrides ANTHROPIC_API_KEY env var).
+            timeout: Request timeout in seconds. Default 120.0.
+            max_retries: Max retries for transient errors (handled by SDK). Default 2.
+            default_model: Fallback model when config.model is empty or generic.
+            io_recorder: Optional :class:`IOJournalRecorder` (M3 / #517).
+                When provided, the adapter wraps each outbound LLM call
+                in the recorder so paired ``llm.call.requested`` /
+                ``llm.call.returned`` events land on the EventStore. The
+                default ``None`` is byte-for-byte the previous
+                behaviour: no journal events, no signature visible to
+                callers that have not adopted the recorder.
+        """
+        self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        self._timeout = timeout
+        self._max_retries = max_retries
+        self._default_model = default_model
+        self._client: Any = None
+        self._io_recorder = io_recorder
+
+    def frugality_prepare_completion(
+        self,
+        config: CompletionConfig,
+    ) -> Result[PreparedFrugalityCompletion, ProviderError]:
+        """Resolve once, seal dispatch, and attest the non-secret execution envelope."""
+        profile_result = resolve_completion_profile_result(config, backend="anthropic")
+        if profile_result.is_err:
+            return Result.err(profile_result.error)
+        resolved = profile_result.value
+        effective_config = resolved.config
+        # The cached SDK client owns dispatch. Its resolved authority may come
+        # from SDK profile configuration rather than this process environment,
+        # so attest the exact client that ``complete`` will reuse.
+        client = self._get_client()
+        client_base_url = getattr(client, "base_url", None)
+        client_api_key = getattr(client, "api_key", None)
+        contract: dict[str, object] = {
+            "schema_version": 2,
+            "schema_id": "ouroboros.anthropic.v2",
+            "internal_attempt_limit": self._max_retries + 1,
+            "credential_authority": credential_authority_digest(client_api_key),
+            "effective_request": effective_completion_request(
+                resolved,
+                provider_model=self._resolve_model(effective_config.model),
+            ),
+            "settings": {
+                "api_base": str(client_base_url) if client_base_url is not None else None,
+                "timeout": self._timeout,
+                "max_retries": self._max_retries,
+                "default_model": self._default_model,
+                "io_recorder_configured": self._io_recorder is not None,
+            },
+        }
+        return Result.ok(
+            PreparedFrugalityCompletion(
+                config=replace(effective_config, role=None, profile=None),
+                contract=contract,
+            )
+        )
+
+    def _get_client(self) -> Any:
+        """Lazy-initialize the Anthropic async client.
+
+        Returns:
+            An AsyncAnthropic client instance.
+
+        Raises:
+            ImportError: If the anthropic package is not installed.
+        """
+        if self._client is None:
+            try:
+                import anthropic
+            except ImportError as e:
+                msg = "anthropic package not installed. Install with: uv add anthropic"
+                raise ImportError(msg) from e
+
+            self._client = anthropic.AsyncAnthropic(
+                api_key=self._api_key,
+                timeout=self._timeout,
+                max_retries=self._max_retries,
+            )
+        return self._client
+
+    def _resolve_model(self, model: str) -> str:
+        """Resolve the model identifier for the Anthropic API.
+
+        Strips provider prefixes (e.g. 'anthropic/claude-...') and falls back
+        to the default model for non-Claude model strings.
+
+        Args:
+            model: Raw model identifier from CompletionConfig.
+
+        Returns:
+            A clean model identifier suitable for the Anthropic API.
+        """
+        # Strip common prefixes
+        if model.startswith("anthropic/"):
+            model = model[len("anthropic/") :]
+        if model.startswith("openrouter/anthropic/"):
+            model = model[len("openrouter/anthropic/") :]
+
+        # If it looks like a Claude model, use it directly
+        if model.startswith("claude"):
+            return model
+
+        # For non-Claude models, fall back to default
+        return self._default_model
+
+    async def complete(
+        self,
+        messages: list[Message],
+        config: CompletionConfig,
+    ) -> Result[CompletionResponse, ProviderError]:
+        """Make a completion request to the Anthropic API.
+
+        Handles system messages separately (Anthropic API requires them as
+        a top-level parameter, not in the messages array).
+
+        Args:
+            messages: The conversation messages to send.
+            config: Configuration for the completion request.
+
+        Returns:
+            Result containing either the completion response or a ProviderError.
+        """
+        try:
+            client = self._get_client()
+        except ImportError as e:
+            return Result.err(ProviderError(str(e), provider="anthropic"))
+
+        if not self._api_key:
+            return Result.err(
+                ProviderError(
+                    "ANTHROPIC_API_KEY not set. Export it or pass api_key= to AnthropicAdapter.",
+                    provider="anthropic",
+                    status_code=401,
+                )
+            )
+
+        profile_result = resolve_completion_profile_result(config, backend="anthropic")
+        if profile_result.is_err:
+            return Result.err(profile_result.error)
+        config = profile_result.value.config
+        model = self._resolve_model(config.model)
+
+        # Separate system messages from conversation messages.
+        # Anthropic API takes system as a top-level param.
+        system_parts: list[str] = []
+        api_messages: list[dict[str, str]] = []
+
+        for msg in messages:
+            if msg.role == MessageRole.SYSTEM:
+                system_parts.append(msg.content)
+            else:
+                api_messages.append(msg.to_dict())
+
+        # Ensure at least one user message exists
+        if not api_messages:
+            api_messages.append({"role": "user", "content": "(empty)"})
+
+        supports_sampling_and_prefill = _supports_sampling_and_prefill(model)
+
+        # Anthropic doesn't support response_format natively. Use assistant
+        # prefill where the model family supports it; Fable/Mythos 5 reject
+        # prefill, so steer JSON through system instructions instead.
+        json_prefill = False
+        if config.response_format and config.response_format.get("type") in (
+            "json_object",
+            "json_schema",
+        ):
+            if supports_sampling_and_prefill:
+                api_messages.append({"role": "assistant", "content": "{"})
+                json_prefill = True
+            else:
+                system_parts.append(_response_format_instruction(config.response_format))
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": api_messages,
+            "max_tokens": config.max_tokens,
+        }
+
+        if supports_sampling_and_prefill:
+            kwargs["temperature"] = config.temperature
+            kwargs["top_p"] = config.top_p
+
+        if system_parts:
+            kwargs["system"] = "\n\n".join(system_parts)
+
+        if config.stop:
+            kwargs["stop_sequences"] = config.stop
+
+        # Effort-first investment dial (RFC #1405). The GA effort parameter lives
+        # under ``output_config.effort`` on current Claude models. It is paired
+        # with adaptive thinking for model families that still require an
+        # explicit thinking mode, and deliberately avoids the removed
+        # ``thinking.budget_tokens`` knob (which 400s on Opus 4.7+ / Fable 5).
+        # Omitted when unset to preserve prior behavior.
+        if config.reasoning_effort:
+            kwargs["output_config"] = {"effort": config.reasoning_effort}
+            if _requires_adaptive_thinking_for_effort(model):
+                kwargs["thinking"] = {"type": "adaptive"}
+
+        log.debug(
+            "anthropic.request.started",
+            model=model,
+            message_count=len(api_messages),
+            has_system=bool(system_parts),
+        )
+
+        try:
+            io_recorder = get_current_io_journal_recorder() or self._io_recorder
+            if io_recorder is not None and io_recorder.is_active:
+                prompt_text = _serialise_prompt_for_hash(
+                    api_messages,
+                    system_parts,
+                    {
+                        "top_p": config.top_p,
+                        "stop_sequences": config.stop,
+                        "reasoning_effort": config.reasoning_effort,
+                    },
+                )
+                async with io_recorder.record_llm_call(
+                    model_id=model,
+                    prompt_text=prompt_text,
+                    caller="anthropic_adapter",
+                    max_tokens=config.max_tokens,
+                    temperature=config.temperature,
+                    extra={
+                        "top_p": config.top_p,
+                        "stop_sequences": config.stop,
+                        "reasoning_effort": config.reasoning_effort,
+                    },
+                ) as call:
+                    response = await client.messages.create(**kwargs)
+                    parsed = self._parse_response(response, model, json_prefill)
+                    _record_completion(call, parsed)
+                return Result.ok(parsed)
+
+            response = await client.messages.create(**kwargs)
+            return Result.ok(self._parse_response(response, model, json_prefill))
+
+        except Exception as e:
+            return self._handle_error(e, model)
+
+    def _parse_response(
+        self,
+        response: Any,
+        model: str,
+        json_prefill: bool = False,
+    ) -> CompletionResponse:
+        """Parse the Anthropic API response into CompletionResponse.
+
+        Args:
+            response: The raw Anthropic Message response.
+            model: The model identifier used for the request.
+            json_prefill: If True, restore the assistant "{" for a valid
+                object continuation or raise a typed provider parse failure.
+
+        Returns:
+            Parsed CompletionResponse.
+        """
+        # Extract text content from content blocks
+        content = ""
+        for block in response.content:
+            if block.type == "text":
+                content += block.text
+
+        # Security: Validate response length *before* prepending the JSON
+        # prefill character. Truncating after prepend would cut the JSON
+        # mid-object, producing silently broken output.
+        is_valid, validation_error = InputValidator.validate_llm_response(content)
+        if not is_valid:
+            if json_prefill:
+                log.warning(
+                    "anthropic.response.rejected_prefill_length",
+                    model=model,
+                    original_length=len(content),
+                    max_length=MAX_LLM_RESPONSE_LENGTH,
+                )
+                raise ProviderError(
+                    "Anthropic JSON prefill response exceeded the safe length boundary",
+                    provider="anthropic",
+                    details={
+                        "error_type": "invalid_json_prefill_response_length",
+                        "validation_error": validation_error,
+                        "original_length": len(content),
+                        "max_length": MAX_LLM_RESPONSE_LENGTH,
+                    },
+                )
+            log.warning(
+                "anthropic.response.truncated",
+                model=model,
+                original_length=len(content),
+                max_length=MAX_LLM_RESPONSE_LENGTH,
+            )
+            content = content[:MAX_LLM_RESPONSE_LENGTH]
+
+        # The synthetic "{" belongs to this provider request boundary. Content
+        # returned after an assistant prefill is always a suffix; never infer
+        # from its bytes that the model ignored the prefill. Invalid suffixes
+        # terminate here so generic extractors cannot rescan fenced or nested
+        # fragments as an authoritative answer.
+        if json_prefill:
+            reconstructed = "{" + content
+            try:
+                parsed_reconstruction = json.loads(reconstructed)
+            except (json.JSONDecodeError, ValueError):
+                parsed_reconstruction = None
+            if not isinstance(parsed_reconstruction, dict):
+                raise ProviderError(
+                    "Anthropic JSON prefill response did not complete a valid object",
+                    provider="anthropic",
+                    details={"error_type": "invalid_json_prefill_response"},
+                )
+            content = reconstructed
+
+        usage = response.usage
+
+        return CompletionResponse(
+            content=content,
+            model=response.model or model,
+            usage=UsageInfo(
+                prompt_tokens=usage.input_tokens if usage else 0,
+                completion_tokens=usage.output_tokens if usage else 0,
+                total_tokens=((usage.input_tokens + usage.output_tokens) if usage else 0),
+            ),
+            finish_reason=response.stop_reason or "end_turn",
+        )
+
+    def _handle_error(
+        self,
+        exc: Exception,
+        model: str,
+    ) -> Result[CompletionResponse, ProviderError]:
+        """Convert Anthropic SDK exceptions to Result.err(ProviderError).
+
+        Args:
+            exc: The caught exception.
+            model: The model identifier for logging context.
+
+        Returns:
+            Result.err with an appropriate ProviderError.
+        """
+        if isinstance(exc, ProviderError):
+            return Result.err(exc)
+
+        try:
+            import anthropic
+        except ImportError:
+            return Result.err(ProviderError(f"Unexpected error: {exc}", provider="anthropic"))
+
+        if isinstance(exc, anthropic.AuthenticationError):
+            log.warning("anthropic.request.failed.auth", model=model, error=str(exc))
+            return Result.err(
+                ProviderError(
+                    "Authentication failed — check ANTHROPIC_API_KEY",
+                    provider="anthropic",
+                    status_code=401,
+                )
+            )
+
+        if isinstance(exc, anthropic.RateLimitError):
+            log.warning("anthropic.request.failed.rate_limit", model=model)
+            return Result.err(
+                ProviderError(
+                    "Rate limit exceeded",
+                    provider="anthropic",
+                    status_code=429,
+                )
+            )
+
+        if isinstance(exc, anthropic.BadRequestError):
+            log.warning("anthropic.request.failed.bad_request", model=model, error=str(exc))
+            return Result.err(
+                ProviderError(
+                    f"Bad request: {exc}",
+                    provider="anthropic",
+                    status_code=400,
+                )
+            )
+
+        if isinstance(exc, anthropic.APIError):
+            log.warning("anthropic.request.failed.api_error", model=model, error=str(exc))
+            return Result.err(
+                ProviderError(
+                    f"API error: {exc}",
+                    provider="anthropic",
+                    status_code=getattr(exc, "status_code", 500),
+                )
+            )
+
+        # Unexpected
+        log.exception("anthropic.request.failed.unexpected", model=model, error=str(exc))
+        return Result.err(
+            ProviderError(
+                f"Unexpected error: {exc}",
+                provider="anthropic",
+                details={"original_exception": type(exc).__name__},
+            )
+        )

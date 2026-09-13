@@ -1,0 +1,115 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import type { AgentSideConnection, ClientCapabilities } from "@agentclientprotocol/sdk";
+import { createMockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
+import { TempDir } from "@gajae-code/utils";
+import { AsyncJobManager } from "../src/async";
+import { Settings } from "../src/config/settings";
+import { createAcpClientBridge } from "../src/modes/acp/acp-client-bridge";
+import { type CreateAgentSessionResult, createAgentSession } from "../src/sdk";
+import { AuthStorage } from "../src/session/auth-storage";
+import type { ClientBridgeTerminalHandle } from "../src/session/client-bridge";
+import { SessionManager } from "../src/session/session-manager";
+
+async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) return;
+		await Bun.sleep(10);
+	}
+	throw new Error("Timed out waiting for production ACP fold state");
+}
+
+describe("SDK production ACP fold path", () => {
+	let created: CreateAgentSessionResult | undefined;
+	let authStorage: AuthStorage | undefined;
+	let tempDir: TempDir | undefined;
+
+	afterEach(async () => {
+		await created?.session.dispose();
+		authStorage?.close();
+		tempDir?.removeSync();
+		created = undefined;
+		authStorage = undefined;
+		tempDir = undefined;
+		AsyncJobManager.resetForTests();
+	});
+
+	test("creates, folds, wakes, and releases through the SDK ToolSession and ACP adapter", async () => {
+		tempDir = TempDir.createSync("@gjc-sdk-fold-acp-");
+		registerMockApi();
+		authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
+		const mock = createMockModel({ responses: [{ content: ["wake complete"] }] });
+		authStorage.setRuntimeApiKey(mock.model.provider, "test-key");
+		created = await createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			authStorage,
+			settings: Settings.isolated({
+				"async.enabled": true,
+				"bash.autoBackground.enabled": false,
+				"compaction.enabled": false,
+			}),
+			model: mock.model,
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			sdkHostModeSupported: false,
+			notificationHostModeSupported: false,
+		});
+
+		const exit = Promise.withResolvers<{ exitCode: number | null; signal: string | null }>();
+		let releaseCalls = 0;
+		const terminal: ClientBridgeTerminalHandle = {
+			terminalId: "sdk-acp-fold-terminal",
+			currentOutput: async () => ({ output: "folded output\n", truncated: false }),
+			waitForExit: () => exit.promise,
+			kill: async () => {},
+			release: async () => {
+				releaseCalls += 1;
+			},
+		};
+		const connection = {
+			createTerminal: async () => ({
+				id: terminal.terminalId,
+				currentOutput: terminal.currentOutput,
+				waitForExit: terminal.waitForExit,
+				kill: terminal.kill,
+				release: terminal.release,
+			}),
+		} as unknown as AgentSideConnection;
+		const bridge = createAcpClientBridge(connection, created.session.sessionId, {
+			terminal: true,
+		} as ClientCapabilities);
+		created.session.setClientBridge(bridge);
+
+		const bash = created.session.getToolForExecution("bash");
+		if (!bash) throw new Error("expected SDK bash tool");
+		const run = bash.execute("sdk-fold-call", { command: "sleep 30" }, undefined, () => {});
+		await waitFor(() => created!.session.hasForegroundBashBackgroundRequestHandler());
+
+		expect(await created.session.requestForegroundBashBackground()).toBe(true);
+		const foreground = await run;
+		expect(foreground.details?.async?.state).toBe("running");
+		const jobId = foreground.details?.async?.jobId;
+		if (!jobId) throw new Error("expected folded SDK job id");
+		const callsBeforeWake = mock.calls.length;
+
+		exit.resolve({ exitCode: 0, signal: null });
+		await waitFor(() => releaseCalls === 1);
+		await waitFor(() => created!.session.yieldQueue.has("async-result"));
+		await created.session.yieldQueue.flush("idle");
+		// Flushing the receipt through the public queue drives the normal model wake.
+		expect(mock.calls.length).toBeGreaterThan(callsBeforeWake);
+		expect(mock.calls.length).toBe(callsBeforeWake + 1);
+		expect(releaseCalls).toBe(1);
+		const wakeMessages = JSON.stringify(mock.calls[mock.calls.length - 1]?.context.messages);
+		expect(wakeMessages).toContain("folded output");
+		expect(wakeMessages).toContain("folded client-terminal wait");
+	});
+});

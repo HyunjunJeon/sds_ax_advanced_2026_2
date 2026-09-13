@@ -1,0 +1,2732 @@
+"""Unit tests for session tracking."""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+import subprocess
+import threading
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from ouroboros.core import project_identity as project_identity_module
+from ouroboros.core.project_identity import (
+    ProjectIdentity,
+    ProjectIdentityError,
+    ProjectIdentityUnavailableError,
+    publication_evidence_sink,
+    resolve_managed_project_identity,
+    resolve_project_identity,
+    resolve_project_identity_for_publication,
+)
+from ouroboros.core.types import Result
+from ouroboros.core.worktree import TaskWorkspace
+from ouroboros.orchestrator.session import (
+    SessionRepository,
+    SessionStatus,
+    SessionTracker,
+)
+
+
+class TestSessionStatus:
+    """Tests for SessionStatus enum."""
+
+    def test_status_values(self) -> None:
+        """Test that all status values are defined."""
+        assert SessionStatus.RUNNING == "running"
+        assert SessionStatus.PAUSED == "paused"
+        assert SessionStatus.COMPLETED == "completed"
+        assert SessionStatus.FAILED == "failed"
+
+
+class TestSessionTracker:
+    """Tests for SessionTracker dataclass."""
+
+    def test_create_new_session(self) -> None:
+        """Test creating a new session tracker."""
+        tracker = SessionTracker.create(
+            execution_id="exec_123",
+            seed_id="seed_456",
+        )
+        assert tracker.execution_id == "exec_123"
+        assert tracker.seed_id == "seed_456"
+        assert tracker.status == SessionStatus.RUNNING
+        assert tracker.session_id.startswith("orch_")
+        assert tracker.messages_processed == 0
+        assert tracker.progress == {}
+
+    def test_create_with_custom_session_id(self) -> None:
+        """Test creating session with custom ID."""
+        tracker = SessionTracker.create(
+            execution_id="exec_123",
+            seed_id="seed_456",
+            session_id="custom_session_id",
+        )
+        assert tracker.session_id == "custom_session_id"
+
+    def test_with_progress_updates_immutably(self) -> None:
+        """Test that with_progress creates a new instance."""
+        original = SessionTracker.create("exec", "seed")
+        updated = original.with_progress({"step": 1})
+
+        assert original.messages_processed == 0
+        assert original.progress == {}
+        assert updated.messages_processed == 1
+        assert updated.progress == {"step": 1}
+        assert original is not updated
+
+    def test_with_progress_merges_progress(self) -> None:
+        """Test that progress is merged, not replaced."""
+        tracker = SessionTracker.create("exec", "seed")
+        tracker = tracker.with_progress({"a": 1})
+        tracker = tracker.with_progress({"b": 2})
+
+        assert tracker.progress == {"a": 1, "b": 2}
+        assert tracker.messages_processed == 2
+
+    def test_with_progress_uses_explicit_messages_processed(self) -> None:
+        """When update dict contains messages_processed, use that value instead of +1."""
+        tracker = SessionTracker.create("exec", "seed")
+        tracker = tracker.with_progress({"messages_processed": 5, "step": "exec"})
+
+        assert tracker.messages_processed == 5
+        assert tracker.progress["messages_processed"] == 5
+
+    def test_with_progress_increments_when_messages_processed_absent(self) -> None:
+        """Without explicit messages_processed, auto-increment by 1."""
+        tracker = SessionTracker.create("exec", "seed")
+        tracker = tracker.with_progress({"step": "exec"})
+
+        assert tracker.messages_processed == 1
+
+    def test_with_status(self) -> None:
+        """Test changing session status."""
+        tracker = SessionTracker.create("exec", "seed")
+        assert tracker.status == SessionStatus.RUNNING
+
+        updated = tracker.with_status(SessionStatus.COMPLETED)
+        assert updated.status == SessionStatus.COMPLETED
+        assert tracker.status == SessionStatus.RUNNING  # Original unchanged
+
+    def test_is_active(self) -> None:
+        """Test is_active property."""
+        tracker = SessionTracker.create("exec", "seed")
+        assert tracker.is_active is True
+
+        paused = tracker.with_status(SessionStatus.PAUSED)
+        assert paused.is_active is True
+
+        completed = tracker.with_status(SessionStatus.COMPLETED)
+        assert completed.is_active is False
+
+        failed = tracker.with_status(SessionStatus.FAILED)
+        assert failed.is_active is False
+
+    def test_is_completed(self) -> None:
+        """Test is_completed property."""
+        tracker = SessionTracker.create("exec", "seed")
+        assert tracker.is_completed is False
+
+        completed = tracker.with_status(SessionStatus.COMPLETED)
+        assert completed.is_completed is True
+
+    def test_is_failed(self) -> None:
+        """Test is_failed property."""
+        tracker = SessionTracker.create("exec", "seed")
+        assert tracker.is_failed is False
+
+        failed = tracker.with_status(SessionStatus.FAILED)
+        assert failed.is_failed is True
+
+    def test_to_dict(self) -> None:
+        """Test serialization to dictionary."""
+        tracker = SessionTracker.create("exec_123", "seed_456")
+        tracker = tracker.with_progress({"current": "step1"})
+
+        data = tracker.to_dict()
+
+        assert data["execution_id"] == "exec_123"
+        assert data["seed_id"] == "seed_456"
+        assert data["status"] == "running"
+        assert data["progress"] == {"current": "step1"}
+        assert data["messages_processed"] == 1
+        assert "start_time" in data
+
+    def test_tracker_is_frozen(self) -> None:
+        """Test that SessionTracker is immutable."""
+        tracker = SessionTracker.create("exec", "seed")
+        with pytest.raises(AttributeError):
+            tracker.status = SessionStatus.COMPLETED  # type: ignore
+
+
+class TestSessionRepository:
+    """Tests for SessionRepository."""
+
+    @pytest.fixture
+    def mock_event_store(self) -> AsyncMock:
+        """Create a mock event store."""
+        store = AsyncMock()
+        store.append = AsyncMock()
+        store.append_session_pause_if_active = AsyncMock(return_value=True)
+        store.replay = AsyncMock(return_value=[])
+        return store
+
+    @pytest.fixture
+    def repository(self, mock_event_store: AsyncMock) -> SessionRepository:
+        """Create a repository with mock store."""
+        return SessionRepository(mock_event_store)
+
+    @pytest.mark.asyncio
+    async def test_create_session(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test creating a new session."""
+        result = await repository.create_session(
+            execution_id="exec_123",
+            seed_id="seed_456",
+        )
+
+        assert result.is_ok
+        tracker = result.value
+        assert tracker.execution_id == "exec_123"
+        assert tracker.seed_id == "seed_456"
+
+        # Verify event was emitted
+        mock_event_store.append.assert_called_once()
+        event = mock_event_store.append.call_args[0][0]
+        assert event.type == "orchestrator.session.started"
+        assert event.aggregate_type == "session"
+
+    @pytest.mark.asyncio
+    async def test_create_session_persists_seed_goal(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Session start events retain the seed goal for immediate replay consumers."""
+        result = await repository.create_session(
+            execution_id="exec_123",
+            seed_id="seed_456",
+            seed_goal="Ship the OpenCode runtime",
+        )
+
+        assert result.is_ok
+        event = mock_event_store.append.call_args[0][0]
+        assert event.data["seed_goal"] == "Ship the OpenCode runtime"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("gate_forced", [True, False])
+    async def test_create_session_persists_gate_provenance(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        gate_forced: bool,
+    ) -> None:
+        result = await repository.create_session(
+            execution_id="exec_123",
+            seed_id="seed_456",
+            gate_forced=gate_forced,
+        )
+
+        assert result.is_ok
+        event = mock_event_store.append.call_args[0][0]
+        assert event.data["gate_forced"] is gate_forced
+
+    @pytest.mark.asyncio
+    async def test_create_session_persists_project_identity_atomically(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        project_root = tmp_path / "project-map"
+        workspace = project_root / "packages" / "app"
+        workspace.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(project_root)], check=True)
+        identity = resolve_project_identity(workspace)
+        execution_contract = {"frugality_proof": identity.to_workspace_data()}
+
+        result = await repository.create_session(
+            execution_id="exec_123",
+            seed_id="seed_456",
+            execution_contract=execution_contract,
+            project_identity=identity,
+            project_workspace=str(workspace),
+        )
+
+        assert result.is_ok
+        event = mock_event_store.append.call_args.args[0]
+        assert {
+            key: event.data[key] for key in ("project_id", "project_root", "workspace_path")
+        } == identity.to_event_data()
+        assert event.data["execution_contract"] == execution_contract
+
+    @pytest.mark.asyncio
+    async def test_create_session_accepts_stable_evidence_without_re_resolution(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        """A stable captured closure lets publication skip the second resolution."""
+        project_root = tmp_path / "project-map"
+        workspace = project_root / "packages" / "app"
+        workspace.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(project_root)], check=True)
+        with publication_evidence_sink():
+            identity, _evidence = resolve_project_identity_for_publication(workspace)
+            execution_contract = {"frugality_proof": identity.to_workspace_data()}
+
+            with patch(
+                "ouroboros.orchestrator.session.resolve_project_identity",
+                side_effect=AssertionError("publication must not re-run the resolver"),
+            ):
+                result = await repository.create_session(
+                    execution_id="exec_123",
+                    seed_id="seed_456",
+                    execution_contract=execution_contract,
+                    project_identity=identity,
+                    project_workspace=str(workspace),
+                )
+
+        assert result.is_ok
+        event = mock_event_store.append.call_args.args[0]
+        assert event.data["project_root"] == identity.project_root
+
+    @pytest.mark.asyncio
+    async def test_create_session_re_resolves_when_evidence_closure_drifts(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        """Any change inside the captured closure forces the full revalidation."""
+        project_root = tmp_path / "project-map"
+        workspace = project_root / "packages" / "app"
+        workspace.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(project_root)], check=True)
+        resolves = {"n": 0}
+
+        def counting(effective_cwd):
+            resolves["n"] += 1
+            return resolve_project_identity(effective_cwd)
+
+        with publication_evidence_sink():
+            identity, _evidence = resolve_project_identity_for_publication(workspace)
+            execution_contract = {"frugality_proof": identity.to_workspace_data()}
+            config = project_root / ".git" / "config"
+            config.write_bytes(config.read_bytes() + b"# identity-neutral edit\n")
+
+            with patch(
+                "ouroboros.orchestrator.session.resolve_project_identity",
+                side_effect=counting,
+            ):
+                result = await repository.create_session(
+                    execution_id="exec_123",
+                    seed_id="seed_456",
+                    execution_contract=execution_contract,
+                    project_identity=identity,
+                    project_workspace=str(workspace),
+                )
+
+        assert result.is_ok
+        assert resolves["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_create_session_ignores_evidence_for_a_different_identity(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        """Evidence must vouch for the published identity itself, not merely exist."""
+        project_root = tmp_path / "project-map"
+        workspace = project_root / "packages" / "app"
+        workspace.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(project_root)], check=True)
+        other_root = tmp_path / "other"
+        other_root.mkdir()
+        subprocess.run(["git", "init", "-q", str(other_root)], check=True)
+        identity = resolve_project_identity(workspace)
+        execution_contract = {"frugality_proof": identity.to_workspace_data()}
+
+        resolves = {"n": 0}
+
+        def counting(effective_cwd):
+            resolves["n"] += 1
+            return resolve_project_identity(effective_cwd)
+
+        with publication_evidence_sink():
+            resolve_project_identity_for_publication(other_root)
+
+            with patch(
+                "ouroboros.orchestrator.session.resolve_project_identity",
+                side_effect=counting,
+            ):
+                result = await repository.create_session(
+                    execution_id="exec_123",
+                    seed_id="seed_456",
+                    execution_contract=execution_contract,
+                    project_identity=identity,
+                    project_workspace=str(workspace),
+                )
+
+        assert result.is_ok
+        assert resolves["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_create_session_refuses_planted_evidence_over_invalid_git_shape(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        """A caller-assembled closure never substitutes for the re-resolution.
+
+        Even evidence that structurally matches the live filesystem is refused
+        when the resolver did not issue it; publication falls through to the
+        full re-resolution, which fails closed on the invalid marker shape.
+        """
+        fake_root = (tmp_path / "fake").resolve()
+        fake_root.mkdir()
+        (fake_root / ".git").mkdir()
+        identity = ProjectIdentity.from_root(fake_root, workspace_path=".", require_exists=True)
+        git_dir = fake_root / ".git"
+        forged_files = [project_identity_module._capture_topology_file(git_dir, hash_content=True)]
+        for name in project_identity_module._GIT_DIR_CLOSURE_NAMES:
+            forged_files.append(
+                project_identity_module._capture_topology_file(git_dir / name, hash_content=True)
+            )
+        forged_files.append(
+            project_identity_module._capture_topology_file(
+                git_dir / "worktrees", hash_content=False
+            )
+        )
+        forged = project_identity_module.PublicationEvidence(
+            identity=identity,
+            effective_directory=fake_root,
+            directory_evidence=(project_identity_module._capture_live_directory(fake_root),),
+            file_evidence=tuple(forged_files),
+            escalate=False,
+        )
+        execution_contract = {"frugality_proof": identity.to_workspace_data()}
+
+        with publication_evidence_sink() as cell:
+            cell[0] = forged
+            with pytest.raises(ProjectIdentityUnavailableError):
+                await repository.create_session(
+                    execution_id="exec_123",
+                    seed_id="seed_456",
+                    execution_contract=execution_contract,
+                    project_identity=identity,
+                    project_workspace=str(fake_root),
+                )
+
+        mock_event_store.append.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_session_rejects_workspace_deleted_after_topology_resolution(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        project_root = tmp_path / "project-map"
+        workspace = project_root / "packages" / "app"
+        workspace.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(project_root)], check=True)
+        identity = resolve_project_identity(workspace)
+        execution_contract = {"frugality_proof": identity.to_workspace_data()}
+        original_resolver = project_identity_module._resolve_canonical_project_identity
+
+        def resolve_then_delete(effective: Path):
+            resolved = original_resolver(effective)
+            workspace.rmdir()
+            return resolved
+
+        with (
+            patch(
+                "ouroboros.core.project_identity._resolve_canonical_project_identity",
+                side_effect=resolve_then_delete,
+            ),
+            pytest.raises(ProjectIdentityError, match="directory"),
+        ):
+            await repository.create_session(
+                execution_id="exec_123",
+                seed_id="seed_456",
+                execution_contract=execution_contract,
+                project_identity=identity,
+                project_workspace=str(workspace),
+            )
+
+        mock_event_store.append.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_session_accepts_canonical_equivalent_managed_workspace(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        source = tmp_path / "source"
+        worktree = tmp_path / "worktree"
+        worktree_alias = tmp_path / "worktree-alias"
+        subprocess.run(["git", "init", "-q", str(source)], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Project Identity Test",
+                "-c",
+                "user.email=project-identity@example.com",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+            cwd=source,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "worktree", "add", "-q", "-b", "managed-alias", str(worktree), "HEAD"],
+            cwd=source,
+            check=True,
+        )
+        source_workspace = source / "packages" / "app"
+        provider_workspace = worktree / "packages" / "app"
+        source_workspace.mkdir(parents=True)
+        provider_workspace.mkdir(parents=True)
+        worktree_alias.symlink_to(worktree, target_is_directory=True)
+        task_workspace = TaskWorkspace(
+            durable_id="managed-alias",
+            repo_root=str(source),
+            repo_name="source",
+            original_cwd=str(source_workspace),
+            effective_cwd=str(worktree_alias / "packages" / "app"),
+            worktree_path=str(worktree_alias),
+            branch="managed-alias",
+            lock_path=str(tmp_path / ".locks" / "managed-alias.json"),
+        )
+        identity = resolve_managed_project_identity(
+            provider_workspace,
+            source_root=source,
+            source_workspace=source_workspace,
+            worktree_root=worktree_alias,
+        )
+        execution_contract = {"frugality_proof": identity.to_workspace_data()}
+
+        result = await repository.create_session(
+            execution_id="exec_123",
+            seed_id="seed_456",
+            execution_contract=execution_contract,
+            project_identity=identity,
+            project_workspace=str(provider_workspace.resolve()),
+            project_task_workspace=task_workspace,
+        )
+
+        assert result.is_ok
+        event = mock_event_store.append.call_args.args[0]
+        assert {
+            key: event.data[key] for key in ("project_id", "project_root", "workspace_path")
+        } == identity.to_event_data()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "publication",
+        [
+            "top-only",
+            "nested-only",
+            "absent-with-contract",
+            "partial",
+            "conflict",
+            "missing-workspace",
+            "workspace-only",
+        ],
+    )
+    async def test_create_session_rejects_non_atomic_project_identity(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        publication: str,
+        tmp_path: Path,
+    ) -> None:
+        project_root = tmp_path / "project-map"
+        other_project_root = tmp_path / "other-project-map"
+        project_root.mkdir()
+        other_project_root.mkdir()
+        (project_root / "packages" / "app").mkdir(parents=True)
+        (other_project_root / "packages" / "app").mkdir(parents=True)
+        identity = ProjectIdentity.from_root(
+            project_root,
+            workspace_path="packages/app",
+        )
+        other = ProjectIdentity.from_root(
+            other_project_root,
+            workspace_path="packages/app",
+        )
+        project_identity = (
+            None
+            if publication in {"nested-only", "absent-with-contract", "workspace-only"}
+            else identity
+        )
+        if publication in {"top-only", "workspace-only"}:
+            execution_contract = None
+        elif publication == "absent-with-contract":
+            execution_contract = {"frugality_proof": {}}
+        elif publication == "partial":
+            execution_contract = {"frugality_proof": {"project_root": identity.project_root}}
+        else:
+            execution_contract = {
+                "frugality_proof": (
+                    other.to_workspace_data()
+                    if publication == "conflict"
+                    else identity.to_workspace_data()
+                )
+            }
+
+        with pytest.raises(ValueError, match="project identity"):
+            await repository.create_session(
+                execution_id="exec_123",
+                seed_id="seed_456",
+                execution_contract=execution_contract,
+                project_identity=project_identity,
+                project_workspace=(
+                    str(project_root / "packages" / "app")
+                    if (project_identity is not None and publication != "missing-workspace")
+                    or publication == "workspace-only"
+                    else None
+                ),
+            )
+
+        mock_event_store.append.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_session_rejects_missing_project_root_before_publication(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        identity = ProjectIdentity.from_root(tmp_path / "missing")
+
+        with pytest.raises(ProjectIdentityError, match="directory"):
+            await repository.create_session(
+                execution_id="exec_123",
+                seed_id="seed_456",
+                execution_contract={"frugality_proof": identity.to_workspace_data()},
+                project_identity=identity,
+                project_workspace=str(tmp_path / "missing"),
+            )
+
+        mock_event_store.append.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_session_rejects_project_root_symlink_swap(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        project_root = tmp_path / "project"
+        replacement = tmp_path / "replacement"
+        project_root.mkdir()
+        replacement.mkdir()
+        identity = ProjectIdentity.from_root(project_root)
+        project_root.rename(tmp_path / "original-project")
+        project_root.symlink_to(replacement, target_is_directory=True)
+
+        with pytest.raises(ValueError, match="changed before publication"):
+            await repository.create_session(
+                execution_id="exec_123",
+                seed_id="seed_456",
+                execution_contract={"frugality_proof": identity.to_workspace_data()},
+                project_identity=identity,
+                project_workspace=str(project_root),
+            )
+
+        mock_event_store.append.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("replacement", ["missing", "file"])
+    async def test_create_session_rejects_workspace_changed_before_publication(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        tmp_path: Path,
+        replacement: str,
+    ) -> None:
+        project_root = tmp_path / "project"
+        workspace = project_root / "packages" / "app"
+        workspace.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(project_root)], check=True)
+        identity = resolve_project_identity(workspace)
+        workspace.rmdir()
+        if replacement == "file":
+            workspace.write_text("not a directory", encoding="utf-8")
+
+        with pytest.raises(ProjectIdentityError, match="directory"):
+            await repository.create_session(
+                execution_id="exec_123",
+                seed_id="seed_456",
+                execution_contract={"frugality_proof": identity.to_workspace_data()},
+                project_identity=identity,
+                project_workspace=str(workspace),
+            )
+
+        mock_event_store.append.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_session_revalidation_keeps_event_loop_responsive(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        workspace = tmp_path / "project"
+        workspace.mkdir()
+        identity = resolve_project_identity(workspace)
+        release_resolver = threading.Event()
+        resolver_threads: list[int] = []
+        event_loop_thread = threading.get_ident()
+
+        def delayed_resolver(value: str) -> ProjectIdentity:
+            assert value == str(workspace)
+            resolver_threads.append(threading.get_ident())
+            if not release_resolver.wait(timeout=1):
+                raise AssertionError("project identity resolution blocked the event loop")
+            return identity
+
+        asyncio.get_running_loop().call_later(0.01, release_resolver.set)
+        with patch(
+            "ouroboros.orchestrator.session.resolve_project_identity",
+            side_effect=delayed_resolver,
+        ):
+            result = await repository.create_session(
+                execution_id="exec_123",
+                seed_id="seed_456",
+                execution_contract={"frugality_proof": identity.to_workspace_data()},
+                project_identity=identity,
+                project_workspace=str(workspace),
+            )
+
+        assert result.is_ok
+        assert resolver_threads and resolver_threads[0] != event_loop_thread
+        mock_event_store.append.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_create_session_persists_contract_snapshot_from_before_revalidation(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        workspace = tmp_path / "project"
+        other_workspace = tmp_path / "other-project"
+        workspace.mkdir()
+        other_workspace.mkdir()
+        identity = resolve_project_identity(workspace)
+        other_identity = resolve_project_identity(other_workspace)
+        route = {"model": "cheap"}
+        execution_contract = {
+            "frugality_proof": identity.to_workspace_data(),
+            "route": route,
+        }
+        resolver_started = threading.Event()
+        release_resolver = threading.Event()
+
+        def delayed_resolver(value: str) -> ProjectIdentity:
+            assert value == str(workspace)
+            resolver_started.set()
+            if not release_resolver.wait(timeout=1):
+                raise AssertionError("test did not release project identity resolution")
+            return identity
+
+        with patch(
+            "ouroboros.orchestrator.session.resolve_project_identity",
+            side_effect=delayed_resolver,
+        ):
+            creation = asyncio.create_task(
+                repository.create_session(
+                    execution_id="exec_123",
+                    seed_id="seed_456",
+                    execution_contract=execution_contract,
+                    project_identity=identity,
+                    project_workspace=str(workspace),
+                )
+            )
+            try:
+                assert await asyncio.to_thread(resolver_started.wait, 1)
+                execution_contract["frugality_proof"] = other_identity.to_workspace_data()
+                route["model"] = "expensive"
+            finally:
+                release_resolver.set()
+            result = await creation
+
+        assert result.is_ok
+        event = mock_event_store.append.call_args.args[0]
+        assert {
+            key: event.data[key] for key in ("project_id", "project_root", "workspace_path")
+        } == identity.to_event_data()
+        assert event.data["execution_contract"] == {
+            "frugality_proof": identity.to_workspace_data(),
+            "route": {"model": "cheap"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_create_session_with_custom_id(
+        self,
+        repository: SessionRepository,
+    ) -> None:
+        """Test creating session with custom ID."""
+        result = await repository.create_session(
+            execution_id="exec",
+            seed_id="seed",
+            session_id="custom_id",
+        )
+
+        assert result.is_ok
+        assert result.value.session_id == "custom_id"
+
+    @pytest.mark.asyncio
+    async def test_track_progress(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test tracking progress."""
+        result = await repository.track_progress(
+            session_id="sess_123",
+            progress={"step": 5, "message": "Working"},
+        )
+
+        assert result.is_ok
+        mock_event_store.append.assert_called_once()
+        event = mock_event_store.append.call_args[0][0]
+        assert event.type == "orchestrator.progress.updated"
+        assert event.data["progress"]["step"] == 5
+
+    @pytest.mark.asyncio
+    async def test_track_progress_excludes_raw_subscribed_payloads(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """track_progress() strips raw subscribed runtime payloads before append."""
+        result = await repository.track_progress(
+            session_id="sess_123",
+            progress={
+                "messages_processed": 5,
+                "runtime": {
+                    "backend": "opencode",
+                    "native_session_id": "native-123",
+                    "metadata": {
+                        "resume_token": "resume-123",
+                        "subscribed_events": [{"type": "item.completed"}],
+                    },
+                },
+                "raw_event": {"type": "thread.updated"},
+            },
+        )
+
+        assert result.is_ok
+        event = mock_event_store.append.call_args[0][0]
+        assert event.data["progress"] == {
+            "messages_processed": 5,
+            "runtime": {
+                "backend": "opencode",
+                "native_session_id": "native-123",
+                "metadata": {
+                    "resume_token": "resume-123",
+                },
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_track_progress_minimizes_opencode_runtime_handle(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """OpenCode checkpoints should persist only the resumable runtime fields."""
+        result = await repository.track_progress(
+            session_id="sess_123",
+            progress={
+                "messages_processed": 5,
+                "runtime": {
+                    "backend": "opencode",
+                    "kind": "implementation_session",
+                    "native_session_id": "native-123",
+                    "cwd": "/tmp/project",
+                    "approval_mode": "acceptEdits",
+                    "updated_at": "2026-03-13T00:00:00+00:00",
+                    "metadata": {
+                        "server_session_id": "server-42",
+                        "session_scope_id": "ac_1",
+                        "session_state_path": (
+                            "execution.acceptance_criteria.ac_1.implementation_session"
+                        ),
+                        "session_role": "implementation",
+                        "retry_attempt": 0,
+                        "runtime_event_type": "tool.completed",
+                    },
+                },
+            },
+        )
+
+        assert result.is_ok
+        event = mock_event_store.append.call_args[0][0]
+        assert event.data["progress"]["runtime"] == {
+            "backend": "opencode",
+            "kind": "implementation_session",
+            "native_session_id": "native-123",
+            "cwd": "/tmp/project",
+            "approval_mode": "acceptEdits",
+            "metadata": {
+                "server_session_id": "server-42",
+                "session_scope_id": "ac_1",
+                "session_state_path": ("execution.acceptance_criteria.ac_1.implementation_session"),
+                "session_role": "implementation",
+                "retry_attempt": 0,
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_mark_completed(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test marking session as completed."""
+        result = await repository.mark_completed(
+            session_id="sess_123",
+            summary={"total_messages": 50},
+        )
+
+        assert result.is_ok
+        event = mock_event_store.append.call_args[0][0]
+        assert event.type == "orchestrator.session.completed"
+        assert event.data["summary"]["total_messages"] == 50
+
+    @pytest.mark.asyncio
+    async def test_mark_failed(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test marking session as failed."""
+        result = await repository.mark_failed(
+            session_id="sess_123",
+            error_message="Connection lost",
+            error_details={"code": 500},
+        )
+
+        assert result.is_ok
+        event = mock_event_store.append.call_args[0][0]
+        assert event.type == "orchestrator.session.failed"
+        assert event.data["error"] == "Connection lost"
+
+    @pytest.mark.asyncio
+    async def test_mark_paused(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test marking session as paused."""
+        result = await repository.mark_paused(
+            session_id="sess_123",
+            reason="Codex resume failed before reconnect",
+            resume_hint="Retry with --resume after fixing the CLI issue.",
+        )
+
+        assert result.is_ok
+        event = mock_event_store.append_session_pause_if_active.call_args[0][0]
+        assert event.type == "orchestrator.session.paused"
+        assert event.data["reason"] == "Codex resume failed before reconnect"
+        assert event.data["resume_hint"] == "Retry with --resume after fixing the CLI issue."
+
+    @pytest.mark.asyncio
+    async def test_mark_paused_records_usage_limit_window(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Usage-limit pauses persist resume timing metadata."""
+        resume_after = datetime(2026, 1, 1, 5, tzinfo=UTC)
+        pause_owner = {
+            "schema_version": 1,
+            "kind": "coordinator_quota",
+            "execution_id": "exec_123",
+            "session_id": "sess_123",
+            "level_number": 1,
+            "coordinator_aggregate_id": "exec_123:l0:coord",
+        }
+
+        result = await repository.mark_paused(
+            session_id="sess_123",
+            reason="Usage limit reached",
+            resume_hint="Resume after the quota window resets.",
+            pause_seconds=18000,
+            resume_after=resume_after,
+            pause_kind="usage_limit",
+            pause_owner=pause_owner,
+        )
+
+        assert result.is_ok
+        event = mock_event_store.append_session_pause_if_active.call_args[0][0]
+        assert event.type == "orchestrator.session.paused"
+        assert event.data["pause_seconds"] == 18000
+        assert event.data["resume_after"] == resume_after.isoformat()
+        assert event.data["pause_kind"] == "usage_limit"
+        assert event.data["pause_owner"] == pause_owner
+
+    @pytest.mark.asyncio
+    async def test_mark_cancelled(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test marking session as cancelled."""
+        result = await repository.mark_cancelled(
+            session_id="sess_123",
+            reason="User requested cancellation",
+            cancelled_by="user",
+        )
+
+        assert result.is_ok
+        event = mock_event_store.append.call_args[0][0]
+        assert event.type == "orchestrator.session.cancelled"
+        assert event.data["reason"] == "User requested cancellation"
+        assert event.data["cancelled_by"] == "user"
+        assert "cancelled_at" in event.data
+
+    @pytest.mark.asyncio
+    async def test_mark_cancelled_auto_cleanup(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test marking session as cancelled by auto-cleanup."""
+        result = await repository.mark_cancelled(
+            session_id="sess_123",
+            reason="Stale session detected",
+            cancelled_by="auto_cleanup",
+        )
+
+        assert result.is_ok
+        event = mock_event_store.append.call_args[0][0]
+        assert event.type == "orchestrator.session.cancelled"
+        assert event.data["cancelled_by"] == "auto_cleanup"
+
+    @pytest.mark.asyncio
+    async def test_mark_cancelled_event_store_error(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test mark_cancelled handles event store errors gracefully."""
+        mock_event_store.append.side_effect = Exception("DB connection lost")
+
+        result = await repository.mark_cancelled(
+            session_id="sess_123",
+            reason="User requested cancellation",
+        )
+
+        assert result.is_err
+        assert "Failed to mark session cancelled" in str(result.error)
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_session_no_events(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test reconstructing session with no events."""
+        mock_event_store.replay.return_value = []
+
+        result = await repository.reconstruct_session("sess_123")
+
+        assert result.is_err
+        assert "No events found" in str(result.error)
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_session_success(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test successful session reconstruction."""
+        # Create mock events
+        start_event = MagicMock()
+        start_event.type = "orchestrator.session.started"
+        start_event.data = {
+            "execution_id": "exec_123",
+            "seed_id": "seed_456",
+            "start_time": datetime.now(UTC).isoformat(),
+        }
+
+        progress_event = MagicMock()
+        progress_event.type = "orchestrator.progress.updated"
+        progress_event.data = {"progress": {"step": 1}}
+
+        mock_event_store.replay.return_value = [start_event, progress_event]
+
+        result = await repository.reconstruct_session("sess_123")
+
+        assert result.is_ok
+        tracker = result.value
+        assert tracker.session_id == "sess_123"
+        assert tracker.execution_id == "exec_123"
+        assert tracker.messages_processed == 1
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_session_strict_related_read_fails_closed(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        start_event = MagicMock()
+        start_event.type = "orchestrator.session.started"
+        start_event.data = {
+            "execution_id": "exec_123",
+            "seed_id": "seed_456",
+            "start_time": datetime.now(UTC).isoformat(),
+        }
+        mock_event_store.replay.return_value = [start_event]
+        mock_event_store.query_session_related_events = AsyncMock(
+            side_effect=RuntimeError("related history unavailable")
+        )
+
+        compatible = await repository.reconstruct_session("sess_123")
+        strict = await repository.reconstruct_session(
+            "sess_123",
+            strict_related_events=True,
+        )
+
+        assert compatible.is_ok
+        assert strict.is_err
+        assert "related history unavailable" in str(strict.error)
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_session_strict_rejects_invalid_related_result(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        start_event = MagicMock()
+        start_event.type = "orchestrator.session.started"
+        start_event.data = {
+            "execution_id": "exec_123",
+            "seed_id": "seed_456",
+            "start_time": datetime.now(UTC).isoformat(),
+        }
+        mock_event_store.replay.return_value = [start_event]
+        mock_event_store.query_session_related_events = AsyncMock(return_value=(start_event,))
+
+        result = await repository.reconstruct_session(
+            "sess_123",
+            strict_related_events=True,
+        )
+
+        assert result.is_err
+        assert "related event query did not return a list" in str(result.error)
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_session_tolerates_invalid_start_time(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Malformed persisted start_time should not poison reconstruction."""
+        event_timestamp = datetime(2026, 1, 1, tzinfo=UTC)
+        start_event = MagicMock()
+        start_event.type = "orchestrator.session.started"
+        start_event.timestamp = event_timestamp
+        start_event.data = {
+            "execution_id": "exec_123",
+            "seed_id": "seed_456",
+            "start_time": "not-a-timestamp",
+        }
+
+        mock_event_store.replay.return_value = [start_event]
+
+        result = await repository.reconstruct_session("sess_123")
+
+        assert result.is_ok
+        assert result.value.start_time == event_timestamp
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_session_merges_progress_updates(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test reconstruction merges progress payloads across events."""
+        start_event = MagicMock()
+        start_event.type = "orchestrator.session.started"
+        start_event.data = {
+            "execution_id": "exec_123",
+            "seed_id": "seed_456",
+            "start_time": datetime.now(UTC).isoformat(),
+        }
+
+        runtime_progress = MagicMock()
+        runtime_progress.type = "orchestrator.progress.updated"
+        runtime_progress.data = {
+            "progress": {
+                "runtime": {
+                    "backend": "claude",
+                    "native_session_id": "sess_native",
+                },
+                "messages_processed": 3,
+            }
+        }
+
+        message_progress = MagicMock()
+        message_progress.type = "orchestrator.progress.updated"
+        message_progress.data = {
+            "progress": {
+                "last_message_type": "assistant",
+                "messages_processed": 7,
+            }
+        }
+
+        mock_event_store.replay.return_value = [
+            start_event,
+            runtime_progress,
+            message_progress,
+        ]
+
+        result = await repository.reconstruct_session("sess_123")
+
+        assert result.is_ok
+        tracker = result.value
+        assert tracker.messages_processed == 7
+        assert tracker.progress["last_message_type"] == "assistant"
+        assert tracker.progress["runtime"]["native_session_id"] == "sess_native"
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_session_merges_parallel_execution_progress(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Parallel execution progress should replay through related execution aggregates."""
+        base_time = datetime.now(UTC)
+        start_event = MagicMock()
+        start_event.id = "evt-start"
+        start_event.type = "orchestrator.session.started"
+        start_event.timestamp = base_time
+        start_event.data = {
+            "execution_id": "exec_parallel_123",
+            "seed_id": "seed_456",
+            "start_time": base_time.isoformat(),
+        }
+
+        workflow_progress = MagicMock()
+        workflow_progress.id = "evt-workflow"
+        workflow_progress.type = "workflow.progress.updated"
+        workflow_progress.timestamp = base_time + timedelta(milliseconds=1)
+        workflow_progress.data = {
+            "completed_count": 2,
+            "total_count": 5,
+            "current_phase": "Deliver",
+            "activity": "Executing",
+            "activity_detail": "Level 1/3: ACs [1, 2]",
+            "messages_count": 14,
+            "tool_calls_count": 6,
+            "acceptance_criteria": [
+                {"index": 0, "content": "AC 1", "status": "completed"},
+                {"index": 1, "content": "AC 2", "status": "executing"},
+            ],
+        }
+
+        child_runtime_event = MagicMock()
+        child_runtime_event.id = "evt-child"
+        child_runtime_event.type = "execution.session.started"
+        child_runtime_event.timestamp = base_time + timedelta(milliseconds=2)
+        child_runtime_event.data = {
+            "session_scope_id": "exec_parallel_123_sub_ac_1_1",
+        }
+
+        mock_event_store.replay.return_value = [start_event]
+        mock_event_store.query_session_related_events = AsyncMock(
+            return_value=[start_event, workflow_progress, child_runtime_event]
+        )
+
+        result = await repository.reconstruct_session("sess_123")
+
+        assert result.is_ok
+        tracker = result.value
+        assert tracker.execution_id == "exec_parallel_123"
+        assert tracker.messages_processed == 15
+        assert tracker.progress["completed_count"] == 2
+        assert tracker.progress["tool_calls_count"] == 6
+        assert tracker.progress["current_phase"] == "Deliver"
+        assert tracker.progress["activity_detail"] == "Level 1/3: ACs [1, 2]"
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_session_minimizes_opencode_runtime_from_audit_progress(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Audit progress events should not reintroduce transient OpenCode runtime fields."""
+        start_event = MagicMock()
+        start_event.type = "orchestrator.session.started"
+        start_event.data = {
+            "execution_id": "exec_123",
+            "seed_id": "seed_456",
+            "start_time": datetime.now(UTC).isoformat(),
+        }
+
+        audit_progress = MagicMock()
+        audit_progress.type = "orchestrator.progress.updated"
+        audit_progress.data = {
+            "message_type": "assistant",
+            "content_preview": "OpenCode resumed",
+            "progress": {
+                "last_message_type": "assistant",
+                "runtime": {
+                    "backend": "opencode",
+                    "kind": "implementation_session",
+                    "native_session_id": "sess_native",
+                    "cwd": "/tmp/project",
+                    "approval_mode": "acceptEdits",
+                    "updated_at": "2026-03-13T00:00:00+00:00",
+                    "metadata": {
+                        "server_session_id": "server-42",
+                        "session_scope_id": "ac_1",
+                        "session_state_path": (
+                            "execution.acceptance_criteria.ac_1.implementation_session"
+                        ),
+                        "session_role": "implementation",
+                        "retry_attempt": 0,
+                        "runtime_event_type": "session.resumed",
+                    },
+                },
+            },
+        }
+
+        mock_event_store.replay.return_value = [start_event, audit_progress]
+
+        result = await repository.reconstruct_session("sess_123")
+
+        assert result.is_ok
+        tracker = result.value
+        assert tracker.progress["runtime"] == {
+            "backend": "opencode",
+            "kind": "implementation_session",
+            "native_session_id": "sess_native",
+            "cwd": "/tmp/project",
+            "approval_mode": "acceptEdits",
+            "metadata": {
+                "server_session_id": "server-42",
+                "session_scope_id": "ac_1",
+                "session_state_path": ("execution.acceptance_criteria.ac_1.implementation_session"),
+                "session_role": "implementation",
+                "retry_attempt": 0,
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_session_preserves_opencode_runtime_identifiers_across_partial_updates(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Later OpenCode progress without ids should retain the last reconnectable runtime handle."""
+        start_event = MagicMock()
+        start_event.type = "orchestrator.session.started"
+        start_event.data = {
+            "execution_id": "exec_123",
+            "seed_id": "seed_456",
+            "start_time": datetime.now(UTC).isoformat(),
+        }
+
+        session_progress = MagicMock()
+        session_progress.type = "orchestrator.progress.updated"
+        session_progress.data = {
+            "progress": {
+                "runtime": {
+                    "backend": "opencode",
+                    "kind": "implementation_session",
+                    "native_session_id": "sess_native",
+                    "cwd": "/tmp/project",
+                    "approval_mode": "acceptEdits",
+                    "metadata": {
+                        "server_session_id": "server-42",
+                        "session_scope_id": "ac_1",
+                    },
+                },
+                "last_message_type": "system",
+            }
+        }
+
+        result_progress = MagicMock()
+        result_progress.type = "orchestrator.progress.updated"
+        result_progress.data = {
+            "progress": {
+                "runtime": {
+                    "backend": "opencode",
+                    "kind": "implementation_session",
+                    "native_session_id": None,
+                    "cwd": "/tmp/project",
+                    "approval_mode": "acceptEdits",
+                    "metadata": {
+                        "server_session_id": "server-42",
+                    },
+                },
+                "last_message_type": "result",
+            }
+        }
+
+        mock_event_store.replay.return_value = [
+            start_event,
+            session_progress,
+            result_progress,
+        ]
+
+        result = await repository.reconstruct_session("sess_123")
+
+        assert result.is_ok
+        tracker = result.value
+        assert tracker.progress["last_message_type"] == "result"
+        assert tracker.progress["runtime"] == {
+            "backend": "opencode",
+            "kind": "implementation_session",
+            "native_session_id": "sess_native",
+            "cwd": "/tmp/project",
+            "approval_mode": "acceptEdits",
+            "metadata": {
+                "server_session_id": "server-42",
+                "session_scope_id": "ac_1",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_session_uses_progress_runtime_status_when_terminal_event_missing(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Progress-only runtime signals should still restore the terminal session status."""
+        start_event = MagicMock()
+        start_event.type = "orchestrator.session.started"
+        start_event.data = {
+            "execution_id": "exec_123",
+            "seed_id": "seed_456",
+            "start_time": datetime.now(UTC).isoformat(),
+        }
+
+        completed_progress = MagicMock()
+        completed_progress.type = "orchestrator.progress.updated"
+        completed_progress.data = {
+            "message_type": "result",
+            "content_preview": "Adapter finished successfully.",
+            "runtime_status": "completed",
+            "progress": {
+                "last_message_type": "result",
+                "runtime_status": "completed",
+                "messages_processed": 4,
+            },
+        }
+
+        mock_event_store.replay.return_value = [start_event, completed_progress]
+
+        result = await repository.reconstruct_session("sess_123")
+
+        assert result.is_ok
+        tracker = result.value
+        assert tracker.status == SessionStatus.COMPLETED
+        assert tracker.messages_processed == 4
+        assert tracker.progress["runtime_status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_session_keeps_running_when_child_runtime_completes_but_workflow_pending(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Child runtime terminal states must not complete an unfinished workflow."""
+        started_at = datetime.now(UTC)
+
+        start_event = MagicMock()
+        start_event.id = "evt-start"
+        start_event.type = "orchestrator.session.started"
+        start_event.timestamp = started_at
+        start_event.data = {
+            "execution_id": "exec_parallel_123",
+            "seed_id": "seed_456",
+            "start_time": started_at.isoformat(),
+        }
+
+        workflow_progress = MagicMock()
+        workflow_progress.id = "evt-workflow"
+        workflow_progress.type = "workflow.progress.updated"
+        workflow_progress.timestamp = started_at + timedelta(seconds=1)
+        workflow_progress.data = {
+            "completed_count": 8,
+            "total_count": 9,
+            "current_phase": "Deliver",
+            "activity": "Level 2 complete",
+            "activity_detail": "Level 2/3",
+            "messages_count": 5822,
+            "acceptance_criteria": [
+                {"index": 4, "content": "AC 5", "status": "pending"},
+            ],
+        }
+
+        child_terminal_progress = MagicMock()
+        child_terminal_progress.id = "evt-child-terminal"
+        child_terminal_progress.type = "orchestrator.progress.updated"
+        child_terminal_progress.timestamp = started_at + timedelta(seconds=2)
+        child_terminal_progress.data = {
+            "runtime_status": "completed",
+            "progress": {
+                "runtime_status": "completed",
+                "runtime": {
+                    "backend": "opencode",
+                    "kind": "implementation_session",
+                    "native_session_id": "child-native",
+                    "cwd": "/tmp/project",
+                    "approval_mode": "acceptEdits",
+                    "metadata": {
+                        "ac_id": "exec_parallel_123_sub_ac_5_3",
+                        "session_scope_id": "exec_parallel_123_sub_ac_5_3",
+                        "session_role": "implementation",
+                    },
+                },
+                "last_message_type": "result",
+            },
+        }
+
+        mock_event_store.replay.return_value = [start_event]
+        mock_event_store.query_session_related_events = AsyncMock(
+            return_value=[start_event, workflow_progress, child_terminal_progress]
+        )
+
+        result = await repository.reconstruct_session("sess_123")
+
+        assert result.is_ok
+        tracker = result.value
+        assert tracker.status == SessionStatus.RUNNING
+        assert tracker.progress["completed_count"] == 8
+        assert tracker.progress["total_count"] == 9
+        assert tracker.progress["runtime_status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_completed_session(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test reconstructing a completed session."""
+        start_event = MagicMock()
+        start_event.type = "orchestrator.session.started"
+        start_event.data = {
+            "execution_id": "exec",
+            "seed_id": "seed",
+            "start_time": datetime.now(UTC).isoformat(),
+        }
+
+        completed_event = MagicMock()
+        completed_event.type = "orchestrator.session.completed"
+        completed_event.data = {}
+
+        mock_event_store.replay.return_value = [start_event, completed_event]
+
+        result = await repository.reconstruct_session("sess")
+
+        assert result.is_ok
+        assert result.value.status == SessionStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_failed_session(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test reconstructing a failed session."""
+        start_event = MagicMock()
+        start_event.type = "orchestrator.session.started"
+        start_event.data = {
+            "execution_id": "exec",
+            "seed_id": "seed",
+            "start_time": datetime.now(UTC).isoformat(),
+        }
+
+        failed_event = MagicMock()
+        failed_event.type = "orchestrator.session.failed"
+        failed_event.data = {}
+
+        mock_event_store.replay.return_value = [start_event, failed_event]
+
+        result = await repository.reconstruct_session("sess")
+
+        assert result.is_ok
+        assert result.value.status == SessionStatus.FAILED
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_cancelled_session(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test reconstructing a cancelled session."""
+        start_event = MagicMock()
+        start_event.type = "orchestrator.session.started"
+        start_event.data = {
+            "execution_id": "exec",
+            "seed_id": "seed",
+            "start_time": datetime.now(UTC).isoformat(),
+        }
+
+        cancelled_event = MagicMock()
+        cancelled_event.type = "orchestrator.session.cancelled"
+        cancelled_event.data = {
+            "reason": "User requested",
+            "cancelled_by": "user",
+        }
+
+        mock_event_store.replay.return_value = [start_event, cancelled_event]
+
+        result = await repository.reconstruct_session("sess")
+
+        assert result.is_ok
+        assert result.value.status == SessionStatus.CANCELLED
+
+
+class TestFindOrphanedSessions:
+    """Tests for orphaned session detection."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_heartbeat(self):
+        """Patch heartbeat so orphan detection doesn't check real lock files."""
+        with patch(
+            "ouroboros.orchestrator.heartbeat.get_alive_sessions",
+            return_value=set(),
+        ):
+            yield
+
+    @pytest.fixture
+    def mock_event_store(self) -> AsyncMock:
+        """Create a mock event store."""
+        store = AsyncMock()
+        store.append = AsyncMock()
+        store.replay = AsyncMock(return_value=[])
+        store.query_events = AsyncMock(return_value=[])
+        store.get_all_sessions = AsyncMock(return_value=[])
+        return store
+
+    @pytest.fixture
+    def repository(self, mock_event_store: AsyncMock) -> SessionRepository:
+        """Create a repository with mock store."""
+        return SessionRepository(mock_event_store)
+
+    def _make_start_event(
+        self,
+        session_id: str,
+        timestamp: datetime | None = None,
+    ) -> MagicMock:
+        """Helper to create a mock session start event."""
+        event = MagicMock()
+        event.type = "orchestrator.session.started"
+        event.aggregate_id = session_id
+        event.timestamp = timestamp or datetime.now(UTC)
+        event.data = {
+            "execution_id": f"exec_{session_id}",
+            "seed_id": f"seed_{session_id}",
+            "start_time": (timestamp or datetime.now(UTC)).isoformat(),
+        }
+        return event
+
+    def _make_progress_event(
+        self,
+        session_id: str,
+        timestamp: datetime | None = None,
+    ) -> MagicMock:
+        """Helper to create a mock progress event."""
+        event = MagicMock()
+        event.type = "orchestrator.progress.updated"
+        event.aggregate_id = session_id
+        event.timestamp = timestamp or datetime.now(UTC)
+        event.data = {"progress": {"step": 1}, "timestamp": event.timestamp.isoformat()}
+        return event
+
+    def _make_terminal_event(
+        self,
+        session_id: str,
+        event_type: str,
+        timestamp: datetime | None = None,
+    ) -> MagicMock:
+        """Helper to create a mock terminal event (completed/failed/cancelled)."""
+        event = MagicMock()
+        event.type = event_type
+        event.aggregate_id = session_id
+        event.timestamp = timestamp or datetime.now(UTC)
+        event.data = {}
+        return event
+
+    @pytest.mark.asyncio
+    async def test_no_sessions_returns_empty(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that no sessions returns empty list."""
+        mock_event_store.get_all_sessions.return_value = []
+
+        result = await repository.find_orphaned_sessions()
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_running_session_within_threshold_not_orphaned(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that a recently active running session is NOT orphaned."""
+        now = datetime.now(UTC)
+        start_event = self._make_start_event("sess_1", timestamp=now - timedelta(minutes=30))
+        progress_event = self._make_progress_event("sess_1", timestamp=now - timedelta(minutes=5))
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event, progress_event]
+
+        result = await repository.find_orphaned_sessions()
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_running_session_beyond_threshold_is_orphaned(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that a running session with no recent activity IS orphaned."""
+        now = datetime.now(UTC)
+        old_time = now - timedelta(hours=2)
+        start_event = self._make_start_event("sess_1", timestamp=old_time)
+        progress_event = self._make_progress_event(
+            "sess_1", timestamp=old_time + timedelta(minutes=5)
+        )
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event, progress_event]
+
+        result = await repository.find_orphaned_sessions()
+
+        assert len(result) == 1
+        assert result[0].session_id == "sess_1"
+        assert result[0].status == SessionStatus.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_completed_session_not_orphaned(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that a completed session is NOT orphaned even if old."""
+        old_time = datetime.now(UTC) - timedelta(hours=5)
+        start_event = self._make_start_event("sess_1", timestamp=old_time)
+        completed_event = self._make_terminal_event(
+            "sess_1", "orchestrator.session.completed", timestamp=old_time + timedelta(hours=1)
+        )
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event, completed_event]
+
+        result = await repository.find_orphaned_sessions()
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_progress_completed_session_not_orphaned_without_terminal_event(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Progress-derived completed status should not be treated as orphaned."""
+        old_time = datetime.now(UTC) - timedelta(hours=5)
+        start_event = self._make_start_event("sess_1", timestamp=old_time)
+        completed_progress = self._make_progress_event(
+            "sess_1", timestamp=old_time + timedelta(hours=1)
+        )
+        completed_progress.data = {
+            "message_type": "result",
+            "runtime_status": "completed",
+            "progress": {
+                "last_message_type": "result",
+                "runtime_status": "completed",
+            },
+        }
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event, completed_progress]
+
+        result = await repository.find_orphaned_sessions()
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_prefers_snapshot_query_over_full_replay(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Snapshot query should avoid session-by-session replay on large stores."""
+        from ouroboros.persistence.event_store import SessionActivitySnapshot
+
+        old_time = datetime.now(UTC) - timedelta(hours=2)
+        mock_event_store.get_session_activity_snapshots = AsyncMock(
+            return_value=[
+                SessionActivitySnapshot(
+                    session_id="sess_1",
+                    execution_id="exec_sess_1",
+                    seed_id="seed_sess_1",
+                    start_time=old_time.isoformat(),
+                    last_activity=old_time,
+                    status_event_type=None,
+                    runtime_status=None,
+                )
+            ]
+        )
+
+        start_event = self._make_start_event("sess_1", timestamp=old_time)
+        mock_event_store.replay.return_value = [start_event]
+
+        result = await repository.find_orphaned_sessions()
+
+        assert len(result) == 1
+        mock_event_store.get_session_activity_snapshots.assert_awaited_once()
+        mock_event_store.get_all_sessions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_snapshot_reconstructed_terminal_tracker_is_not_orphaned(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Snapshot classification rechecks authoritative reconstructed status."""
+        from ouroboros.persistence.event_store import SessionActivitySnapshot
+
+        old_time = datetime.now(UTC) - timedelta(hours=2)
+        mock_event_store.get_session_activity_snapshots = AsyncMock(
+            return_value=[
+                SessionActivitySnapshot(
+                    session_id="sess_1",
+                    execution_id="exec_sess_1",
+                    seed_id="seed_sess_1",
+                    start_time=old_time.isoformat(),
+                    last_activity=old_time,
+                    status_event_type=None,
+                    runtime_status="running",
+                )
+            ]
+        )
+        repository.reconstruct_session = AsyncMock(
+            return_value=Result.ok(
+                SessionTracker.create(
+                    "exec_sess_1",
+                    "seed_sess_1",
+                    session_id="sess_1",
+                ).with_status(SessionStatus.COMPLETED)
+            )
+        )
+
+        result = await repository.find_orphaned_sessions()
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_failed_session_not_orphaned(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that a failed session is NOT orphaned."""
+        old_time = datetime.now(UTC) - timedelta(hours=5)
+        start_event = self._make_start_event("sess_1", timestamp=old_time)
+        failed_event = self._make_terminal_event(
+            "sess_1", "orchestrator.session.failed", timestamp=old_time + timedelta(hours=1)
+        )
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event, failed_event]
+
+        result = await repository.find_orphaned_sessions()
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_cancelled_session_not_orphaned(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that an already-cancelled session is NOT orphaned."""
+        old_time = datetime.now(UTC) - timedelta(hours=5)
+        start_event = self._make_start_event("sess_1", timestamp=old_time)
+        cancelled_event = self._make_terminal_event(
+            "sess_1", "orchestrator.session.cancelled", timestamp=old_time + timedelta(hours=1)
+        )
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event, cancelled_event]
+
+        result = await repository.find_orphaned_sessions()
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_late_running_progress_cannot_revive_cancelled_orphan(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Replay-only orphan detection keeps terminal lifecycle absorbing."""
+        old_time = datetime.now(UTC) - timedelta(hours=5)
+        start_event = self._make_start_event("sess_1", timestamp=old_time)
+        cancelled_event = self._make_terminal_event(
+            "sess_1",
+            "orchestrator.session.cancelled",
+            timestamp=old_time + timedelta(minutes=5),
+        )
+        late_running = self._make_progress_event(
+            "sess_1",
+            timestamp=old_time + timedelta(minutes=10),
+        )
+        late_running.data = {
+            "runtime_status": "running",
+            "progress": {"runtime_status": "running"},
+        }
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event, cancelled_event, late_running]
+
+        result = await repository.find_orphaned_sessions()
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_reconstructed_terminal_tracker_is_not_appended_as_orphan(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Fallback classification rechecks authoritative reconstructed status."""
+        old_time = datetime.now(UTC) - timedelta(hours=5)
+        start_event = self._make_start_event("sess_1", timestamp=old_time)
+        running_event = self._make_progress_event(
+            "sess_1",
+            timestamp=old_time + timedelta(minutes=10),
+        )
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event, running_event]
+        repository.reconstruct_session = AsyncMock(
+            return_value=Result.ok(
+                SessionTracker.create(
+                    "exec_sess_1",
+                    "seed_sess_1",
+                    session_id="sess_1",
+                ).with_status(SessionStatus.CANCELLED)
+            )
+        )
+
+        result = await repository.find_orphaned_sessions()
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_paused_session_beyond_threshold_is_orphaned(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that a paused session beyond threshold IS orphaned."""
+        old_time = datetime.now(UTC) - timedelta(hours=3)
+        start_event = self._make_start_event("sess_1", timestamp=old_time)
+        paused_event = self._make_terminal_event(
+            "sess_1", "orchestrator.session.paused", timestamp=old_time + timedelta(minutes=10)
+        )
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event, paused_event]
+
+        result = await repository.find_orphaned_sessions()
+
+        assert len(result) == 1
+        assert result[0].status == SessionStatus.PAUSED
+
+    @pytest.mark.asyncio
+    async def test_usage_limit_paused_session_before_resume_after_not_orphaned(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Usage-limit pauses should not be cancelled before the resume window."""
+        now = datetime.now(UTC)
+        paused_at = now - timedelta(hours=2)
+        resume_after = now + timedelta(hours=3)
+        start_event = self._make_start_event(
+            "sess_usage_limit",
+            timestamp=paused_at - timedelta(minutes=10),
+        )
+        paused_event = self._make_terminal_event(
+            "sess_usage_limit",
+            "orchestrator.session.paused",
+            timestamp=paused_at,
+        )
+        paused_event.data = {
+            "reason": "Usage limit reached",
+            "pause_kind": "usage_limit",
+            "pause_seconds": 18000,
+            "paused_at": paused_at.isoformat(),
+            "resume_after": resume_after.isoformat(),
+        }
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event, paused_event]
+
+        result = await repository.find_orphaned_sessions()
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_usage_limit_paused_session_after_resume_grace_is_orphaned(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Usage-limit pauses can be cleaned up after resume time plus staleness."""
+        now = datetime.now(UTC)
+        resume_after = now - timedelta(hours=2)
+        paused_at = resume_after - timedelta(hours=5)
+        start_event = self._make_start_event(
+            "sess_expired_usage_limit",
+            timestamp=paused_at - timedelta(minutes=10),
+        )
+        paused_event = self._make_terminal_event(
+            "sess_expired_usage_limit",
+            "orchestrator.session.paused",
+            timestamp=paused_at,
+        )
+        paused_event.data = {
+            "reason": "Usage limit reached",
+            "pause_kind": "usage_limit",
+            "pause_seconds": 18000,
+            "paused_at": paused_at.isoformat(),
+            "resume_after": resume_after.isoformat(),
+        }
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event, paused_event]
+
+        result = await repository.find_orphaned_sessions()
+
+        assert len(result) == 1
+        assert result[0].status == SessionStatus.PAUSED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("pause_seconds", [float("inf"), float("nan"), "inf", "nan"])
+    async def test_non_finite_pause_seconds_does_not_break_orphan_cleanup(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        pause_seconds: float | str,
+    ) -> None:
+        """Non-finite pause metadata degrades to "no resume window", never raises."""
+        now = datetime.now(UTC)
+        paused_at = now - timedelta(hours=5)
+        start_event = self._make_start_event(
+            "sess_non_finite_pause",
+            timestamp=paused_at - timedelta(minutes=10),
+        )
+        paused_event = self._make_terminal_event(
+            "sess_non_finite_pause",
+            "orchestrator.session.paused",
+            timestamp=paused_at,
+        )
+        # No resume_after: resolution must fall through to paused_at + pause_seconds.
+        paused_event.data = {
+            "reason": "Usage limit reached",
+            "pause_kind": "usage_limit",
+            "pause_seconds": pause_seconds,
+            "paused_at": paused_at.isoformat(),
+        }
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event, paused_event]
+
+        result = await repository.find_orphaned_sessions()
+
+        assert len(result) == 1
+        assert result[0].status == SessionStatus.PAUSED
+
+    @pytest.mark.asyncio
+    async def test_snapshot_usage_limit_paused_session_before_resume_after_not_orphaned(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Snapshot orphan detection should also respect usage-limit pause windows."""
+        now = datetime.now(UTC)
+        paused_at = now - timedelta(hours=2)
+        resume_after = now + timedelta(hours=3)
+        start_event = self._make_start_event(
+            "sess_snapshot_usage_limit",
+            timestamp=paused_at - timedelta(minutes=10),
+        )
+        paused_event = self._make_terminal_event(
+            "sess_snapshot_usage_limit",
+            "orchestrator.session.paused",
+            timestamp=paused_at,
+        )
+        paused_event.data = {
+            "reason": "Usage limit reached",
+            "pause_kind": "usage_limit",
+            "pause_seconds": 18000,
+            "paused_at": paused_at.isoformat(),
+            "resume_after": resume_after.isoformat(),
+        }
+        snapshot = MagicMock()
+        snapshot.session_id = "sess_snapshot_usage_limit"
+        snapshot.execution_id = "exec_sess_snapshot_usage_limit"
+        snapshot.seed_id = "seed_sess_snapshot_usage_limit"
+        snapshot.start_time = start_event.data["start_time"]
+        snapshot.last_activity = paused_at
+        snapshot.status_event_type = "orchestrator.session.paused"
+        snapshot.runtime_status = None
+
+        mock_event_store.get_session_activity_snapshots = AsyncMock(return_value=[snapshot])
+        mock_event_store.replay.return_value = [start_event, paused_event]
+
+        result = await repository.find_orphaned_sessions()
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_multiple_sessions_mixed_states(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test with multiple sessions in different states."""
+        now = datetime.now(UTC)
+        old_time = now - timedelta(hours=2)
+
+        # Session 1: running and stale (orphaned)
+        start_1 = self._make_start_event("sess_1", timestamp=old_time)
+        # Session 2: completed (not orphaned)
+        start_2 = self._make_start_event("sess_2", timestamp=old_time)
+        completed_2 = self._make_terminal_event(
+            "sess_2", "orchestrator.session.completed", timestamp=old_time + timedelta(minutes=30)
+        )
+        # Session 3: running but recent (not orphaned)
+        start_3 = self._make_start_event("sess_3", timestamp=now - timedelta(minutes=10))
+        progress_3 = self._make_progress_event("sess_3", timestamp=now - timedelta(minutes=2))
+
+        mock_event_store.get_all_sessions.return_value = [start_1, start_2, start_3]
+
+        replay_data = {
+            "sess_1": [start_1],
+            "sess_2": [start_2, completed_2],
+            "sess_3": [start_3, progress_3],
+        }
+
+        async def mock_replay(aggregate_type: str, aggregate_id: str) -> list:
+            return replay_data.get(aggregate_id, [])
+
+        mock_event_store.replay.side_effect = mock_replay
+
+        result = await repository.find_orphaned_sessions()
+
+        assert len(result) == 1
+        assert result[0].session_id == "sess_1"
+
+    @pytest.mark.asyncio
+    async def test_custom_staleness_threshold(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test with a custom staleness threshold."""
+        now = datetime.now(UTC)
+        # Session started 30 minutes ago
+        start_event = self._make_start_event("sess_1", timestamp=now - timedelta(minutes=30))
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event]
+
+        # With default 1-hour threshold: NOT orphaned
+        result = await repository.find_orphaned_sessions()
+        assert result == []
+
+        # With 15-minute threshold: IS orphaned
+        result = await repository.find_orphaned_sessions(staleness_threshold=timedelta(minutes=15))
+        assert len(result) == 1
+
+    @pytest.mark.asyncio
+    async def test_replay_failure_skips_session(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that a replay failure for one session doesn't break detection."""
+        old_time = datetime.now(UTC) - timedelta(hours=2)
+        start_1 = self._make_start_event("sess_1", timestamp=old_time)
+        start_2 = self._make_start_event("sess_2", timestamp=old_time)
+
+        mock_event_store.get_all_sessions.return_value = [start_1, start_2]
+
+        async def mock_replay(aggregate_type: str, aggregate_id: str) -> list:
+            if aggregate_id == "sess_1":
+                raise Exception("DB error")
+            return [start_2]
+
+        mock_event_store.replay.side_effect = mock_replay
+
+        # Should not raise, and sess_2 should still be detected
+        result = await repository.find_orphaned_sessions()
+        assert len(result) == 1
+        assert result[0].session_id == "sess_2"
+
+    @pytest.mark.asyncio
+    async def test_event_store_failure_returns_empty(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that event store failure returns empty list gracefully."""
+        mock_event_store.get_all_sessions.side_effect = Exception("DB connection lost")
+
+        result = await repository.find_orphaned_sessions()
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_session_at_exact_threshold_not_orphaned(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that a session at exactly the threshold boundary is NOT orphaned.
+
+        The comparison uses strict > so a session whose last activity is exactly
+        staleness_threshold ago should not be considered orphaned.
+        """
+        from unittest.mock import patch as mock_patch
+
+        fixed_now = datetime(2025, 6, 1, 12, 0, 0, tzinfo=UTC)
+        threshold = timedelta(hours=1)
+        # Last activity exactly at the threshold boundary
+        start_event = self._make_start_event("sess_boundary", timestamp=fixed_now - threshold)
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event]
+
+        # Freeze time so find_orphaned_sessions sees the same 'now'
+        with mock_patch("ouroboros.orchestrator.session.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            mock_dt.fromisoformat = datetime.fromisoformat
+            result = await repository.find_orphaned_sessions(staleness_threshold=threshold)
+
+        # Strict > means exactly-at-threshold is NOT orphaned
+        assert result == []
+
+
+class TestCancelOrphanedSessions:
+    """Tests for auto-cancel-on-startup routine."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_heartbeat(self):
+        """Patch heartbeat so orphan detection doesn't check real lock files."""
+        with patch(
+            "ouroboros.orchestrator.heartbeat.get_alive_sessions",
+            return_value=set(),
+        ):
+            yield
+
+    @pytest.fixture
+    def mock_event_store(self) -> AsyncMock:
+        """Create a mock event store."""
+        store = AsyncMock()
+        store.append = AsyncMock()
+        store.replay = AsyncMock(return_value=[])
+        store.get_all_sessions = AsyncMock(return_value=[])
+        return store
+
+    @pytest.fixture
+    def repository(self, mock_event_store: AsyncMock) -> SessionRepository:
+        """Create a repository with mock store."""
+        return SessionRepository(mock_event_store)
+
+    def _make_start_event(
+        self,
+        session_id: str,
+        timestamp: datetime | None = None,
+    ) -> MagicMock:
+        """Helper to create a mock session start event."""
+        event = MagicMock()
+        event.type = "orchestrator.session.started"
+        event.aggregate_id = session_id
+        event.timestamp = timestamp or datetime.now(UTC)
+        event.data = {
+            "execution_id": f"exec_{session_id}",
+            "seed_id": f"seed_{session_id}",
+            "start_time": (timestamp or datetime.now(UTC)).isoformat(),
+        }
+        return event
+
+    @pytest.mark.asyncio
+    async def test_no_orphans_returns_empty(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that no orphaned sessions returns empty list."""
+        mock_event_store.get_all_sessions.return_value = []
+
+        result = await repository.cancel_orphaned_sessions()
+
+        assert result == []
+        # mark_cancelled should not have been called
+        mock_event_store.append.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancels_orphaned_sessions(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that orphaned sessions are cancelled and events emitted."""
+        old_time = datetime.now(UTC) - timedelta(hours=2)
+        start_event = self._make_start_event("sess_1", timestamp=old_time)
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event]
+
+        result = await repository.cancel_orphaned_sessions()
+
+        assert len(result) == 1
+        assert result[0].session_id == "sess_1"
+
+        # Verify a cancellation event was appended
+        mock_event_store.append.assert_called_once()
+        appended_event = mock_event_store.append.call_args[0][0]
+        assert appended_event.type == "orchestrator.session.cancelled"
+        assert appended_event.aggregate_id == "sess_1"
+        assert appended_event.data["cancelled_by"] == "auto_cleanup"
+        assert "Auto-cancelled on startup" in appended_event.data["reason"]
+
+    @pytest.mark.asyncio
+    async def test_cancels_multiple_orphaned_sessions(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that multiple orphaned sessions are all cancelled."""
+        old_time = datetime.now(UTC) - timedelta(hours=2)
+        start_1 = self._make_start_event("sess_1", timestamp=old_time)
+        start_2 = self._make_start_event("sess_2", timestamp=old_time)
+
+        mock_event_store.get_all_sessions.return_value = [start_1, start_2]
+
+        async def mock_replay(aggregate_type: str, aggregate_id: str) -> list:
+            if aggregate_id == "sess_1":
+                return [start_1]
+            elif aggregate_id == "sess_2":
+                return [start_2]
+            return []
+
+        mock_event_store.replay.side_effect = mock_replay
+
+        result = await repository.cancel_orphaned_sessions()
+
+        assert len(result) == 2
+        assert {r.session_id for r in result} == {"sess_1", "sess_2"}
+        # Two cancellation events appended
+        assert mock_event_store.append.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cancel_failure_does_not_include_in_result(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that a failed cancellation is excluded from returned list."""
+        old_time = datetime.now(UTC) - timedelta(hours=2)
+        start_event = self._make_start_event("sess_1", timestamp=old_time)
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event]
+        # Make append fail (cancellation fails)
+        mock_event_store.append.side_effect = Exception("DB write error")
+
+        result = await repository.cancel_orphaned_sessions()
+
+        # Session should not be in the result since cancellation failed
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_logs_to_stderr(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Test that cancellations are logged to stderr."""
+        old_time = datetime.now(UTC) - timedelta(hours=2)
+        start_event = self._make_start_event("sess_1", timestamp=old_time)
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event]
+
+        await repository.cancel_orphaned_sessions()
+
+        captured = capsys.readouterr()
+        assert "Auto-cancelled orphaned session sess_1" in captured.err
+        assert "exec_sess_1" in captured.err
+
+    @pytest.mark.asyncio
+    async def test_uses_auto_cleanup_cancelled_by(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that cancelled_by is set to 'auto_cleanup'."""
+        old_time = datetime.now(UTC) - timedelta(hours=2)
+        start_event = self._make_start_event("sess_1", timestamp=old_time)
+
+        mock_event_store.get_all_sessions.return_value = [start_event]
+        mock_event_store.replay.return_value = [start_event]
+
+        await repository.cancel_orphaned_sessions()
+
+        appended_event = mock_event_store.append.call_args[0][0]
+        assert appended_event.data["cancelled_by"] == "auto_cleanup"
+
+    @pytest.mark.asyncio
+    async def test_emits_events_for_each_cancellation(
+        self,
+        repository: SessionRepository,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test that a corresponding event is emitted for each cancellation."""
+        old_time = datetime.now(UTC) - timedelta(hours=3)
+        start_1 = self._make_start_event("sess_a", timestamp=old_time)
+        start_2 = self._make_start_event("sess_b", timestamp=old_time)
+
+        mock_event_store.get_all_sessions.return_value = [start_1, start_2]
+
+        async def mock_replay(aggregate_type: str, aggregate_id: str) -> list:
+            if aggregate_id == "sess_a":
+                return [start_1]
+            elif aggregate_id == "sess_b":
+                return [start_2]
+            return []
+
+        mock_event_store.replay.side_effect = mock_replay
+
+        await repository.cancel_orphaned_sessions()
+
+        # Each orphaned session should have a cancellation event
+        assert mock_event_store.append.call_count == 2
+        event_ids = {call[0][0].aggregate_id for call in mock_event_store.append.call_args_list}
+        assert event_ids == {"sess_a", "sess_b"}
+        for call in mock_event_store.append.call_args_list:
+            event = call[0][0]
+            assert event.type == "orchestrator.session.cancelled"
+            assert "cancelled_at" in event.data
+
+
+class TestStaleRuntimeMetadataCleansing:
+    """Test that terminal sessions have stale runtime_status sanitized (#188)."""
+
+    async def test_cancelled_session_overwrites_stale_runtime_status(self) -> None:
+        """runtime_status should reflect terminal state after cancellation."""
+        from ouroboros.events.base import BaseEvent
+
+        mock_event_store = AsyncMock()
+        mock_event_store.replay = AsyncMock(
+            return_value=[
+                BaseEvent(
+                    type="orchestrator.session.started",
+                    aggregate_type="session",
+                    aggregate_id="sess-stale",
+                    data={"execution_id": "exec-1", "seed_id": "seed-1"},
+                ),
+                BaseEvent(
+                    type="orchestrator.progress.updated",
+                    aggregate_type="session",
+                    aggregate_id="sess-stale",
+                    data={"progress": {"runtime_status": "running", "phase": "executing"}},
+                ),
+                BaseEvent(
+                    type="orchestrator.session.cancelled",
+                    aggregate_type="session",
+                    aggregate_id="sess-stale",
+                    data={"reason": "Auto-cancelled on startup", "cancelled_by": "auto_cleanup"},
+                ),
+            ]
+        )
+        mock_event_store.query_session_related_events = None
+
+        repository = SessionRepository(mock_event_store)
+        result = await repository.reconstruct_session("sess-stale")
+
+        assert result.is_ok
+        tracker = result.value
+        assert tracker.status == SessionStatus.CANCELLED
+        assert tracker.progress.get("runtime_status") == "cancelled"
+
+    async def test_cancelled_session_ignores_later_running_progress(self) -> None:
+        """A delayed progress checkpoint cannot revive a durable cancellation."""
+        from ouroboros.events.base import BaseEvent
+
+        mock_event_store = AsyncMock()
+        mock_event_store.replay = AsyncMock(
+            return_value=[
+                BaseEvent(
+                    type="orchestrator.session.started",
+                    aggregate_type="session",
+                    aggregate_id="sess-cancelled-late-progress",
+                    data={"execution_id": "exec", "seed_id": "seed"},
+                ),
+                BaseEvent(
+                    type="orchestrator.session.cancelled",
+                    aggregate_type="session",
+                    aggregate_id="sess-cancelled-late-progress",
+                    data={"reason": "user request", "cancelled_by": "user"},
+                ),
+                BaseEvent(
+                    type="orchestrator.progress.updated",
+                    aggregate_type="session",
+                    aggregate_id="sess-cancelled-late-progress",
+                    data={"progress": {"runtime_status": "running", "phase": "late"}},
+                ),
+            ]
+        )
+        mock_event_store.query_session_related_events = None
+
+        result = await SessionRepository(mock_event_store).reconstruct_session(
+            "sess-cancelled-late-progress"
+        )
+
+        assert result.is_ok
+        assert result.value.status == SessionStatus.CANCELLED
+        assert result.value.progress.get("runtime_status") == "cancelled"
+
+    async def test_completed_session_overwrites_stale_runtime_status(self) -> None:
+        """runtime_status should reflect 'completed' for completed sessions."""
+        from ouroboros.events.base import BaseEvent
+
+        mock_event_store = AsyncMock()
+        mock_event_store.replay = AsyncMock(
+            return_value=[
+                BaseEvent(
+                    type="orchestrator.session.started",
+                    aggregate_type="session",
+                    aggregate_id="sess-done",
+                    data={"execution_id": "exec-2", "seed_id": "seed-2"},
+                ),
+                BaseEvent(
+                    type="orchestrator.progress.updated",
+                    aggregate_type="session",
+                    aggregate_id="sess-done",
+                    data={"progress": {"runtime_status": "running"}},
+                ),
+                BaseEvent(
+                    type="orchestrator.session.completed",
+                    aggregate_type="session",
+                    aggregate_id="sess-done",
+                    data={"summary": {"success": True}},
+                ),
+            ]
+        )
+        mock_event_store.query_session_related_events = None
+
+        repository = SessionRepository(mock_event_store)
+        result = await repository.reconstruct_session("sess-done")
+
+        assert result.is_ok
+        tracker = result.value
+        assert tracker.status == SessionStatus.COMPLETED
+        assert tracker.progress.get("runtime_status") == "completed"
+
+    async def test_paused_session_overwrites_stale_runtime_status(self) -> None:
+        """runtime_status should reflect 'paused' after usage-limit pause replay."""
+        from ouroboros.events.base import BaseEvent
+
+        mock_event_store = AsyncMock()
+        mock_event_store.replay = AsyncMock(
+            return_value=[
+                BaseEvent(
+                    type="orchestrator.session.started",
+                    aggregate_type="session",
+                    aggregate_id="sess-paused",
+                    data={"execution_id": "exec-3", "seed_id": "seed-3"},
+                ),
+                BaseEvent(
+                    type="orchestrator.progress.updated",
+                    aggregate_type="session",
+                    aggregate_id="sess-paused",
+                    data={"progress": {"runtime_status": "running", "phase": "executing"}},
+                ),
+                BaseEvent(
+                    type="orchestrator.session.paused",
+                    aggregate_type="session",
+                    aggregate_id="sess-paused",
+                    data={
+                        "reason": "Usage limit reached",
+                        "pause_kind": "usage_limit",
+                        "pause_seconds": 18000,
+                    },
+                ),
+            ]
+        )
+        mock_event_store.query_session_related_events = None
+
+        repository = SessionRepository(mock_event_store)
+        result = await repository.reconstruct_session("sess-paused")
+
+        assert result.is_ok
+        tracker = result.value
+        assert tracker.status == SessionStatus.PAUSED
+        assert tracker.progress.get("runtime_status") == "paused"
+
+    async def test_resumed_session_progress_clears_stale_pause_status(self) -> None:
+        """Later running progress should clear an earlier usage-limit pause replay state."""
+        from ouroboros.events.base import BaseEvent
+
+        mock_event_store = AsyncMock()
+        mock_event_store.replay = AsyncMock(
+            return_value=[
+                BaseEvent(
+                    type="orchestrator.session.started",
+                    aggregate_type="session",
+                    aggregate_id="sess-resumed",
+                    data={"execution_id": "exec-4", "seed_id": "seed-4"},
+                ),
+                BaseEvent(
+                    type="orchestrator.session.paused",
+                    aggregate_type="session",
+                    aggregate_id="sess-resumed",
+                    data={
+                        "reason": "Usage limit reached",
+                        "pause_kind": "usage_limit",
+                        "pause_seconds": 18000,
+                        "resume_after": "2026-01-01T05:00:00+00:00",
+                        "pause_owner": {
+                            "schema_version": 1,
+                            "kind": "coordinator_quota",
+                            "execution_id": "exec-4",
+                            "session_id": "sess-resumed",
+                            "level_number": 1,
+                            "coordinator_aggregate_id": "exec-4:l0:coord",
+                        },
+                    },
+                ),
+                BaseEvent(
+                    type="orchestrator.progress.updated",
+                    aggregate_type="session",
+                    aggregate_id="sess-resumed",
+                    data={"progress": {"runtime_status": "running", "phase": "resumed"}},
+                ),
+            ]
+        )
+        mock_event_store.query_session_related_events = None
+
+        repository = SessionRepository(mock_event_store)
+        result = await repository.reconstruct_session("sess-resumed")
+
+        assert result.is_ok
+        tracker = result.value
+        assert tracker.status == SessionStatus.RUNNING
+        assert tracker.progress.get("runtime_status") == "running"
+        assert "pause_kind" not in tracker.progress
+        assert "resume_after" not in tracker.progress
+        assert "pause_owner" not in tracker.progress
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_session_rejects_malformed_pause_owner(self) -> None:
+        """Effect-bearing resume authority must be validated again on replay."""
+
+        from ouroboros.events.base import BaseEvent
+
+        mock_event_store = AsyncMock()
+        mock_event_store.replay = AsyncMock(
+            return_value=[
+                BaseEvent(
+                    type="orchestrator.session.started",
+                    aggregate_type="session",
+                    aggregate_id="sess-malformed-pause-owner",
+                    data={"execution_id": "exec-4", "seed_id": "seed-4"},
+                ),
+                BaseEvent(
+                    type="orchestrator.session.paused",
+                    aggregate_type="session",
+                    aggregate_id="sess-malformed-pause-owner",
+                    data={
+                        "reason": "Usage limit reached",
+                        "pause_kind": "usage_limit",
+                        "pause_owner": {
+                            "schema_version": 1,
+                            "kind": "coordinator_quota",
+                            "execution_id": "exec-4",
+                            "session_id": "sess-malformed-pause-owner",
+                            "level_number": True,
+                            "coordinator_aggregate_id": "exec-4:l0:coord",
+                        },
+                    },
+                ),
+            ]
+        )
+        mock_event_store.query_session_related_events = None
+
+        result = await SessionRepository(mock_event_store).reconstruct_session(
+            "sess-malformed-pause-owner"
+        )
+
+        assert result.is_err
+        assert "pause owner exceeds its durable bounds" in str(result.error)
+
+
+class TestEventStreamMerging:
+    """Tests for merging event streams in SessionRepository."""
+
+    def test_merge_event_streams_handles_mixed_timezone_naive_and_aware_events(self) -> None:
+        """Verify _merge_event_streams sorts correctly when naive and aware datetimes are mixed."""
+        from ouroboros.events.base import BaseEvent
+
+        naive_time = datetime(2026, 5, 29, 10, 0, 0)
+        aware_time = datetime(2026, 5, 29, 10, 15, 0, tzinfo=UTC)
+
+        event_naive = BaseEvent(
+            type="orchestrator.session.started",
+            aggregate_type="session",
+            aggregate_id="sess-1",
+            timestamp=naive_time,
+        )
+        event_aware = BaseEvent(
+            type="orchestrator.progress.updated",
+            aggregate_type="session",
+            aggregate_id="sess-1",
+            timestamp=aware_time,
+        )
+
+        # Merge them
+        merged = SessionRepository._merge_event_streams(
+            [event_aware],
+            [event_naive],
+        )
+
+        assert len(merged) == 2
+        # Naive time is 10:00 (parsed as UTC), aware is 10:15 UTC. Naive should be first.
+        assert merged[0].id == event_naive.id
+        assert merged[1].id == event_aware.id

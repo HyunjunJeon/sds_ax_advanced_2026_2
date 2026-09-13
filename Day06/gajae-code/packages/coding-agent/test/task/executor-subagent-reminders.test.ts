@@ -1,0 +1,1895 @@
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@gajae-code/agent-core";
+import { type AssistantMessage, type AssistantMessageEvent, Effort, type Model } from "@gajae-code/ai";
+import type { RecoveryFsRoot } from "@gajae-code/natives";
+import type { AsyncJobManager } from "../../src/async/job-manager";
+import { kNoAuth } from "../../src/config/model-registry";
+import { Settings } from "../../src/config/settings";
+import type { ExtensionActions, LoadExtensionsResult } from "../../src/extensibility/extensions/types";
+import { AgentRegistry } from "../../src/registry/agent-registry";
+import type { CreateAgentSessionResult } from "../../src/sdk";
+import * as sdkModule from "../../src/sdk";
+import type { AgentSession, AgentSessionEvent, ForkContextSeed, PromptOptions } from "../../src/session/agent-session";
+import { ArtifactManager } from "../../src/session/artifacts";
+import type { AuthStorage } from "../../src/session/auth-storage";
+import {
+	ManagedSessionDescendantStore,
+	managedDirectoryRoot,
+} from "../../src/session/internal/managed-session-storage";
+import { createManagedTaskPersistence, runSubprocess, SUBAGENT_WARNING_MISSING_YIELD } from "../../src/task/executor";
+import { buildTaskReceipt } from "../../src/task/receipt";
+
+import {
+	type AgentDefinition,
+	type AgentProgress,
+	type SubagentLifecyclePayload,
+	type SubagentProgressPayload,
+	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+	TASK_SUBAGENT_PROGRESS_CHANNEL,
+} from "../../src/task/types";
+
+import { EventBus } from "../../src/utils/event-bus";
+
+function createAssistantStopMessage(text: string): AssistantMessage {
+	return {
+		role: "assistant",
+		content: text ? [{ type: "text", text }] : [],
+		api: "openai-responses",
+		provider: "openai",
+		model: "mock",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+}
+
+function createMockSession(
+	onPrompt: (params: {
+		text: string;
+		options?: PromptOptions;
+		promptIndex: number;
+		emit: (event: AgentSessionEvent) => void;
+		state: { messages: AssistantMessage[] };
+	}) => void,
+	options?: { model?: Model },
+): AgentSession {
+	const listeners: Array<(event: AgentSessionEvent) => void> = [];
+	const state = { messages: [] as AssistantMessage[] };
+	let promptIndex = 0;
+
+	const emit = (event: AgentSessionEvent) => {
+		for (const listener of listeners) listener(event);
+	};
+
+	const session = {
+		state,
+		agent: { state: { systemPrompt: ["test"] } },
+		model: options?.model,
+		get messages() {
+			return state.messages;
+		},
+		extensionRunner: undefined,
+		sessionManager: {
+			appendSessionInit: () => {},
+		},
+		getActiveToolNames: () => ["read", "yield"],
+		setActiveToolsByName: async (_toolNames: string[]) => {},
+		setConfiguredModelChain: () => {},
+		seedDefaultFallbackResolution: () => {},
+		subscribe: (listener: (event: AgentSessionEvent) => void) => {
+			listeners.push(listener);
+			return () => {
+				const index = listeners.indexOf(listener);
+				if (index >= 0) listeners.splice(index, 1);
+			};
+		},
+		prompt: async (text: string, options?: PromptOptions) => {
+			promptIndex += 1;
+			onPrompt({ text, options, promptIndex, emit, state });
+		},
+		waitForIdle: async () => {},
+		getLastAssistantMessage: () => state.messages[state.messages.length - 1],
+		abort: async () => {},
+		dispose: async () => {},
+	};
+
+	return session as unknown as AgentSession;
+}
+
+function createSessionResult(session: AgentSession): CreateAgentSessionResult {
+	return {
+		session,
+		extensionsResult: {} as unknown as LoadExtensionsResult,
+		setToolUIContext: () => {},
+		eventBus: new EventBus(),
+	};
+}
+
+function mockCreateAgentSession(session: AgentSession) {
+	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+}
+
+describe("runSubprocess yield reminders", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	const baseAgent: AgentDefinition = {
+		name: "task",
+		description: "test",
+		systemPrompt: "test",
+		source: "bundled",
+	};
+
+	const baseOptions = {
+		cwd: "/tmp",
+		agent: baseAgent,
+		task: "do work",
+		index: 0,
+		id: "subagent-1",
+		settings: Settings.isolated(),
+		modelRegistry: {
+			refresh: async () => {},
+			getAvailable: () => [],
+			getApiKey: async () => kNoAuth,
+		} as unknown as import("../../src/config/model-registry").ModelRegistry,
+		enableLsp: false,
+	};
+
+	function createForkContextSeed(): ForkContextSeed {
+		return {
+			messages: [],
+			agentMessages: [],
+			metadata: {
+				sourceSessionId: "parent-session",
+				parentMessageCount: 3,
+				includedMessages: 1,
+				skippedMessages: 2,
+				approximateTokens: 64,
+				maxMessages: 5,
+				maxTokens: 100,
+				skippedReasons: {},
+			},
+		};
+	}
+
+	const model = {
+		provider: "test",
+		id: "mock",
+		name: "Mock",
+		api: "openai-responses",
+		contextWindow: 1_000,
+		maxTokens: 1_000,
+	} as Model;
+	const modelRegistry = {
+		refresh: async () => {},
+		getAvailable: () => [model],
+		getApiKey: async () => kNoAuth,
+	} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+	it("forwards fallback switches to the parent event bus", async () => {
+		const fallbackEvents: AgentSessionEvent[] = [];
+		const eventBus = new EventBus();
+		eventBus.on("task:subagent:event", payload => {
+			const event = (payload as { event: AgentSessionEvent }).event;
+			if (event.type === "model_fallback_switched") fallbackEvents.push(event);
+		});
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "model_fallback_switched",
+				eventId: "fallback-1",
+				from: "primary/model",
+				to: "fallback/model",
+				reason: "rate_limit",
+				role: "executor",
+				scope: "subagent",
+				activeIndex: 1,
+				chainLength: 2,
+				attemptsUsed: 3,
+			});
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-fallback-forwarding",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-fallback-forwarding",
+			eventBus,
+			modelOverride: "test/mock",
+			modelRegistry,
+		});
+
+		expect(fallbackEvents).toEqual([
+			expect.objectContaining({
+				type: "model_fallback_switched",
+				from: "primary/model",
+				to: "fallback/model",
+				role: "executor",
+				scope: "subagent",
+			}),
+		]);
+	});
+
+	it("keeps the fallback metadata update on the inherited job manager", async () => {
+		// Review thread P2: when this subagent emits model_fallback_switched
+		// after another top-level session has become the process-global
+		// manager, the metadata update must still go to the manager selected at
+		// dispatch — writing to AsyncJobManager.instance() would leave this
+		// session's subagent metadata stale or overwrite an unrelated same-ID
+		// record in the other session.
+		const updates: Array<{ subagentId: string; meta: Record<string, unknown> }> = [];
+		const inheritedManager = {
+			updateSubagentModel: (subagentId: string, meta: Record<string, unknown>) => updates.push({ subagentId, meta }),
+			removeLiveHandle: () => {},
+			registerLiveHandle: () => {},
+			getSubagentRecord: () => undefined,
+		} as unknown as AsyncJobManager;
+		const fallbackEvents: AgentSessionEvent[] = [];
+		const eventBus = new EventBus();
+		eventBus.on("task:subagent:event", payload => {
+			const event = (payload as { event: AgentSessionEvent }).event;
+			if (event.type === "model_fallback_switched") fallbackEvents.push(event);
+		});
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "model_fallback_switched",
+				eventId: "fallback-inherited-manager",
+				from: "primary/model",
+				to: "fallback/model",
+				reason: "rate_limit",
+				role: "executor",
+				scope: "subagent",
+				activeIndex: 1,
+				chainLength: 2,
+				attemptsUsed: 3,
+			});
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-fallback-inherited-manager",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-fallback-inherited-manager",
+			eventBus,
+			modelOverride: "test/mock",
+			modelRegistry,
+			asyncJobManager: inheritedManager,
+		});
+
+		expect(fallbackEvents).toHaveLength(1);
+		// The initial model update AND the fallback update both land on the
+		// inherited manager; the fallback one carries modelFellBack:true.
+		expect(updates.length).toBeGreaterThanOrEqual(2);
+		expect(updates.at(-1)).toMatchObject({
+			subagentId: "subagent-fallback-inherited-manager",
+			meta: expect.objectContaining({ modelFellBack: true, effectiveModel: "fallback/model" }),
+		});
+	});
+
+	it("refreshes Fast state when the active fallback model changes", async () => {
+		const primaryModel = {
+			...model,
+			provider: "custom-proxy",
+			id: "gpt-5.6-sol",
+			compat: { supportsServiceTier: true },
+		} as Model;
+		const fallbackModel = {
+			...model,
+			provider: "openrouter",
+			id: "openai/gpt-5.6-sol",
+		} as Model;
+		const session = createMockSession(
+			({ emit }) => {
+				(session as unknown as { model: Model }).model = fallbackModel;
+				emit({
+					type: "model_fallback_switched",
+					eventId: "fallback-fast-state",
+					from: "custom-proxy/gpt-5.6-sol",
+					to: "openrouter/openai/gpt-5.6-sol",
+					reason: "rate_limit",
+					role: "executor",
+					scope: "subagent",
+					activeIndex: 1,
+					chainLength: 2,
+					attemptsUsed: 1,
+				});
+				emit({
+					type: "tool_execution_end",
+					toolCallId: "tool-fallback-fast-state",
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "Result submitted." }],
+						details: { status: "success", data: { ok: true } },
+					},
+					isError: false,
+				});
+			},
+			{ model: primaryModel },
+		);
+		mockCreateAgentSession(session);
+		const fallbackRegistry = {
+			refresh: async () => {},
+			getAvailable: () => [primaryModel, fallbackModel],
+			getApiKey: async () => "sk-test",
+		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-fallback-fast-state",
+			modelOverride: "custom-proxy/gpt-5.6-sol",
+			modelRegistry: fallbackRegistry,
+			inheritedServiceTier: "priority",
+		});
+
+		expect(result.fastMode).toBe(false);
+	});
+
+	it("publishes the persisted session file for observer lifecycle and progress events", async () => {
+		const sessionFile = "/tmp/subagent-observer.jsonl";
+		const lifecycleEvents: SubagentLifecyclePayload[] = [];
+		const progressEvents: SubagentProgressPayload[] = [];
+		const eventBus = new EventBus();
+		eventBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
+			lifecycleEvents.push(payload as SubagentLifecyclePayload);
+		});
+		eventBus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, payload => {
+			progressEvents.push(payload as SubagentProgressPayload);
+		});
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-observer-session-file",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-observer-session-file",
+			eventBus,
+			sessionFile,
+		});
+
+		expect(lifecycleEvents.map(event => event.status)).toEqual(["started", "completed"]);
+		expect(lifecycleEvents.every(event => event.sessionFile === sessionFile)).toBe(true);
+		expect(progressEvents.length).toBeGreaterThan(0);
+		expect(progressEvents.every(event => event.sessionFile === sessionFile)).toBe(true);
+	});
+
+	it("clears provider retry state on the first recovered assistant event", async () => {
+		let currentEvent = "setup";
+		const progressUpdates: Array<{ event: string; progress: AgentProgress }> = [];
+		const eventBus = new EventBus();
+		const disposeProgressListener = eventBus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, payload => {
+			const progress = (payload as { progress: AgentProgress }).progress;
+			progressUpdates.push({ event: currentEvent, progress: structuredClone(progress) });
+		});
+
+		const session = createMockSession(({ emit, state }) => {
+			const recovered = { ...createAssistantStopMessage("recovered"), provider: "test", model: "mock" };
+
+			currentEvent = "auto_retry_start";
+			emit({
+				type: "auto_retry_start",
+				attempt: 1,
+				maxAttempts: 3,
+				delayMs: 10_000,
+				errorMessage: "provider stream stalled",
+			});
+			state.messages.push(recovered);
+			currentEvent = "message_start";
+			emit({ type: "message_start", message: recovered });
+			currentEvent = "auto_retry_end";
+			emit({ type: "auto_retry_end", success: true, attempt: 1 });
+			currentEvent = "tool_execution_end";
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-recovered-retry",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { recovered: true } },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-retry-recovered-event",
+			eventBus,
+			modelOverride: "test/mock",
+			modelRegistry,
+		});
+
+		const retryStartIndex = progressUpdates.findIndex(update => update.event === "auto_retry_start");
+		const recoveredIndex = progressUpdates.findIndex(update => update.event === "message_start");
+		const retryEndIndex = progressUpdates.findIndex(update => update.event === "auto_retry_end");
+		expect(retryStartIndex).toBeGreaterThanOrEqual(0);
+		expect(progressUpdates[retryStartIndex]?.progress.retryState).toMatchObject({
+			attempt: 1,
+			kind: "provider_error",
+		});
+		expect(recoveredIndex).toBeGreaterThan(retryStartIndex);
+		expect(retryEndIndex).toBeGreaterThan(recoveredIndex);
+		expect(progressUpdates[recoveredIndex]?.progress.retryState).toBeUndefined();
+		expect(result.exitCode).toBe(0);
+		disposeProgressListener();
+	});
+
+	it("only clears retries on qualifying provider activity and starts each retry with the latest fallback provider", async () => {
+		let currentEvent = "setup";
+		const progressUpdates: Array<{ event: string; progress: AgentProgress }> = [];
+		const eventBus = new EventBus();
+		const disposeProgressListener = eventBus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, payload => {
+			progressUpdates.push({
+				event: currentEvent,
+				progress: structuredClone((payload as { progress: AgentProgress }).progress),
+			});
+		});
+
+		const session = createMockSession(({ emit, state }) => {
+			const assistant = { ...createAssistantStopMessage("streaming"), provider: "test", model: "mock" };
+			const baseline = {
+				...assistant,
+				content: [{ type: "text" as const, text: "baseline" }],
+				timestamp: assistant.timestamp - 1_000,
+			};
+			const errored = { ...assistant, stopReason: "error" as const, errorMessage: "upstream failed" };
+			const update = (assistantMessageEvent: AssistantMessageEvent) =>
+				emit({ type: "message_update", message: { ...assistant }, assistantMessageEvent });
+			const retry = (attempt: number) =>
+				emit({
+					type: "auto_retry_start",
+					attempt,
+					maxAttempts: 3,
+					delayMs: 10_000,
+					errorMessage: "provider stream stalled",
+				});
+			const flush = () => emit({ type: "agent_end", messages: [], stopReason: "completed" });
+			state.messages.push(baseline);
+
+			currentEvent = "retry-1";
+			retry(1);
+			currentEvent = "baseline-replay-update";
+			emit({
+				type: "message_update",
+				message: { ...baseline },
+				assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "replay", partial: { ...baseline } },
+			});
+			flush();
+			currentEvent = "errored-assistant-start";
+			emit({ type: "message_start", message: errored });
+			flush();
+			currentEvent = "aborted-assistant-start";
+			emit({ type: "message_start", message: { ...assistant, stopReason: "aborted" } });
+			flush();
+			currentEvent = "user-start";
+			emit({ type: "message_start", message: { role: "user", content: "control", timestamp: Date.now() } });
+			flush();
+			currentEvent = "control-update";
+			update({
+				type: "toolChoiceIncapability",
+				api: "openai-responses",
+				provider: "test",
+				model: "mock",
+				requestedLevel: "required",
+				resolvedLevel: "none",
+				reason: "unsupported",
+				registryKey: "test/mock",
+			});
+			flush();
+			currentEvent = "error-update";
+			update({ type: "error", reason: "error", error: errored });
+			flush();
+			currentEvent = "malformed-update";
+			emit({
+				type: "message_update",
+				message: assistant,
+				assistantMessageEvent: { type: "text_delta" } as unknown as AssistantMessageEvent,
+			});
+			flush();
+			currentEvent = "missing-update";
+			emit({
+				type: "message_update",
+				message: { ...assistant },
+				assistantMessageEvent: undefined,
+			} as unknown as AgentSessionEvent);
+			flush();
+			currentEvent = "qualifying-update";
+			update({ type: "text_delta", contentIndex: 0, delta: "ok", partial: assistant });
+			currentEvent = "delayed-end";
+			emit({ type: "auto_retry_end", success: true, attempt: 1 });
+			currentEvent = "fallback-one";
+			emit({
+				type: "model_fallback_switched",
+				eventId: "fallback-one",
+				from: "test/mock",
+				to: "first/model",
+				reason: "rate_limit",
+				role: "executor",
+				scope: "subagent",
+				activeIndex: 1,
+				chainLength: 3,
+				attemptsUsed: 1,
+			});
+			currentEvent = "fallback-two";
+			emit({
+				type: "model_fallback_switched",
+				eventId: "fallback-two",
+				from: "first/model",
+				to: "final/model",
+				reason: "rate_limit",
+				role: "executor",
+				scope: "subagent",
+				activeIndex: 2,
+				chainLength: 3,
+				attemptsUsed: 2,
+			});
+			currentEvent = "retry-2";
+			retry(2);
+			currentEvent = "qualifying-start";
+			emit({ type: "message_start", message: { ...assistant, provider: "final", model: "model" } });
+			currentEvent = "tool_execution_end";
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "retry-qualification",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: {} },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-retry-qualification",
+			eventBus,
+			modelOverride: "test/mock",
+			modelRegistry,
+		});
+		const states = (event: string) =>
+			progressUpdates.filter(update => update.event === event).map(update => update.progress);
+		for (const event of [
+			"errored-assistant-start",
+			"aborted-assistant-start",
+			"user-start",
+			"baseline-replay-update",
+			"control-update",
+			"error-update",
+			"malformed-update",
+			"missing-update",
+		]) {
+			expect(states(event).at(-1)?.retryState).toMatchObject({ attempt: 1, provider: "test" });
+		}
+		expect(states("qualifying-update").at(-1)?.retryState).toBeUndefined();
+		expect(states("delayed-end").at(-1)?.retryState).toBeUndefined();
+		expect(states("retry-2").at(-1)?.retryState).toMatchObject({ attempt: 2, provider: "final" });
+		expect(states("qualifying-start").at(-1)?.retryState).toBeUndefined();
+		expect(result.exitCode).toBe(0);
+		disposeProgressListener();
+	});
+
+	it("attributes fallback retries to the switched model provider", async () => {
+		let currentEvent = "setup";
+		const progressUpdates: Array<{ event: string; progress: AgentProgress }> = [];
+		const eventBus = new EventBus();
+		eventBus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, payload => {
+			const progress = (payload as { progress: AgentProgress }).progress;
+			progressUpdates.push({ event: currentEvent, progress });
+		});
+
+		const session = createMockSession(({ emit, state }) => {
+			const failedProviderMessage = {
+				...createAssistantStopMessage("primary response"),
+				provider: "primary",
+				model: "model",
+			};
+			state.messages.push(failedProviderMessage);
+
+			currentEvent = "message_end";
+			emit({ type: "message_end", message: failedProviderMessage });
+			currentEvent = "model_fallback_switched";
+			emit({
+				type: "model_fallback_switched",
+				eventId: "fallback-provider-attribution",
+				from: "primary/model",
+				to: "fallback/model",
+				reason: "rate_limit",
+				role: "executor",
+				scope: "subagent",
+				activeIndex: 1,
+				chainLength: 2,
+				attemptsUsed: 1,
+			});
+			currentEvent = "auto_retry_start";
+			emit({
+				type: "auto_retry_start",
+				attempt: 1,
+				maxAttempts: 3,
+				delayMs: 10_000,
+				errorMessage: "provider rate limit",
+			});
+			currentEvent = "auto_retry_end";
+			emit({ type: "auto_retry_end", success: true, attempt: 1 });
+			currentEvent = "tool_execution_end";
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-fallback-retry",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { provider: "fallback" } },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-fallback-provider-attribution",
+			eventBus,
+		});
+
+		const retryStart = progressUpdates.find(update => update.event === "auto_retry_start");
+		expect(retryStart?.progress.retryState?.provider).toBe("fallback");
+		expect(result.exitCode).toBe(0);
+	});
+
+	it("does not count synthesized terminal message ends as provider progress", async () => {
+		let currentEvent = "setup";
+		const progressUpdates: Array<{ event: string; progress: AgentProgress }> = [];
+		const eventBus = new EventBus();
+		eventBus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, payload => {
+			progressUpdates.push({
+				event: currentEvent,
+				progress: structuredClone((payload as { progress: AgentProgress }).progress),
+			});
+		});
+		const session = createMockSession(({ emit }) => {
+			const terminal = {
+				...createAssistantStopMessage("terminal failure"),
+				provider: "test",
+				model: "mock",
+				stopReason: "error" as const,
+				errorMessage: "provider failed",
+			};
+			currentEvent = "retry-1";
+			emit({
+				type: "auto_retry_start",
+				attempt: 1,
+				maxAttempts: 3,
+				delayMs: 1_000,
+				errorMessage: "provider failed",
+			});
+			currentEvent = "terminal-start";
+			emit({ type: "message_start", message: terminal });
+			currentEvent = "terminal-end";
+			emit({ type: "message_end", message: terminal });
+			currentEvent = "cancelled-agent-end";
+			emit({ type: "agent_end", messages: [terminal], stopReason: "cancelled" });
+			currentEvent = "failed-end";
+			emit({ type: "auto_retry_end", success: false, attempt: 1, finalError: "provider failed" });
+			currentEvent = "retry-2";
+			emit({
+				type: "auto_retry_start",
+				attempt: 2,
+				maxAttempts: 3,
+				delayMs: 1_000,
+				errorMessage: "provider failed again",
+			});
+			currentEvent = "tool_execution_end";
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "terminal-progress-guard",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: {} },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-terminal-progress-guard",
+			eventBus,
+			modelOverride: "test/mock",
+			modelRegistry,
+		});
+		const secondRetry = progressUpdates.find(update => update.event === "retry-2")?.progress.retryState;
+		const cancelledRetry = progressUpdates.find(update => update.event === "cancelled-agent-end")?.progress
+			.retryState;
+		expect(cancelledRetry).toMatchObject({ attempt: 1, provider: "test" });
+		expect(secondRetry).toMatchObject({ attempt: 2, provider: "test" });
+		expect(secondRetry?.lastProviderProgressAtMs).toBeUndefined();
+		expect(result.exitCode).toBe(0);
+	});
+
+	it("waits for session_start extension user messages before prompting the subagent", async () => {
+		let extensionSendUserMessage: ExtensionActions["sendUserMessage"] | undefined;
+		let messageInFlight = false;
+		let sendStarted = false;
+
+		const session = createMockSession(({ emit }) => {
+			if (messageInFlight) {
+				throw new AgentBusyError();
+			}
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-extension-session-start",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const mutableSession = session as unknown as {
+			extensionRunner: NonNullable<AgentSession["extensionRunner"]>;
+			sendUserMessage: AgentSession["sendUserMessage"];
+		};
+		mutableSession.sendUserMessage = async () => {
+			sendStarted = true;
+			messageInFlight = true;
+			await Bun.sleep(20);
+			messageInFlight = false;
+		};
+		mutableSession.extensionRunner = {
+			initialize: (actions: ExtensionActions) => {
+				extensionSendUserMessage = actions.sendUserMessage;
+			},
+			onError: () => {},
+			emit: async (event: { type: string }) => {
+				if (event.type === "session_start") {
+					extensionSendUserMessage?.("hello from session_start", { deliverAs: "followUp" });
+				}
+				return undefined;
+			},
+		} as unknown as NonNullable<AgentSession["extensionRunner"]>;
+
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-session-start-extension",
+		});
+
+		expect(sendStarted).toBe(true);
+		expect(result.exitCode).toBe(0);
+		expect(result.error).toBeUndefined();
+	});
+
+	it("skips modelRegistry.refresh when reusing the parent registry", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-skip-refresh",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+		const modelRegistry = {
+			refresh: async () => {},
+			getAvailable: () => [],
+			getApiKey: async () => kNoAuth,
+		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+		const refreshSpy = vi.spyOn(modelRegistry, "refresh");
+
+		await runSubprocess({ ...baseOptions, id: "subagent-skip-refresh", modelRegistry });
+
+		expect(refreshSpy).not.toHaveBeenCalled();
+		expect(createAgentSessionSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps child-owned provider identity separate from the parent credential scope", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-provider-identity",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+		const authSessionIds: Array<string | undefined> = [];
+
+		await runSubprocess({
+			...baseOptions,
+			id: "3-Child",
+			subagentId: "3-Child",
+			parentSessionId: "parent-session",
+			parentCredentialSessionId: "credential-pool",
+			modelRegistry: {
+				refresh: async () => {},
+				getAvailable: () => [
+					{
+						id: "mock",
+						name: "mock",
+						provider: "openai",
+						api: "openai-responses",
+						baseUrl: "https://api.openai.com/v1",
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 128_000,
+						maxTokens: 16_384,
+					} as Model,
+				],
+				getApiKey: async (_model: Model, sessionId?: string) => {
+					authSessionIds.push(sessionId);
+					return kNoAuth;
+				},
+			} as unknown as import("../../src/config/model-registry").ModelRegistry,
+			modelOverride: "openai/mock",
+		});
+
+		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.providerSessionId).toBe(
+			JSON.stringify(["subagent-canonical", "parent-session", "3-Child"]),
+		);
+		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.credentialSessionId).toBe("credential-pool");
+		expect(authSessionIds).toEqual(["credential-pool"]);
+	});
+	it("keeps managed fork siblings on distinct canonical provider scopes", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-fork-"));
+		const retainedAuthorities: RecoveryFsRoot[] = [];
+		const retainedAuthorityCloseCounts = new Map<RecoveryFsRoot, number>();
+		const childRuns: Promise<unknown>[] = [];
+		let store: ManagedSessionDescendantStore | undefined;
+
+		try {
+			const artifactsDir = path.join(root, "artifacts");
+			store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), artifactsDir);
+			const manager = new ArtifactManager(store);
+			const retainAuthority = store.retainAuthority.bind(store);
+			vi.spyOn(store, "retainAuthority").mockImplementation(() => {
+				const authority = retainAuthority();
+				if (!authority) return undefined;
+				retainedAuthorities.push(authority);
+				const close = authority.close.bind(authority);
+				vi.spyOn(authority, "close").mockImplementation(() => {
+					retainedAuthorityCloseCounts.set(authority, (retainedAuthorityCloseCounts.get(authority) ?? 0) + 1);
+					return close();
+				});
+				return authority;
+			});
+			const createAgentSessionSpy = vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+				const session = createMockSession(({ emit }) => {
+					emit({
+						type: "tool_execution_end",
+						toolCallId: "tool-managed-fork",
+						toolName: "yield",
+						result: {
+							content: [{ type: "text", text: "Result submitted." }],
+							details: { status: "success", data: { ok: true } },
+						},
+						isError: false,
+					});
+				});
+				session.dispose = async () => {
+					await options?.sessionManager?.close();
+				};
+				return createSessionResult(session);
+			});
+			const childIds = ["4-ManagedFork", "5-ManagedFork"];
+
+			childRuns.push(
+				...childIds.map((id, index) =>
+					runSubprocess({
+						...baseOptions,
+						cwd: root,
+						index,
+						id,
+						subagentId: id,
+						parentSessionId: "parent-session",
+						forkContextSeed: createForkContextSeed(),
+						artifactsDir,
+						managedPersistence: createManagedTaskPersistence(manager, id),
+					}),
+				),
+			);
+			await Promise.all(childRuns);
+
+			// Managed siblings share a lifecycle parent but must retain distinct child provider scopes.
+			const expectedScopes = childIds.map(id => JSON.stringify(["subagent-canonical", "parent-session", id]));
+			const providerScopes = createAgentSessionSpy.mock.calls.map(([options]) => options?.providerSessionId);
+			expect(providerScopes.sort()).toEqual(expectedScopes.sort());
+			expect(retainedAuthorities).toHaveLength(childIds.length);
+			await Promise.all(childIds.map(id => fs.stat(path.join(artifactsDir, `${id}.md.selector.json`))));
+		} finally {
+			await Promise.allSettled(childRuns);
+			for (const authority of retainedAuthorities) authority.close();
+			expect(retainedAuthorityCloseCounts).toHaveLength(retainedAuthorities.length);
+			expect([...retainedAuthorityCloseCounts.values()]).toEqual(retainedAuthorities.map(() => 1));
+			store?.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("renders shared task context in subagent system prompt before now", async () => {
+		let userPrompt = "";
+		const session = createMockSession(({ text, emit }) => {
+			userPrompt = text;
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-context-system",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-context-system",
+			context: "Shared task background",
+			task: "Your assignment is below.\nBe thorough and complete fully before yielding.\n\nDo the task.",
+		});
+
+		const systemPromptBuilder = createAgentSessionSpy.mock.calls[0]?.[0]?.systemPrompt;
+		expect(systemPromptBuilder).toBeFunction();
+		if (typeof systemPromptBuilder !== "function") throw new Error("Expected system prompt builder");
+		const systemPrompt = systemPromptBuilder(["system", "project", "now"]);
+
+		expect(systemPrompt).toHaveLength(4);
+		expect(systemPrompt?.[0]).toBe("system");
+		expect(systemPrompt?.[1]).toBe("project");
+		expect(systemPrompt?.[2]).toContain("[CONTEXT]\nShared task background\n[/CONTEXT]");
+		expect(systemPrompt?.[2]).toContain("[ROLE]\ntest\n[/ROLE]");
+		expect(systemPrompt?.[3]).toBe("now");
+		expect(userPrompt).not.toContain("[CONTEXT]");
+		expect(userPrompt).not.toContain("Shared task background");
+	});
+
+	it("does not mention IRC in fork-context notice when IRC is unavailable", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-fork-context-no-irc",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-fork-context-no-irc",
+			forkContextSeed: createForkContextSeed(),
+			ircAvailable: false,
+		});
+
+		const systemPromptBuilder = createAgentSessionSpy.mock.calls[0]?.[0]?.systemPrompt;
+		expect(systemPromptBuilder).toBeFunction();
+		if (typeof systemPromptBuilder !== "function") throw new Error("Expected system prompt builder");
+		const systemPrompt = systemPromptBuilder(["system", "now"]);
+
+		expect(systemPrompt.join("\n")).toContain("forked snapshot of the parent conversation");
+		expect(systemPrompt.join("\n")).not.toContain("IRC");
+		expect(systemPrompt.join("\n")).toContain("Rely on the explicit assignment and supplied context");
+	});
+
+	it("mentions IRC in fork-context notice when IRC is available", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-fork-context-irc",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-fork-context-irc",
+			forkContextSeed: createForkContextSeed(),
+			ircAvailable: true,
+		});
+
+		const systemPromptBuilder = createAgentSessionSpy.mock.calls[0]?.[0]?.systemPrompt;
+		expect(systemPromptBuilder).toBeFunction();
+		if (typeof systemPromptBuilder !== "function") throw new Error("Expected system prompt builder");
+		const systemPrompt = systemPromptBuilder(["system", "now"]);
+
+		expect(systemPrompt.join("\n")).toContain("Use IRC for live coordination.");
+	});
+
+	it("uses the parent registry for the child session and static IRC peers", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-registry",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: {} },
+				},
+				isError: false,
+			});
+		});
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+		const parentRegistry = new AgentRegistry();
+		const otherRegistry = new AgentRegistry();
+		parentRegistry.register({ id: "0-Main", displayName: "parent", kind: "main", session: null });
+		parentRegistry.register({ id: "1-ParentPeer", displayName: "parent peer", kind: "sub", session: null });
+		otherRegistry.register({ id: "2-OtherPeer", displayName: "other peer", kind: "sub", session: null });
+
+		await runSubprocess({ ...baseOptions, id: "3-Child", ircAvailable: true, agentRegistry: parentRegistry });
+
+		const childOptions = createAgentSessionSpy.mock.calls[0]?.[0];
+		expect(childOptions?.agentRegistry).toBe(parentRegistry);
+		const systemPromptBuilder = childOptions?.systemPrompt;
+		expect(systemPromptBuilder).toBeFunction();
+		if (typeof systemPromptBuilder !== "function") throw new Error("Expected system prompt builder");
+		const systemPrompt = systemPromptBuilder(["system", "now"]).join("\n");
+		expect(systemPrompt).toContain("1-ParentPeer");
+		expect(systemPrompt).not.toContain("2-OtherPeer");
+	});
+
+	it("sends reminder prompt when subagent stops without yield", async () => {
+		const prompts: string[] = [];
+		const promptOptions: Array<PromptOptions | undefined> = [];
+		const session = createMockSession(({ text, options, promptIndex, emit, state }) => {
+			prompts.push(text);
+			promptOptions.push(options);
+			if (promptIndex === 1) {
+				const assistant = createAssistantStopMessage("did some work");
+				state.messages.push(assistant);
+				emit({ type: "message_end", message: assistant });
+				return;
+			}
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-1",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { done: true } },
+				},
+				isError: false,
+			});
+		});
+
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess(baseOptions);
+		expect(prompts.length).toBe(2);
+		expect(promptOptions).toHaveLength(2);
+		expect(promptOptions[0]?.attribution).toBe("agent");
+		expect(promptOptions[1]?.attribution).toBe("agent");
+		expect(prompts[1]).toContain("Your last turn ended without a tool call");
+		expect(result.output).toContain('"done": true');
+		expect(result.output.includes("SYSTEM WARNING")).toBe(false);
+	});
+
+	it("omits forced yield toolChoice on final retry when named forcing degrades", async () => {
+		const promptOptions: Array<PromptOptions | undefined> = [];
+		const degradedModel = {
+			provider: "anthropic",
+			api: "anthropic-messages",
+			id: "mock-no-forced",
+			name: "Mock no forced",
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			compat: { supportsForcedToolChoice: false },
+		} as Model;
+		const session = createMockSession(
+			({ options, promptIndex, emit, state }) => {
+				promptOptions.push(options);
+				const assistant = createAssistantStopMessage(`stopped ${promptIndex}`);
+				state.messages.push(assistant);
+				emit({ type: "message_end", message: assistant });
+			},
+			{ model: degradedModel },
+		);
+
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-final-degraded-yield" });
+
+		expect(promptOptions).toHaveLength(4);
+		expect(promptOptions[3]?.toolChoice).toBeUndefined();
+		expect(result.output).toContain("stopped 4");
+	});
+
+	it("keeps null yield warning when subagent submits success without data", async () => {
+		const session = createMockSession(({ promptIndex, emit, state }) => {
+			if (promptIndex === 1) {
+				const assistant = createAssistantStopMessage("partial output");
+				state.messages.push(assistant);
+				emit({ type: "message_end", message: assistant });
+				return;
+			}
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-2",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success" },
+				},
+				isError: false,
+			});
+		});
+
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-2" });
+		expect(result.output).toContain("SYSTEM WARNING: Subagent called yield with null data.");
+	});
+
+	it("retries when yield tool returns an error before succeeding", async () => {
+		const prompts: string[] = [];
+		const session = createMockSession(({ text, promptIndex, emit, state }) => {
+			prompts.push(text);
+			if (promptIndex === 1) {
+				const assistant = createAssistantStopMessage("attempted yield");
+				state.messages.push(assistant);
+				emit({ type: "message_end", message: assistant });
+				emit({
+					type: "tool_execution_end",
+					toolCallId: "tool-error",
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "Output does not match schema" }],
+						details: { status: "error", error: "Output does not match schema" },
+					},
+					isError: true,
+				});
+				return;
+			}
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-success",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-err-then-success" });
+		expect(prompts).toHaveLength(2);
+		expect(result.exitCode).toBe(0);
+		expect(result.output).toContain('"ok": true');
+	});
+	it("uses provided thinking level when model override has no explicit suffix", async () => {
+		vi.clearAllMocks();
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-thinking-fallback",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+
+		const modelRegistry = {
+			refresh: async () => {},
+			getAvailable: () => [{ provider: "openai", id: "gpt-4o", name: "GPT-4o" }],
+			getApiKey: async () => kNoAuth,
+		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-thinking-fallback",
+			modelOverride: "openai/gpt-4o",
+			thinkingLevel: Effort.High,
+			modelRegistry,
+		});
+
+		expect(createAgentSessionSpy).toHaveBeenCalledTimes(1);
+		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.thinkingLevel).toBe(Effort.High);
+	});
+
+	it("prefers explicit modelOverride thinking suffix over provided thinking level, including off", async () => {
+		vi.clearAllMocks();
+		const modelRegistry = {
+			refresh: async () => {},
+			getAvailable: () => [{ provider: "openai", id: "gpt-4o", name: "GPT-4o" }],
+			getApiKey: async () => kNoAuth,
+		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+		const cases = [
+			{ modelOverride: "openai/gpt-4o:low", expectedThinkingLevel: Effort.Low },
+			{ modelOverride: "openai/gpt-4o:off", expectedThinkingLevel: "off" },
+		] as const;
+
+		const createAgentSessionSpy = vi.spyOn(sdkModule, "createAgentSession");
+
+		for (const [index, testCase] of cases.entries()) {
+			const session = createMockSession(({ emit }) => {
+				emit({
+					type: "tool_execution_end",
+					toolCallId: `tool-thinking-override-${index}`,
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "Result submitted." }],
+						details: { status: "success", data: { ok: true } },
+					},
+					isError: false,
+				});
+			});
+
+			createAgentSessionSpy.mockResolvedValue(createSessionResult(session));
+
+			await runSubprocess({
+				...baseOptions,
+				id: `subagent-thinking-override-${index}`,
+				modelOverride: testCase.modelOverride,
+				thinkingLevel: Effort.High,
+				modelRegistry,
+			});
+		}
+
+		expect(createAgentSessionSpy).toHaveBeenCalledTimes(2);
+		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.thinkingLevel).toBe(cases[0].expectedThinkingLevel);
+		expect(createAgentSessionSpy.mock.calls[1]?.[0]?.thinkingLevel).toBe(cases[1].expectedThinkingLevel);
+	});
+	it("surfaces auth fallback model substitution and annotates session model_change", async () => {
+		vi.clearAllMocks();
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-auth-fallback",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const sessionModelChanges: Array<{
+			model: string;
+			role?: string;
+			metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null };
+		}> = [];
+		(
+			session as unknown as {
+				sessionManager: {
+					appendSessionInit: () => void;
+					appendModelChange: (
+						model: string,
+						role?: string,
+						metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null },
+					) => string;
+				};
+			}
+		).sessionManager = {
+			appendSessionInit: () => {},
+			appendModelChange: (model, role, metadata) => {
+				sessionModelChanges.push({ model, role, metadata });
+				return "model-change-id";
+			},
+		};
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+		const modelRegistry = {
+			refresh: async () => {},
+			getAvailable: () => [
+				{ provider: "openai-codex", id: "gpt-5.3-codex", name: "GPT-5.3 Codex", contextWindow: 272000 },
+				{ provider: "openai-codex", id: "gpt-5.5", name: "GPT-5.5", contextWindow: 400000 },
+			],
+			getApiKey: async (model: { id: string }) => (model.id === "gpt-5.5" ? "sk-test" : undefined),
+		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-auth-fallback-warning",
+			modelOverride: "openai-codex/gpt-5.3-codex:high",
+			parentActiveModelPattern: "openai-codex/gpt-5.5",
+			modelRegistry,
+			inheritedServiceTier: "priority",
+		});
+
+		expect(result.modelSubstitutionWarning).toEqual({
+			requested: "openai-codex/gpt-5.3-codex",
+			effective: "openai-codex/gpt-5.5",
+			reason: "auth_unavailable",
+		});
+		expect(result.fastMode).toBe(true);
+		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.model?.id).toBe("gpt-5.5");
+		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.modelSubstitution).toMatchObject({
+			reason: "auth_unavailable",
+			requestedModel: { provider: "openai-codex", id: "gpt-5.3-codex" },
+		});
+		expect(sessionModelChanges).toEqual([]);
+	});
+
+	it("reports Fast for an opted-in custom provider using the child tier snapshot", async () => {
+		vi.clearAllMocks();
+		const customModel = {
+			provider: "custom-proxy",
+			id: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol",
+			api: "openai-responses",
+			baseUrl: "https://proxy.example/v1",
+			contextWindow: 400_000,
+			maxTokens: 32_000,
+			compat: { supportsServiceTier: true },
+		} as Model;
+		const session = createMockSession(
+			({ emit }) => {
+				emit({
+					type: "tool_execution_end",
+					toolCallId: "tool-custom-fast",
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "Result submitted." }],
+						details: { status: "success", data: { ok: true } },
+					},
+					isError: false,
+				});
+			},
+			{ model: customModel },
+		);
+		mockCreateAgentSession(session);
+		const customRegistry = {
+			refresh: async () => {},
+			getAvailable: () => [customModel],
+			getApiKey: async () => "sk-test",
+		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-custom-fast",
+			modelOverride: "custom-proxy/gpt-5.6-sol",
+			modelRegistry: customRegistry,
+			inheritedServiceTier: "priority",
+		});
+
+		expect(result.fastMode).toBe(true);
+	});
+
+	it("surfaces server-side assistant model substitution evidence", async () => {
+		vi.clearAllMocks();
+		const sessionModelChanges: Array<{
+			model: string;
+			role?: string;
+			metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null };
+		}> = [];
+		const session = createMockSession(({ emit, state }) => {
+			const assistant: AssistantMessage = {
+				...createAssistantStopMessage("done"),
+				provider: "openai-codex",
+				model: "gpt-5.5",
+			};
+			state.messages.push(assistant);
+			emit({ type: "message_end", message: assistant });
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-server-substitution",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		(
+			session as unknown as {
+				sessionManager: {
+					appendSessionInit: () => void;
+					appendModelChange: (
+						model: string,
+						role?: string,
+						metadata?: { previousModel?: string; reason?: string; thinkingLevel?: string | null },
+					) => string;
+				};
+			}
+		).sessionManager = {
+			appendSessionInit: () => {},
+			appendModelChange: (model, role, metadata) => {
+				sessionModelChanges.push({ model, role, metadata });
+				return "model-change-id";
+			},
+		};
+		mockCreateAgentSession(session);
+		const modelRegistry = {
+			refresh: async () => {},
+			getAvailable: () => [
+				{ provider: "openai-codex", id: "gpt-5.3-codex", name: "GPT-5.3 Codex", contextWindow: 272000 },
+			],
+			getApiKey: async () => "sk-test",
+		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-server-substitution-warning",
+			modelOverride: "openai-codex/gpt-5.3-codex:high",
+			modelRegistry,
+		});
+
+		expect(result.modelSubstitutionWarning).toEqual({
+			requested: "openai-codex/gpt-5.3-codex",
+			effective: "openai-codex/gpt-5.5",
+			reason: "assistant_model_mismatch",
+		});
+		expect(sessionModelChanges).toEqual([
+			{
+				model: "openai-codex/gpt-5.5",
+				role: undefined,
+				metadata: {
+					previousModel: "openai-codex/gpt-5.3-codex",
+					reason: "assistant_model_mismatch",
+					thinkingLevel: Effort.High,
+				},
+			},
+		]);
+	});
+	it("fails after 3 reminders when yield is never called for a structured task", async () => {
+		const prompts: string[] = [];
+		const session = createMockSession(({ text, promptIndex, emit, state }) => {
+			prompts.push(text);
+			const assistant = createAssistantStopMessage(promptIndex === 1 ? "did work" : "still no yield");
+			state.messages.push(assistant);
+			emit({ type: "message_end", message: assistant });
+		});
+
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-3",
+			outputSchema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] },
+		});
+		expect(prompts).toHaveLength(4);
+		expect(result.exitCode).toBe(1);
+		expect(result.aborted).toBe(false);
+		expect(result.stderr).toBe(SUBAGENT_WARNING_MISSING_YIELD);
+		expect(result.abortReason).toBeUndefined();
+	});
+
+	it("surfaces abort reason when yield reports aborted status", async () => {
+		const session = createMockSession(({ promptIndex, emit, state }) => {
+			if (promptIndex === 1) {
+				const assistant = createAssistantStopMessage("cannot proceed");
+				state.messages.push(assistant);
+				emit({ type: "message_end", message: assistant });
+			}
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-abort",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Task aborted: blocked by permissions" }],
+					details: { status: "aborted", error: "blocked by permissions" },
+				},
+				isError: false,
+			});
+		});
+
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-aborted-yield" });
+		expect(result.aborted).toBe(true);
+		expect(result.abortReason).toBe("blocked by permissions");
+	});
+
+	it("marks pre-aborted subprocess with a concrete reason", async () => {
+		const abortController = new AbortController();
+		abortController.abort("caller cancelled task");
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-cancelled-before-start",
+			signal: abortController.signal,
+		});
+
+		expect(result.aborted).toBe(true);
+		expect(result.abortReason).toBe("Cancelled before start");
+		expect(result.stderr).toBe("Cancelled before start");
+	});
+	it("uses modelRegistry.authStorage when only options.modelRegistry is provided", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-registry-only",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		const createAgentSessionSpy = mockCreateAgentSession(session);
+		const fakeAuthStorage = { sentinel: "registry-storage" } as unknown as AuthStorage;
+		const modelRegistry = {
+			authStorage: fakeAuthStorage,
+			refresh: async () => {},
+			getAvailable: () => [],
+			getApiKey: async () => kNoAuth,
+		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+		await runSubprocess({ ...baseOptions, id: "subagent-registry-only", modelRegistry });
+
+		expect(createAgentSessionSpy).toHaveBeenCalledTimes(1);
+		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.authStorage).toBe(fakeAuthStorage);
+	});
+
+	it("rejects when options.authStorage and options.modelRegistry.authStorage are different instances", async () => {
+		// Mismatch fails via runSubprocess's standard catch path (exitCode=1 + stderr), not a thrown promise.
+		const createAgentSessionSpy = vi.spyOn(sdkModule, "createAgentSession");
+		const registryStorage = { sentinel: "registry" } as unknown as AuthStorage;
+		const otherStorage = { sentinel: "other" } as unknown as AuthStorage;
+		const modelRegistry = {
+			authStorage: registryStorage,
+			refresh: async () => {},
+			getAvailable: () => [],
+			getApiKey: async () => kNoAuth,
+		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-mismatch",
+			authStorage: otherStorage,
+			modelRegistry,
+		});
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toMatch(/options\.authStorage.*modelRegistry\.authStorage/);
+		expect(createAgentSessionSpy).not.toHaveBeenCalled();
+	});
+});
+
+describe("runSubprocess telemetry propagation", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	const baseAgent: AgentDefinition = {
+		name: "reviewer",
+		description: "code review specialist",
+		systemPrompt: "you are a reviewer",
+		source: "bundled",
+	};
+
+	const baseOptions = {
+		cwd: "/tmp",
+		agent: baseAgent,
+		task: "do work",
+		index: 0,
+		id: "subagent-telemetry",
+		settings: Settings.isolated(),
+		modelRegistry: {
+			refresh: async () => {},
+			getAvailable: () => [],
+			getApiKey: async () => kNoAuth,
+		} as unknown as import("../../src/config/model-registry").ModelRegistry,
+		enableLsp: false,
+	};
+
+	function buildSession() {
+		return createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-telemetry",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+	}
+
+	it("derives subagent telemetry from parent: keeps tracer/hooks, swaps agent identity, clears conversationId", async () => {
+		const createAgentSessionSpy = mockCreateAgentSession(buildSession());
+		const onSpanStart = () => {};
+		const onSpanEnd = () => {};
+		const costEstimator = () => undefined;
+		const tracer = { startSpan: () => undefined } as unknown as Tracer;
+		const parentTelemetry: AgentTelemetryConfig = {
+			tracer,
+			captureMessageContent: true,
+			attributes: { "deployment.id": "prod" },
+			agent: { id: "0-Main", name: "main", description: "primary agent" },
+			conversationId: "parent-conversation",
+			onSpanStart,
+			onSpanEnd,
+			costEstimator,
+		};
+
+		await runSubprocess({ ...baseOptions, id: "subagent-telemetry-derive", parentTelemetry });
+
+		expect(createAgentSessionSpy).toHaveBeenCalledTimes(1);
+		const forwarded = createAgentSessionSpy.mock.calls[0]?.[0]?.telemetry;
+		expect(forwarded).toBeDefined();
+		if (!forwarded) throw new Error("expected telemetry on createAgentSession call");
+		expect(forwarded.tracer).toBe(tracer);
+		expect(forwarded.captureMessageContent).toBe(true);
+		expect(forwarded.attributes).toEqual({ "deployment.id": "prod" });
+		expect(forwarded.onSpanStart).toBe(onSpanStart);
+		expect(forwarded.onSpanEnd).toBe(onSpanEnd);
+		expect(forwarded.costEstimator).toBe(costEstimator);
+		expect(forwarded.agent).toEqual({
+			id: "subagent-telemetry-derive",
+			name: baseAgent.name,
+			description: baseAgent.description,
+		});
+		// Child loop falls back to its own session id for gen_ai.conversation.id.
+		expect(forwarded.conversationId).toBeUndefined();
+	});
+
+	it("propagates a terminal local_buffer_overflow into localErrorSummary from the structured shape (#4618)", async () => {
+		// Free-form message deliberately carries marker text: the summary must
+		// be built from the structured shape only, never from this string.
+		const marker = "SECRET-PROMPT-MATERIAL-must-not-reach-receipt";
+		const session = createMockSession(({ state }) => {
+			state.messages.push({
+				...createAssistantStopMessage(""),
+				stopReason: "error",
+				errorMessage: `Managed fallback attempt exceeded the provisional event buffer limit ... ${marker}`,
+				errorKind: "local_buffer_overflow",
+				bufferOverflow: {
+					stage: "overflow.staged",
+					exceeded: "bytes",
+					stagedEventCount: 9000,
+					stagedBytes: 4194304,
+					incomingEventBytes: 16777216,
+					maxStagedEvents: 10_000,
+					maxStagedBytes: 16 * 1024 * 1024,
+				},
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-overflow-propagation" });
+
+		expect(result.exitCode).toBe(1);
+		expect(result.localErrorSummary).toMatchObject({
+			kind: "local_buffer_overflow",
+		});
+		expect(result.localErrorSummary?.summary).toContain("overflow.staged");
+		expect(result.localErrorSummary?.summary).toContain("exceeded=bytes");
+		expect(result.localErrorSummary?.summary).toContain("9000/10000 events");
+		expect(result.localErrorSummary?.summary).toContain("not a provider or context-window failure");
+		// Trust boundary: free-form message text never reaches the summary.
+		expect(result.localErrorSummary?.summary).not.toContain(marker);
+	});
+
+	it("degrades a self-labeled overflow without the structured shape to a neutral summary (#4618)", async () => {
+		const marker = "FORGED-TEXT-must-not-reach-parent";
+		const session = createMockSession(({ state }) => {
+			state.messages.push({
+				...createAssistantStopMessage(""),
+				stopReason: "error",
+				errorMessage: `local_buffer_overflow: ${marker}`,
+				// Self-labeled kind WITHOUT the identity-checked shape.
+				errorKind: "local_buffer_overflow",
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-forged-overflow-kind" });
+
+		expect(result.exitCode).toBe(1);
+		expect(result.localErrorSummary?.kind).toBe("local_buffer_overflow");
+		// Neutral sentence only: the forged message text is not forwarded.
+		expect(result.localErrorSummary?.summary).not.toContain(marker);
+		expect(result.localErrorSummary?.summary).toContain("structured diagnostic unavailable");
+	});
+
+	it("rejects a foreign shape with free-form stage, string counters, or inconsistent caps (#4618)", async () => {
+		const marker = "PROMPT-MATERIAL-must-not-reach-parent";
+		// Deliberately invalid runtime shapes (the point of the test), so the
+		// array is typed as the public field while the literals stay hostile.
+		const forgedShapes = [
+			// Free-form stage carrying arbitrary text.
+			{
+				stage: marker,
+				exceeded: "bytes",
+				stagedEventCount: 1,
+				stagedBytes: 0,
+				incomingEventBytes: 16_777_217,
+				maxStagedEvents: 10_000,
+				maxStagedBytes: 16 * 1024 * 1024,
+			},
+			// Nominally-numeric fields as strings.
+			{
+				stage: "overflow.staged",
+				exceeded: "bytes",
+				stagedEventCount: "9000",
+				stagedBytes: 0,
+				incomingEventBytes: 16_777_217,
+				maxStagedEvents: 10_000,
+				maxStagedBytes: 16 * 1024 * 1024,
+			},
+			// Free-form exceeded discriminator.
+			{
+				stage: "overflow.staged",
+				exceeded: marker,
+				stagedEventCount: 1,
+				stagedBytes: 0,
+				incomingEventBytes: 16_777_217,
+				maxStagedEvents: 10_000,
+				maxStagedBytes: 16 * 1024 * 1024,
+			},
+			// Internally inconsistent: claims bytes exceeded but the projection fits.
+			{
+				stage: "overflow.staged",
+				exceeded: "bytes",
+				stagedEventCount: 1,
+				stagedBytes: 100,
+				incomingEventBytes: 200,
+				maxStagedEvents: 10_000,
+				maxStagedBytes: 16 * 1024 * 1024,
+			},
+			// Negative counter.
+			{
+				stage: "overflow.staged",
+				exceeded: "events",
+				stagedEventCount: -1,
+				stagedBytes: 0,
+				incomingEventBytes: 1,
+				maxStagedEvents: 10_000,
+				maxStagedBytes: 16 * 1024 * 1024,
+			},
+		] as unknown as Array<AssistantMessage["bufferOverflow"]>;
+		for (const [index, bufferOverflow] of forgedShapes.entries()) {
+			const session = createMockSession(({ state }) => {
+				state.messages.push({
+					...createAssistantStopMessage(""),
+					stopReason: "error",
+					errorMessage: `cover ${marker} text`,
+					errorKind: "local_buffer_overflow",
+					bufferOverflow,
+				});
+			});
+			mockCreateAgentSession(session);
+
+			const result = await runSubprocess({ ...baseOptions, id: `subagent-forged-shape-${index}` });
+
+			expect(result.exitCode).toBe(1);
+			// Validation rejected the shape: fixed neutral sentence, no marker.
+			expect(result.localErrorSummary?.summary).toBe(
+				"Local staging-buffer overflow; structured diagnostic unavailable.",
+			);
+			expect(result.localErrorSummary?.summary).not.toContain(marker);
+		}
+	});
+
+	it("uses the fixed snapshot-failure sentence instead of forwarding free-form message text (#4618)", async () => {
+		const marker = "SNAPSHOT-FAILURE-must-not-reach-parent";
+		const session = createMockSession(({ state }) => {
+			state.messages.push({
+				...createAssistantStopMessage(""),
+				stopReason: "error",
+				errorMessage: `local snapshot failure: ${marker}`,
+				errorKind: "local_snapshot_failure",
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-snapshot-failure-fixed" });
+
+		expect(result.exitCode).toBe(1);
+		expect(result.localErrorSummary?.kind).toBe("local_snapshot_failure");
+		expect(result.localErrorSummary?.summary).toContain("serializable event snapshot");
+		expect(result.localErrorSummary?.summary).not.toContain(marker);
+	});
+
+	it("keeps a forged local errorKind out of the receipt when the runtime never produced one (#4618)", async () => {
+		// The agent runtime strips `errorKind` from any terminal message it did
+		// not itself produce from an identity-checked local error, so a provider
+		// failure never arrives here labeled local. Pin the executor's behavior
+		// for that contract: no local summary, ordinary provider error text.
+		const session = createMockSession(({ state }) => {
+			state.messages.push({
+				...createAssistantStopMessage(""),
+				stopReason: "error",
+				errorMessage: "upstream stream terminated unexpectedly",
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-unlabeled-provider-error" });
+		const receipt = buildTaskReceipt(result);
+
+		expect(result.localErrorSummary).toBeUndefined();
+		expect(receipt.preview).not.toContain("local failure");
+		expect(receipt.preview).not.toContain("staging-buffer");
+	});
+
+	it("keeps localErrorSummary undefined for an ordinary provider error (#4618 fallback isolation)", async () => {
+		const session = createMockSession(({ state }) => {
+			state.messages.push({
+				...createAssistantStopMessage(""),
+				stopReason: "error",
+				errorMessage: "500 Internal Server Error",
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-ordinary-error" });
+
+		expect(result.exitCode).toBe(1);
+		expect(result.localErrorSummary).toBeUndefined();
+		expect(result.error).toBe("500 Internal Server Error");
+	});
+
+	it("forwards no telemetry when the parent has none", async () => {
+		const createAgentSessionSpy = mockCreateAgentSession(buildSession());
+
+		await runSubprocess({ ...baseOptions, id: "subagent-telemetry-none" });
+
+		expect(createAgentSessionSpy).toHaveBeenCalledTimes(1);
+		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.telemetry).toBeUndefined();
+	});
+});

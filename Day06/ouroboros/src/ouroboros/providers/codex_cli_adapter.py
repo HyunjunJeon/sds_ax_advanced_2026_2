@@ -1,0 +1,1409 @@
+"""Codex CLI adapter for LLM completion using local Codex authentication.
+
+This adapter shells out to `codex exec` in non-interactive mode, allowing
+Ouroboros to use a local Codex CLI session for single-turn completion tasks
+without requiring an API key.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
+import contextlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+import tomllib
+from typing import Any
+
+import structlog
+
+from ouroboros.codex.cli_policy import (
+    DEFAULT_CODEX_CHILD_SESSION_ENV_KEYS,
+    DEFAULT_MAX_OUROBOROS_DEPTH,
+    build_codex_child_env,
+    resolve_codex_cli_path,
+)
+from ouroboros.codex.home import resolve_codex_home
+from ouroboros.codex.runtime_profile import codex_uses_profile_v2, resolve_codex_profile
+from ouroboros.codex_permissions import (
+    build_codex_exec_permission_args,
+    resolve_codex_permission_mode,
+)
+from ouroboros.config import get_codex_cli_path
+from ouroboros.core.errors import ProviderError
+from ouroboros.core.retry import BASE_TRANSIENT_PATTERNS, is_transient_error
+from ouroboros.core.types import Result
+from ouroboros.providers.base import (
+    CompletionConfig,
+    CompletionResponse,
+    Message,
+    MessageRole,
+    UsageInfo,
+)
+from ouroboros.providers.codex_cli_stream import RuntimeStreamMixin, collect_stream_lines
+from ouroboros.providers.llm_response import truncate_llm_response_if_oversized
+from ouroboros.providers.profiles import resolve_completion_profile_result
+
+log = structlog.get_logger()
+
+_SAFE_MODEL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_./:@-]+$")
+_CODEX_REASONING_EFFORT_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
+
+
+# Codex shares the canonical transient core verbatim — its previous local copy
+# (rate/temporarily/timeout/overloaded/try-again/connection) was a strict subset,
+# so adopting the shared tuple only *adds* the missing common signals
+# (concurrency, 429, 5xx, bare "connection") without dropping any prior match.
+_RETRYABLE_ERROR_PATTERNS = BASE_TRANSIENT_PATTERNS
+
+_CODEX_AUTH_FAILURE_PATTERNS = (
+    "missing bearer or basic authentication",
+    "401 unauthorized",
+    "unauthorized",
+    "invalid api key",
+    "no api key",
+    "missing api key",
+    "invalid bearer token",
+)
+
+# A bare auth phrase ("401 unauthorized", "unauthorized") is ambiguous —
+# nested tools or MCP services routed through the same ``error`` /
+# ``turn.failed`` channel can surface their own 401s without involving Codex
+# auth at all. To avoid sending operators to inspect ``CODEX_HOME/auth.json``
+# for an unrelated failure, classification additionally requires that the
+# error mention a Codex/OpenAI-specific marker below.
+_CODEX_PROVIDER_MARKERS = (
+    "api.openai.com",
+    "openai.com",
+    "codex",
+)
+_OPENAI_RESPONSES_ENDPOINT = "api.openai.com/v1/responses"
+
+
+def _deep_merge_config_mappings(
+    base: Mapping[str, object] | None,
+    overlay: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Merge one Codex config layer onto another without mutating either.
+
+    Codex profile-v2 files layer nested tables recursively over ``config.toml``.
+    Reproducing that behavior here is necessary because MCP transport fields can
+    be split across the base and selected profile files.
+    """
+    merged = dict(base or {})
+    if overlay is None:
+        return merged
+
+    for key, overlay_value in overlay.items():
+        base_value = merged.get(key)
+        if isinstance(base_value, dict) and isinstance(overlay_value, dict):
+            merged[key] = _deep_merge_config_mappings(base_value, overlay_value)
+        else:
+            merged[key] = overlay_value
+    return merged
+
+
+class CodexCliLLMAdapter(RuntimeStreamMixin):
+    """LLM adapter backed by local Codex CLI execution.
+
+    Streaming progress callback contract (``on_message``):
+
+    The callable receives ``(message_type, content)`` tuples derived from the
+    Codex JSONL stream. ``message_type`` is one of:
+
+    - ``"thinking"`` — agent reasoning, summaries, or to-do lists. Emitted
+      only on completion (started reasoning is suppressed to reduce noise).
+    - ``"tool_started"`` — a tool/MCP/file-change/web-search call has begun
+      executing. Useful for chat or terminal renderers that want to show
+      in-flight progress before completion. New in 0.34+.
+    - ``"tool"`` — a tool call has finished and the adapter has the
+      completed item information. Always emitted for tool-like items
+      regardless of whether ``"tool_started"`` was seen.
+
+    Consumers that switch on ``message_type`` should ignore unknown kinds to
+    stay forward-compatible with future categories.
+    """
+
+    _provider_name = "codex_cli"
+    _display_name = "Codex CLI"
+    _default_cli_name = "codex"
+    _tempfile_prefix = "ouroboros-codex-llm-"
+    _schema_tempfile_prefix = "ouroboros-codex-schema-"
+    _process_shutdown_timeout_seconds = 5.0
+    _log_namespace = "codex_cli_adapter"
+    _max_ouroboros_depth = DEFAULT_MAX_OUROBOROS_DEPTH
+    _child_session_env_keys = DEFAULT_CODEX_CHILD_SESSION_ENV_KEYS
+    _completion_profile_backend = "codex"
+
+    def _stream_provider_name(self) -> str:
+        return "codex_cli"
+
+    def _stream_line_collector(self) -> Callable[..., Awaitable[list[str]]]:
+        return collect_stream_lines
+
+    def __init__(
+        self,
+        *,
+        cli_path: str | Path | None = None,
+        cwd: str | Path | None = None,
+        permission_mode: str | None = None,
+        allowed_tools: list[str] | None = None,
+        max_turns: int = 1,
+        on_message: Callable[[str, str], None] | None = None,
+        max_retries: int = 3,
+        ephemeral: bool = True,
+        timeout: float | None = None,
+        runtime_profile: str | None = None,
+        strict_mcp_config: bool = False,
+    ) -> None:
+        self._cli_path = self._resolve_cli_path(cli_path)
+        self._cwd = str(Path(cwd).expanduser()) if cwd is not None else os.getcwd()
+        self._permission_mode = self._resolve_permission_mode(permission_mode)
+        self._allowed_tools = list(allowed_tools) if allowed_tools is not None else None
+        self._max_turns = max_turns
+        self._on_message = on_message
+        self._max_retries = max_retries
+        self._ephemeral = ephemeral
+        self._timeout = timeout if timeout and timeout > 0 else None
+        self._runtime_profile = runtime_profile
+        self._strict_mcp_config = bool(strict_mcp_config)
+        self._codex_profile = resolve_codex_profile(
+            runtime_profile,
+            logger=log,
+            log_namespace=self._log_namespace,
+        )
+
+    def _resolve_permission_mode(self, permission_mode: str | None) -> str:
+        """Validate and normalize the adapter permission mode."""
+        return resolve_codex_permission_mode(permission_mode, default_mode="default")
+
+    def _build_permission_args(self) -> list[str]:
+        """Translate the configured permission mode into backend CLI flags."""
+        return build_codex_exec_permission_args(
+            self._permission_mode,
+            default_mode="default",
+            source=f"{self._log_namespace}.llm_adapter",
+        )
+
+    @staticmethod
+    def _mapping_has_effective_ouroboros_mcp(config: object) -> bool:
+        """Return whether parsed Codex config declares a usable enabled transport."""
+        if not isinstance(config, dict):
+            return False
+        mcp_servers = config.get("mcp_servers")
+        if not isinstance(mcp_servers, dict):
+            return False
+        ouroboros = mcp_servers.get("ouroboros")
+        if not isinstance(ouroboros, dict):
+            return False
+
+        enabled = ouroboros.get("enabled", True)
+        if not isinstance(enabled, bool) or not enabled:
+            return False
+        return any(
+            isinstance(ouroboros.get(key), str) and bool(ouroboros[key].strip())
+            for key in ("command", "url")
+        )
+
+    @staticmethod
+    def _read_config_mapping(path: Path) -> dict[str, object] | None:
+        """Read one Codex config layer without treating malformed state as effective."""
+        try:
+            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            return None
+        return parsed
+
+    def _has_effective_ouroboros_mcp(self, *, active_profile: str | None) -> bool:
+        """Inspect only config layers reachable by this exact Codex child command."""
+        codex_home = resolve_codex_home()
+        base_config = self._read_config_mapping(codex_home / "config.toml")
+        base_has_mcp = self._mapping_has_effective_ouroboros_mcp(base_config)
+
+        if not active_profile:
+            return base_has_mcp
+        uses_profile_v2 = codex_uses_profile_v2(self._cli_path)
+        if uses_profile_v2 is False:
+            # Split-mode Codex selects [profiles.<name>] for profile options,
+            # but it does not promote a nested mcp_servers table into the
+            # effective top-level MCP namespace. Only the base transport,
+            # checked above, is reachable in this mode.
+            return base_has_mcp
+
+        profile_filename = f"{active_profile}.config.toml"
+        if Path(profile_filename).name != profile_filename:
+            return base_has_mcp
+        profile_config = self._read_config_mapping(codex_home / profile_filename)
+        effective_profile_config = _deep_merge_config_mappings(base_config, profile_config)
+        profile_v2_has_mcp = self._mapping_has_effective_ouroboros_mcp(effective_profile_config)
+        if uses_profile_v2 is None and profile_v2_has_mcp and not base_has_mcp:
+            raise ProviderError(
+                message=(
+                    "Cannot guarantee strict MCP isolation because the Codex "
+                    "--profile contract could not be detected"
+                ),
+                provider=self._provider_name,
+                details={
+                    "cli_path": self._cli_path,
+                    "profile": active_profile,
+                    "profile_config": str(codex_home / profile_filename),
+                },
+            )
+        if uses_profile_v2 is None:
+            # If the base transport is already effective, the transient
+            # ``enabled=false`` override is safe in either selector mode. A
+            # profile-v2 layer may disable it, but the redundant override does
+            # not synthesize a new transport or mutate user configuration.
+            return base_has_mcp
+        return profile_v2_has_mcp
+
+    def _get_configured_cli_path(self) -> str | None:
+        """Resolve an explicit CLI path from config helpers when available."""
+        return get_codex_cli_path()
+
+    def _resolve_cli_path(self, cli_path: str | Path | None) -> str:
+        """Resolve Codex CLI path from explicit path, config, or PATH."""
+        resolution = resolve_codex_cli_path(
+            explicit_cli_path=cli_path,
+            configured_cli_path=self._get_configured_cli_path(),
+            default_cli_name=self._default_cli_name,
+            logger=log,
+            log_namespace=self._log_namespace,
+        )
+        return resolution.cli_path
+
+    def _normalize_model(self, model: str) -> str | None:
+        """Normalize a model name for Codex CLI.
+
+        Raises:
+            ValueError: If *model* contains characters outside the safe set.
+        """
+        candidate = model.strip()
+        if not candidate or candidate == "default":
+            return None
+        if not _SAFE_MODEL_NAME_PATTERN.match(candidate):
+            msg = f"Unsafe model name rejected: {candidate!r}"
+            raise ValueError(msg)
+        return candidate
+
+    def _build_prompt(self, messages: list[Message], *, max_turns: int | None = None) -> str:
+        """Build a plain-text prompt from conversation messages."""
+        parts: list[str] = []
+        effective_max_turns = max_turns if max_turns is not None else self._max_turns
+
+        system_messages = [
+            message.content for message in messages if message.role == MessageRole.SYSTEM
+        ]
+        if system_messages:
+            parts.append("## System Instructions")
+            parts.append("\n\n".join(system_messages))
+
+        if self._allowed_tools:
+            parts.append("## Tool Constraints")
+            parts.append(
+                "If you need tools, prefer using only the following tools:\n"
+                + "\n".join(f"- {tool}" for tool in self._allowed_tools)
+            )
+        elif self._allowed_tools is not None:
+            # Explicit empty list means no tools allowed — text-only response
+            parts.append("## Tool Constraints")
+            parts.append("Do NOT use any tools or MCP calls. Respond with plain text only.")
+
+        if effective_max_turns > 0:
+            parts.append("## Execution Budget")
+            if self._allowed_tools == []:
+                parts.append(
+                    "Answer directly in plain text and avoid turning this into a "
+                    "multi-step tool workflow."
+                )
+            else:
+                parts.append(
+                    f"Keep the work within at most {effective_max_turns} tool-assisted turns if possible."
+                )
+
+        for message in messages:
+            if message.role == MessageRole.SYSTEM:
+                continue
+            role = "User" if message.role == MessageRole.USER else "Assistant"
+            parts.append(f"{role}: {message.content}")
+
+        parts.append("Please respond to the above conversation.")
+        return "\n\n".join(part for part in parts if part.strip())
+
+    def _build_output_schema(
+        self,
+        response_format: dict[str, object] | None,
+    ) -> tuple[dict[str, object] | None, tuple[tuple[str, ...], ...]]:
+        """Build a Codex-compatible JSON Schema payload and response transforms."""
+        if not response_format:
+            return None, ()
+
+        schema_type = response_format.get("type")
+        if schema_type == "json_schema":
+            schema = response_format.get("json_schema")
+            if not isinstance(schema, dict):
+                return None, ()
+            normalized_schema, map_paths = self._normalize_schema_for_codex(schema)
+            return normalized_schema, tuple(map_paths)
+        if schema_type == "json_object":
+            log.warning(
+                "codex_cli_adapter.json_object_unstructured_fallback",
+                reason="codex_output_schema_requires_strict_object_shapes",
+            )
+            return None, ()
+        return None, ()
+
+    def _normalize_schema_for_codex(
+        self,
+        schema: dict[str, Any],
+        *,
+        path: tuple[str, ...] = (),
+    ) -> tuple[dict[str, object], list[tuple[str, ...]]]:
+        """Normalize generic JSON Schema into the stricter Codex CLI subset.
+
+        Codex requires object schemas to declare ``required`` for every
+        property and to set ``additionalProperties`` to ``false``. Generic
+        open-map objects are therefore rewritten into arrays of
+        ``{key, value}`` entries and restored after completion.
+        """
+        normalized: dict[str, object] = {
+            key: value
+            for key, value in schema.items()
+            if key not in {"properties", "required", "additionalProperties", "items"}
+        }
+        map_paths: list[tuple[str, ...]] = []
+
+        schema_type = normalized.get("type")
+        if schema_type == "object":
+            properties = schema.get("properties")
+            if isinstance(properties, dict):
+                normalized_properties: dict[str, object] = {}
+                for key, value in properties.items():
+                    if isinstance(value, dict):
+                        child_schema, child_map_paths = self._normalize_schema_for_codex(
+                            value,
+                            path=(*path, key),
+                        )
+                        normalized_properties[key] = child_schema
+                        map_paths.extend(child_map_paths)
+                    else:
+                        normalized_properties[key] = value
+
+                normalized["properties"] = normalized_properties
+                normalized["required"] = list(normalized_properties.keys())
+                normalized["additionalProperties"] = False
+                return normalized, map_paths
+
+            additional_properties = schema.get("additionalProperties")
+            if isinstance(additional_properties, dict):
+                value_schema, _ = self._normalize_schema_for_codex(additional_properties)
+                map_paths.append(path)
+                return (
+                    {
+                        "type": "array",
+                        "description": normalized.get("description"),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "key": {"type": "string"},
+                                "value": value_schema,
+                            },
+                            "required": ["key", "value"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    map_paths,
+                )
+
+            normalized["properties"] = {}
+            normalized["required"] = []
+            normalized["additionalProperties"] = False
+            return normalized, map_paths
+
+        if schema_type == "array":
+            items = schema.get("items")
+            if isinstance(items, dict):
+                normalized_items, child_map_paths = self._normalize_schema_for_codex(
+                    items,
+                    path=(*path, "*"),
+                )
+                normalized["items"] = normalized_items
+                map_paths.extend(child_map_paths)
+            elif items is not None:
+                normalized["items"] = items
+
+        return normalized, map_paths
+
+    def _restore_schema_transforms(
+        self,
+        content: str,
+        map_paths: tuple[tuple[str, ...], ...],
+    ) -> str:
+        """Restore backend-specific schema rewrites back into the original shape."""
+        if not map_paths:
+            return content
+
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            return content
+
+        restored = payload
+        for path in sorted(map_paths, key=len, reverse=True):
+            restored = self._restore_map_entries(restored, path)
+
+        try:
+            return json.dumps(restored, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return content
+
+    def _restore_map_entries(
+        self,
+        node: object,
+        path: tuple[str, ...],
+    ) -> object:
+        """Convert entry-array payloads back into ``{key: value}`` maps."""
+        if not path:
+            return self._entries_array_to_object(node)
+
+        head, *tail = path
+        remaining = tuple(tail)
+        if head == "*":
+            if not isinstance(node, list):
+                return node
+            return [self._restore_map_entries(item, remaining) for item in node]
+
+        if not isinstance(node, dict) or head not in node:
+            return node
+
+        restored = dict(node)
+        restored[head] = self._restore_map_entries(restored[head], remaining)
+        return restored
+
+    @staticmethod
+    def _entries_array_to_object(value: object) -> object:
+        """Convert ``[{key, value}, ...]`` into ``{key: value, ...}`` when possible."""
+        if not isinstance(value, list):
+            return value
+
+        result: dict[str, object] = {}
+        for item in value:
+            if not isinstance(item, dict):
+                return value
+            key = item.get("key")
+            if not isinstance(key, str) or "value" not in item:
+                return value
+            result[key] = item["value"]
+        return result
+
+    def _build_command(
+        self,
+        *,
+        output_last_message_path: str,
+        output_schema_path: str | None,
+        model: str | None,
+        profile: str | None = None,
+        reasoning_effort: str | None = None,
+        prompt: str | None = None,
+    ) -> list[str]:
+        """Build the `codex exec` command for a one-shot completion.
+
+        The prompt is always fed via stdin to avoid ARG_MAX limits.
+        """
+        command = [self._cli_path, "exec"]
+        active_profile = self._codex_profile or profile
+        # Codex has one --profile selector. Runtime-profile worker isolation
+        # owns that flag when configured; task-profile resolution may still
+        # contribute a --model fallback, but must not emit a competing profile.
+        if self._codex_profile:
+            command.extend(["--profile", self._codex_profile])
+        command.extend(
+            [
+                "--json",
+                "--skip-git-repo-check",
+                "-C",
+                self._cwd,
+                "--output-last-message",
+                output_last_message_path,
+            ]
+        )
+
+        command.extend(self._build_permission_args())
+
+        if self._strict_mcp_config and self._has_effective_ouroboros_mcp(
+            active_profile=active_profile
+        ):
+            command.extend(["-c", "mcp_servers.ouroboros.enabled=false"])
+
+        if self._ephemeral:
+            command.append("--ephemeral")
+
+        if output_schema_path:
+            command.extend(["--output-schema", output_schema_path])
+
+        if reasoning_effort in _CODEX_REASONING_EFFORT_LEVELS:
+            command.extend(["-c", f"model_reasoning_effort={reasoning_effort}"])
+
+        if profile and not self._codex_profile:
+            command.extend(["--profile", profile])
+        elif model:
+            command.extend(["--model", model])
+
+        return command
+
+    def _parse_json_event(self, line: str) -> dict[str, Any] | None:
+        """Parse a JSONL event line, returning None for non-JSON output."""
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+
+        return event if isinstance(event, dict) else None
+
+    def _extract_text(self, value: object) -> str:
+        """Extract text recursively from a nested JSON-like structure."""
+        if isinstance(value, str):
+            return value.strip()
+
+        if isinstance(value, list):
+            parts = [self._extract_text(item) for item in value]
+            return "\n".join(part for part in parts if part)
+
+        if isinstance(value, dict):
+            preferred_keys = (
+                "text",
+                "message",
+                "output_text",
+                "content",
+                "summary",
+                "details",
+                "command",
+            )
+            dict_parts: list[str] = []
+            for key in preferred_keys:
+                if key in value:
+                    text = self._extract_text(value[key])
+                    if text:
+                        dict_parts.append(text)
+            if dict_parts:
+                return "\n".join(dict_parts)
+
+            # Shallow fallback: collect only top-level string values to avoid
+            # recursive data leakage while still capturing non-standard keys.
+            shallow_parts = [v.strip() for v in value.values() if isinstance(v, str) and v.strip()]
+            return "\n".join(shallow_parts)
+
+        return ""
+
+    def _extract_session_id(self, stdout_lines: list[str]) -> str | None:
+        """Extract a Codex thread id from JSONL stdout."""
+        for line in stdout_lines:
+            event = self._parse_json_event(line)
+            if not event:
+                continue
+            if event.get("type") == "thread.started" and isinstance(event.get("thread_id"), str):
+                return event["thread_id"]
+        return None
+
+    def _extract_session_id_from_event(self, event: dict[str, Any]) -> str | None:
+        """Extract a Codex thread id from a single runtime event."""
+        if event.get("type") == "thread.started" and isinstance(event.get("thread_id"), str):
+            return event["thread_id"]
+        return None
+
+    def _extract_tool_input(self, item: dict[str, Any]) -> dict[str, Any]:
+        """Extract tool input payload from a Codex event item."""
+        for key in ("input", "arguments", "args"):
+            candidate = item.get(key)
+            if isinstance(candidate, dict):
+                return candidate
+        return {}
+
+    def _extract_path(self, item: dict[str, Any]) -> str:
+        """Extract a file path from a file change event."""
+        candidates: list[object] = [
+            item.get("path"),
+            item.get("file_path"),
+            item.get("target_file"),
+        ]
+
+        if isinstance(item.get("changes"), list):
+            for change in item["changes"]:
+                if isinstance(change, dict):
+                    candidates.extend(
+                        [
+                            change.get("path"),
+                            change.get("file_path"),
+                        ]
+                    )
+
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return ""
+
+    @staticmethod
+    def _redact_env_presence(value: str | None) -> bool:
+        """Return presence without exposing secret material in error details."""
+        return bool(value and value.strip())
+
+    @staticmethod
+    def _path_exists(value: str | None, child: str | None = None) -> bool:
+        """Return whether an env-backed path exists without raising."""
+        if not value:
+            return False
+        path = Path(value).expanduser()
+        if child:
+            path = path / child
+        return path.exists()
+
+    @classmethod
+    def _codex_auth_context(cls) -> dict[str, object]:
+        """Return non-secret Codex auth-plane diagnostics for nested CLI failures."""
+        codex_home = os.environ.get("CODEX_HOME")
+        home = os.environ.get("HOME")
+        auth_base = codex_home or (str(Path(home).expanduser() / ".codex") if home else None)
+        return {
+            "codex_home": codex_home or "",
+            "home": home or "",
+            "codex_auth_json_exists": cls._path_exists(auth_base, "auth.json"),
+            "codex_config_toml_exists": cls._path_exists(auth_base, "config.toml"),
+            "openai_api_key_present": cls._redact_env_presence(os.environ.get("OPENAI_API_KEY")),
+        }
+
+    @staticmethod
+    def _looks_like_codex_auth_failure(message: str) -> bool:
+        """Identify Codex/OpenAI auth failures that are otherwise opaque 401s.
+
+        Requires BOTH an auth-related phrase AND a Codex/OpenAI-specific
+        provider marker. Without the marker, generic 401s from nested tool
+        or MCP calls would be misclassified as Codex auth-plane failures
+        and routed to the wrong remediation (``CODEX_HOME/auth.json``).
+        """
+        normalized = message.lower()
+        has_auth_phrase = any(pattern in normalized for pattern in _CODEX_AUTH_FAILURE_PATTERNS)
+        if not has_auth_phrase:
+            return False
+        return any(marker in normalized for marker in _CODEX_PROVIDER_MARKERS)
+
+    @staticmethod
+    def _uses_openai_responses_endpoint(message: str) -> bool:
+        """Return whether the error mentions the OpenAI Responses API endpoint."""
+        return _OPENAI_RESPONSES_ENDPOINT in message.lower()
+
+    @staticmethod
+    def _looks_like_codex_model_unavailable(message: str) -> bool:
+        """Recognize clear model-availability failures without guessing an update.
+
+        Account access, model retirement, and an outdated CLI can share this
+        symptom.  Callers must not turn this classification into an update
+        instruction without more evidence.
+        """
+        normalized = message.lower()
+        return "model" in normalized and any(
+            phrase in normalized
+            for phrase in (
+                "model not found",
+                "model unavailable",
+                "model is unavailable",
+                "unsupported model",
+                "unknown model",
+                "does not have access to model",
+            )
+        )
+
+    @staticmethod
+    def _codex_version(path: str) -> str | None:
+        """Return a CLI version without making model failures depend on diagnostics."""
+        try:
+            result = subprocess.run(
+                [path, "--version"], capture_output=True, text=True, timeout=2, check=False
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        version = (result.stdout or result.stderr).strip().splitlines()
+        return version[-1].strip() if result.returncode == 0 and version else None
+
+    @classmethod
+    def _codex_failure_details(
+        cls,
+        *,
+        returncode: int | None,
+        session_id: str | None,
+        stderr: str,
+        stdout_errors: list[str],
+        message: str,
+        cli_path: str | None = None,
+    ) -> dict[str, object]:
+        """Build structured, non-secret details for a failed Codex CLI call."""
+        details: dict[str, object] = {
+            "returncode": returncode,
+            "session_id": session_id,
+            "stderr": stderr,
+            "stdout_errors": stdout_errors,
+        }
+        auth_failure = cls._looks_like_codex_auth_failure(message)
+        openai_responses = cls._uses_openai_responses_endpoint(message)
+        if auth_failure:
+            details.update(
+                {
+                    "failure_category": "codex_auth",
+                    "auth_plane": "codex_cli",
+                    "openai_responses_endpoint_seen": openai_responses,
+                    "codex_auth_context": cls._codex_auth_context(),
+                    "remediation": (
+                        "Verify that the nested Codex process inherits CODEX_HOME/HOME and "
+                        "that CODEX_HOME/auth.json contains the intended Codex OAuth login. "
+                        "If llm.backend is codex, this should not require OPENAI_API_KEY unless "
+                        "the selected Codex profile intentionally uses an OpenAI API-key provider."
+                    ),
+                }
+            )
+        elif cls._looks_like_codex_model_unavailable(message):
+            details.update(
+                {
+                    "failure_category": "codex_model_unavailable",
+                    "model_guidance": (
+                        "The requested model is not available in this Codex environment. "
+                        "Check the Codex App and CLI versions, then verify account access "
+                        "before changing the pinned model."
+                    ),
+                }
+            )
+            if cli_path:
+                cli_version = cls._codex_version(cli_path)
+                app_path = "/Applications/ChatGPT.app/Contents/Resources/codex"
+                app_version = cls._codex_version(app_path)
+                if cli_version and app_version:
+                    details["codex_app_version"] = app_version
+                    details["codex_cli_version"] = cli_version
+                    details["codex_app_cli_versions_match"] = app_version == cli_version
+                    if app_version != cli_version:
+                        details["model_guidance"] = (
+                            "The Codex App and the CLI used for this task report different "
+                            "versions. Update both Codex installations, then reopen Codex before "
+                            "retrying the pinned model."
+                        )
+        return details
+
+    def _fallback_content(self, stdout_lines: list[str], stderr: str) -> str:
+        """Build a fallback response from JSON events or stderr."""
+        for line in reversed(stdout_lines):
+            event = self._parse_json_event(line)
+            if not event:
+                continue
+            item = event.get("item")
+            if isinstance(item, dict):
+                content = self._extract_text(item)
+                if content:
+                    return content
+
+        return stderr.strip()
+
+    def _extract_stdout_errors(self, stdout_lines: list[str]) -> list[str]:
+        """Pull error event messages from a Codex JSONL stdout stream.
+
+        Codex CLI 0.128+ emits in-flight failures (provider 502s, model
+        registry mismatches, auth issues, retry exhaustion) as JSONL events
+        on stdout with ``type`` of ``"error"`` or ``"turn.failed"``. The
+        process eventually exits with rc != 0 and only the static startup
+        banner ("Reading prompt from stdin...") on stderr — so any error
+        report that forwards just stderr loses every actionable detail.
+
+        This helper reads ``stdout_lines`` in arrival order and returns the
+        textual ``message`` from each terminal/error event, preserving order
+        so callers can use ``[-1]`` for the most recent (final) error.
+        """
+        errors: list[str] = []
+        for line in stdout_lines:
+            event = self._parse_json_event(line)
+            if not event:
+                continue
+            event_type = event.get("type")
+            if event_type not in {"error", "turn.failed"}:
+                continue
+
+            payload = event.get("error") if event_type == "turn.failed" else event
+            if isinstance(payload, dict):
+                msg = payload.get("message")
+                if isinstance(msg, str) and msg.strip():
+                    errors.append(msg.strip())
+                    continue
+            if isinstance(payload, str) and payload.strip():
+                errors.append(payload.strip())
+        return errors
+
+    def _format_tool_info(self, tool_name: str, tool_input: dict[str, Any]) -> str:
+        """Format tool name and input details for debug callbacks."""
+        detail = ""
+        if tool_name == "Bash":
+            detail = str(tool_input.get("command", ""))
+        elif tool_name in {"Edit", "Write", "Read"}:
+            detail = str(tool_input.get("file_path", ""))
+        elif tool_name in {"Glob", "Grep"}:
+            detail = str(tool_input.get("pattern", ""))
+        elif tool_name == "WebSearch":
+            detail = str(tool_input.get("query", ""))
+        elif tool_name.startswith("mcp__") or tool_name == "mcp_tool":
+            detail = next((str(value) for value in tool_input.values() if value), "")
+
+        if detail:
+            detail = detail[:77] + "..." if len(detail) > 80 else detail
+            return f"{tool_name}: {detail}"
+        return tool_name
+
+    def _emit_callback_for_event(self, event: dict[str, Any]) -> None:
+        """Emit best-effort debug callbacks from Codex JSON events.
+
+        External chat hosts such as Hermes/Discord need to distinguish tool
+        start from tool completion when they render nested Codex progress.
+        Keep the historical ``tool`` callback for completed items and add a
+        non-breaking ``tool_started`` callback for started tool events.
+        """
+        if self._on_message is None:
+            return
+
+        event_type = event.get("type")
+        if event_type not in {"item.started", "item.completed"}:
+            return
+
+        item = event.get("item")
+        if not isinstance(item, dict):
+            return
+
+        item_type = item.get("type")
+        if not isinstance(item_type, str):
+            return
+
+        if item_type in {"agent_message", "reasoning", "todo_list"}:
+            if event_type == "item.started":
+                return
+            content = self._extract_text(item)
+            if content:
+                self._on_message("thinking", content)
+            return
+
+        if item_type == "command_execution":
+            command = self._extract_text({"command": item.get("command")}) or ""
+            tool_info = self._format_tool_info("Bash", {"command": command})
+            self._on_message("tool_started" if event_type == "item.started" else "tool", tool_info)
+            return
+
+        if item_type == "mcp_tool_call":
+            tool_name = item.get("name") if isinstance(item.get("name"), str) else "mcp_tool"
+            tool_info = self._format_tool_info(tool_name, self._extract_tool_input(item))
+            self._on_message("tool_started" if event_type == "item.started" else "tool", tool_info)
+            return
+
+        if item_type == "file_change":
+            tool_info = self._format_tool_info("Edit", {"file_path": self._extract_path(item)})
+            self._on_message("tool_started" if event_type == "item.started" else "tool", tool_info)
+            return
+
+        if item_type == "web_search":
+            query = (
+                item.get("query")
+                if isinstance(item.get("query"), str)
+                else self._extract_text(item)
+            )
+            tool_info = self._format_tool_info("WebSearch", {"query": query})
+            self._on_message("tool_started" if event_type == "item.started" else "tool", tool_info)
+
+    def _prompt_stdin_bytes(self, prompt: str) -> bytes | None:
+        """Return bytes to write to process stdin for the prompt, if any."""
+        return prompt.encode("utf-8")
+
+    def _update_last_content(self, last_content: str, event_content: str) -> str:
+        """Return the fallback completion content after a streamed event.
+
+        Codex-style events normally contain complete assistant messages, so the
+        latest content remains the fallback.  Delta-oriented adapters can
+        override this hook to accumulate chunks.
+        """
+        return event_content if event_content else last_content
+
+    def _read_output_message(self, output_path: Path) -> str:
+        """Read the output-last-message file if the backend wrote one."""
+        try:
+            return output_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return ""
+
+    @staticmethod
+    def _truncate_if_oversized(content: str, model: str) -> str:
+        """Validate and truncate oversized LLM responses."""
+        return truncate_llm_response_if_oversized(content, model=model)
+
+    def _is_retryable_error(self, message: str) -> bool:
+        """Check whether an error looks transient."""
+        return is_transient_error(message)
+
+    async def _collect_legacy_process_output(
+        self,
+        process: Any,
+        *,
+        deadline: float,
+    ) -> tuple[list[str], list[str], str | None, str]:
+        """Fallback for tests or wrappers that only expose communicate()."""
+        async with asyncio.timeout_at(deadline):
+            stdout_bytes, stderr_bytes = await process.communicate()
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        stdout_lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+        stderr_lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+        session_id = self._extract_session_id(stdout_lines)
+        last_content = ""
+
+        for line in stdout_lines:
+            event = self._parse_json_event(line)
+            if event is None:
+                continue
+            self._emit_callback_for_event(event)
+            event_content = self._extract_text(event.get("item") or event)
+            last_content = self._update_last_content(last_content, event_content)
+
+        return stdout_lines, stderr_lines, session_id, last_content
+
+    @classmethod
+    def _build_child_env(cls) -> dict[str, str]:
+        """Build an isolated environment for child Codex processes.
+
+        Strips Ouroboros MCP env vars to prevent recursive startup (#185).
+        """
+        return build_codex_child_env(
+            max_depth=cls._max_ouroboros_depth,
+            child_session_env_keys=cls._child_session_env_keys,
+            depth_error_factory=lambda depth, max_depth: ProviderError(
+                message=f"Maximum Ouroboros nesting depth ({max_depth}) exceeded",
+                provider=cls._provider_name,
+                details={"depth": depth},
+            ),
+        )
+
+    async def _complete_once(
+        self,
+        messages: list[Message],
+        config: CompletionConfig,
+    ) -> Result[CompletionResponse, ProviderError]:
+        """Execute a single Codex CLI completion request."""
+        profile_result = resolve_completion_profile_result(
+            config, backend=self._completion_profile_backend
+        )
+        if profile_result.is_err:
+            return Result.err(profile_result.error)
+        resolved = profile_result.value
+        effective_config = resolved.config
+        prompt = self._build_prompt(messages, max_turns=effective_config.max_turns)
+        normalized_model = (
+            None
+            if resolved.backend_profile and not self._codex_profile
+            else self._normalize_model(effective_config.model)
+        )
+        output_fd, output_path_str = tempfile.mkstemp(prefix=self._tempfile_prefix, suffix=".txt")
+        os.close(output_fd)
+        output_path = Path(output_path_str)
+
+        schema_path: Path | None = None
+        schema, map_paths = self._build_output_schema(config.response_format)
+        if schema is not None:
+            schema_fd, schema_path_str = tempfile.mkstemp(
+                prefix=self._schema_tempfile_prefix,
+                suffix=".json",
+            )
+            os.close(schema_fd)
+            schema_path = Path(schema_path_str)
+            schema_path.write_text(json.dumps(schema), encoding="utf-8")
+
+        # Goose and Pi reuse this completion flow but expose no Codex-style
+        # per-invocation effort flag. Pass it only to Codex's command builder;
+        # their narrower overrides intentionally do not accept this argument.
+        try:
+            if self._completion_profile_backend == "codex":
+                command = self._build_command(
+                    output_last_message_path=str(output_path),
+                    output_schema_path=str(schema_path) if schema_path else None,
+                    model=normalized_model,
+                    profile=resolved.backend_profile,
+                    reasoning_effort=effective_config.reasoning_effort,
+                    prompt=prompt,
+                )
+            else:
+                command = self._build_command(
+                    output_last_message_path=str(output_path),
+                    output_schema_path=str(schema_path) if schema_path else None,
+                    model=normalized_model,
+                    profile=resolved.backend_profile,
+                    prompt=prompt,
+                )
+        except ProviderError as exc:
+            output_path.unlink(missing_ok=True)
+            if schema_path:
+                schema_path.unlink(missing_ok=True)
+            return Result.err(exc)
+
+        prompt_stdin_bytes = self._prompt_stdin_bytes(prompt)
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=self._cwd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=(
+                    self._build_env_for_instance()
+                    if hasattr(self, "_build_env_for_instance")
+                    else self._build_child_env()
+                ),
+            )
+        except FileNotFoundError as exc:
+            output_path.unlink(missing_ok=True)
+            if schema_path:
+                schema_path.unlink(missing_ok=True)
+            return Result.err(
+                ProviderError(
+                    message=f"{self._display_name} not found: {exc}",
+                    provider=self._provider_name,
+                    details={"cli_path": self._cli_path},
+                )
+            )
+        except Exception as exc:
+            output_path.unlink(missing_ok=True)
+            if schema_path:
+                schema_path.unlink(missing_ok=True)
+            return Result.err(
+                ProviderError(
+                    message=f"Failed to start {self._display_name}: {exc}",
+                    provider=self._provider_name,
+                    details={"cli_path": self._cli_path, "error_type": type(exc).__name__},
+                )
+            )
+
+        timeout_seconds = self._effective_timeout_seconds()
+        completion_deadline = asyncio.get_running_loop().time() + timeout_seconds
+
+        # Prompt delivery is part of the completion lifecycle: a child that
+        # stops reading stdin must not escape the same deadline as its output.
+        try:
+            async with asyncio.timeout_at(completion_deadline):
+                if process.stdin is not None and prompt_stdin_bytes is not None:
+                    process.stdin.write(prompt_stdin_bytes)
+                    await process.stdin.drain()
+                    process.stdin.close()
+                elif process.stdin is not None:
+                    process.stdin.close()
+        except TimeoutError:
+            await self._terminate_process(process)
+            output_path.unlink(missing_ok=True)
+            if schema_path:
+                schema_path.unlink(missing_ok=True)
+            return Result.err(
+                ProviderError(
+                    message=f"{self._display_name} request timed out after {timeout_seconds:.1f}s",
+                    provider=self._provider_name,
+                    details={
+                        "timed_out": True,
+                        "timeout_seconds": timeout_seconds,
+                        "timeout_was_default": self._timeout_is_default_ceiling(),
+                        "returncode": getattr(process, "returncode", None),
+                    },
+                )
+            )
+        except asyncio.CancelledError:
+            await self._terminate_process(process)
+            output_path.unlink(missing_ok=True)
+            if schema_path:
+                schema_path.unlink(missing_ok=True)
+            raise
+
+        if not hasattr(process, "stdout") or not callable(getattr(process, "wait", None)):
+            try:
+                (
+                    stdout_lines,
+                    stderr_lines,
+                    session_id,
+                    last_content,
+                ) = await self._collect_legacy_process_output(
+                    process,
+                    deadline=completion_deadline,
+                )
+            except TimeoutError:
+                await self._terminate_process(process)
+                output_path.unlink(missing_ok=True)
+                if schema_path:
+                    schema_path.unlink(missing_ok=True)
+                return Result.err(
+                    ProviderError(
+                        message=(
+                            f"{self._display_name} legacy request timed out"
+                            f" after {timeout_seconds:.1f}s"
+                        ),
+                        provider=self._provider_name,
+                        details={
+                            "timed_out": True,
+                            "timeout_seconds": timeout_seconds,
+                            "timeout_was_default": self._timeout_is_default_ceiling(),
+                            "returncode": getattr(process, "returncode", None),
+                        },
+                    )
+                )
+            content = self._read_output_message(output_path)
+            output_path.unlink(missing_ok=True)
+            if schema_path:
+                schema_path.unlink(missing_ok=True)
+
+            if not content:
+                content = last_content or self._fallback_content(
+                    stdout_lines,
+                    "\n".join(stderr_lines),
+                )
+
+            if process.returncode != 0:
+                stdout_errors = self._extract_stdout_errors(stdout_lines)
+                return Result.err(
+                    ProviderError(
+                        message=(stdout_errors[-1] if stdout_errors else None)
+                        or content
+                        or f"{self._display_name} exited with code {process.returncode}",
+                        provider=self._provider_name,
+                        details=self._codex_failure_details(
+                            returncode=process.returncode,
+                            session_id=session_id,
+                            stderr="\n".join(stderr_lines).strip(),
+                            stdout_errors=stdout_errors,
+                            message=(stdout_errors[-1] if stdout_errors else None)
+                            or content
+                            or f"{self._display_name} exited with code {process.returncode}",
+                            cli_path=self._cli_path,
+                        ),
+                    )
+                )
+
+            if not content:
+                return Result.err(
+                    ProviderError(
+                        message=f"Empty response from {self._display_name}",
+                        provider=self._provider_name,
+                        details={"session_id": session_id},
+                    )
+                )
+
+            content = self._restore_schema_transforms(content, map_paths)
+            content = self._truncate_if_oversized(content, normalized_model or "default")
+
+            return Result.ok(
+                CompletionResponse(
+                    content=content,
+                    model=normalized_model or "default",
+                    usage=UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+                    finish_reason="stop",
+                    raw_response={
+                        "session_id": session_id,
+                        "returncode": process.returncode,
+                    },
+                )
+            )
+
+        stdout_lines = []
+        stderr_lines = []
+        session_id = None
+        last_content = ""
+        stderr_task = asyncio.create_task(self._collect_stream_lines(process.stderr))
+
+        async def _read_stdout() -> None:
+            nonlocal session_id, last_content
+            async for raw_line in self._iter_stream_lines(process.stdout):
+                line = raw_line.strip()
+                if not line:
+                    continue
+
+                stdout_lines.append(line)
+                event = self._parse_json_event(line)
+                if event is None:
+                    continue
+
+                event_session_id = self._extract_session_id_from_event(event)
+                if event_session_id:
+                    session_id = event_session_id
+
+                self._emit_callback_for_event(event)
+                event_content = self._extract_text(event.get("item") or event)
+                last_content = self._update_last_content(last_content, event_content)
+
+        stdout_task = asyncio.create_task(_read_stdout())
+
+        try:
+            async with asyncio.timeout_at(completion_deadline):
+                await process.wait()
+                await stdout_task
+                stderr_lines = await stderr_task
+        except ProviderError as exc:
+            await self._terminate_process(process)
+            if not stdout_task.done():
+                stdout_task.cancel()
+            if not stderr_task.done():
+                stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await stdout_task
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await stderr_task
+            output_path.unlink(missing_ok=True)
+            if schema_path:
+                schema_path.unlink(missing_ok=True)
+            return Result.err(
+                ProviderError(
+                    message=exc.message,
+                    provider=self._provider_name,
+                    details={
+                        **exc.details,
+                        "session_id": session_id,
+                        "returncode": getattr(process, "returncode", None),
+                    },
+                )
+            )
+        except TimeoutError:
+            await self._terminate_process(process)
+            if not stdout_task.done():
+                stdout_task.cancel()
+            if not stderr_task.done():
+                stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(
+                    stdout_task,
+                    timeout=self._process_shutdown_timeout_seconds,
+                )
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                stderr_lines = await asyncio.wait_for(
+                    stderr_task,
+                    timeout=self._process_shutdown_timeout_seconds,
+                )
+
+            content = (
+                self._read_output_message(output_path)
+                or last_content
+                or "\n".join(stderr_lines).strip()
+            )
+            output_path.unlink(missing_ok=True)
+            if schema_path:
+                schema_path.unlink(missing_ok=True)
+
+            return Result.err(
+                ProviderError(
+                    message=f"{self._display_name} request timed out after {timeout_seconds:.1f}s",
+                    provider=self._provider_name,
+                    details={
+                        "timed_out": True,
+                        "timeout_seconds": timeout_seconds,
+                        "timeout_was_default": self._timeout_is_default_ceiling(),
+                        "session_id": session_id,
+                        "partial_content": content,
+                        "returncode": getattr(process, "returncode", None),
+                        "stderr": "\n".join(stderr_lines).strip(),
+                    },
+                )
+            )
+        except asyncio.CancelledError:
+            await self._terminate_process(process)
+            stdout_task.cancel()
+            stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await stdout_task
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await stderr_task
+            output_path.unlink(missing_ok=True)
+            if schema_path:
+                schema_path.unlink(missing_ok=True)
+            raise
+
+        content = self._read_output_message(output_path)
+        output_path.unlink(missing_ok=True)
+        if schema_path:
+            schema_path.unlink(missing_ok=True)
+
+        if not content:
+            content = last_content or self._fallback_content(stdout_lines, "\n".join(stderr_lines))
+
+        if process.returncode != 0:
+            stdout_errors = self._extract_stdout_errors(stdout_lines)
+            return Result.err(
+                ProviderError(
+                    message=(stdout_errors[-1] if stdout_errors else None)
+                    or content
+                    or f"{self._display_name} exited with code {process.returncode}",
+                    provider=self._provider_name,
+                    details=self._codex_failure_details(
+                        returncode=process.returncode,
+                        session_id=session_id,
+                        stderr="\n".join(stderr_lines).strip(),
+                        stdout_errors=stdout_errors,
+                        message=(stdout_errors[-1] if stdout_errors else None)
+                        or content
+                        or f"{self._display_name} exited with code {process.returncode}",
+                        cli_path=self._cli_path,
+                    ),
+                )
+            )
+
+        if not content:
+            return Result.err(
+                ProviderError(
+                    message=f"Empty response from {self._display_name}",
+                    provider=self._provider_name,
+                    details={"session_id": session_id},
+                )
+            )
+
+        content = self._restore_schema_transforms(content, map_paths)
+        content = self._truncate_if_oversized(content, normalized_model or "default")
+
+        return Result.ok(
+            CompletionResponse(
+                content=content,
+                model=normalized_model or "default",
+                usage=UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+                finish_reason="stop",
+                raw_response={
+                    "session_id": session_id,
+                    "returncode": process.returncode,
+                },
+            )
+        )
+
+    async def complete(
+        self,
+        messages: list[Message],
+        config: CompletionConfig,
+    ) -> Result[CompletionResponse, ProviderError]:
+        """Make a completion request via Codex CLI with light retry logic."""
+        last_error: ProviderError | None = None
+
+        for attempt in range(self._max_retries):
+            result = await self._complete_once(messages, config)
+            if result.is_ok:
+                return result
+
+            last_error = result.error
+            if bool(result.error.details.get("timed_out")):
+                return result
+            if (
+                not self._is_retryable_error(result.error.message)
+                or attempt >= self._max_retries - 1
+            ):
+                return result
+
+            await asyncio.sleep(2**attempt)
+
+        return Result.err(
+            last_error
+            or ProviderError(
+                f"{self._display_name} request failed",
+                provider=self._provider_name,
+            )
+        )
+
+
+__all__ = ["CodexCliLLMAdapter"]

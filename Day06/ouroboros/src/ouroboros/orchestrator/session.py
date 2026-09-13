@@ -1,0 +1,1826 @@
+"""Session tracking for orchestrator execution.
+
+This module provides session management through event sourcing:
+- SessionTracker: Immutable session state (frozen dataclass)
+- SessionRepository: Event-based persistence and reconstruction
+
+Sessions are tracked entirely through events in the EventStore,
+following the principle that events are the single source of truth.
+
+Usage:
+    repo = SessionRepository(event_store)
+
+    # Create and track session
+    tracker = SessionTracker.create(execution_id, seed_id)
+    await repo.track_progress(tracker.session_id, {"step": 1})
+
+    # Reconstruct session from events
+    result = await repo.reconstruct_session(session_id)
+    if result.is_ok:
+        tracker = result.value
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+import math
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from uuid import uuid4
+
+from ouroboros.core.errors import PersistenceError
+from ouroboros.core.project_identity import (
+    ProjectIdentity,
+    active_publication_evidence,
+    publication_evidence_is_stable,
+    resolve_managed_project_identity,
+    resolve_project_identity,
+)
+from ouroboros.core.types import Result
+from ouroboros.core.worktree import TaskWorkspace
+from ouroboros.events.base import BaseEvent, sanitize_event_data_for_persistence
+from ouroboros.observability.logging import get_logger
+
+if TYPE_CHECKING:
+    from ouroboros.persistence.event_store import EventStore, SessionActivitySnapshot
+
+log = get_logger(__name__)
+
+
+# Reconstruction-only metadata copied from the authoritative session start
+# event.  It intentionally lives in ``SessionTracker.progress`` rather than a
+# new persisted progress row: resume validation needs the original seed/runtime
+# identity even for legacy sessions, while later progress events must never be
+# able to overwrite that identity.
+SESSION_START_IDENTITY_PROGRESS_KEY = "_session_start_identity"
+SESSION_RUNTIME_IDENTITY_PROGRESS_KEY = "_session_runtime_identity"
+ACCEPTANCE_ROOT_INDICES_PROGRESS_KEY = "acceptance_root_indices"
+
+
+def _normalize_pause_owner(value: object) -> dict[str, object]:
+    """Validate the closed coordinator owner carried by a PAUSED event."""
+
+    expected_keys = frozenset(
+        {
+            "schema_version",
+            "kind",
+            "execution_id",
+            "session_id",
+            "level_number",
+            "coordinator_aggregate_id",
+        }
+    )
+    if not isinstance(value, Mapping) or set(value.keys()) != expected_keys:
+        raise ValueError("pause owner has an invalid schema")
+    normalized = dict(value)
+    if (
+        type(normalized.get("schema_version")) is not int
+        or normalized.get("schema_version") != 1
+        or normalized.get("kind") != "coordinator_quota"
+        or type(normalized.get("execution_id")) is not str
+        or not normalized["execution_id"]
+        or len(normalized["execution_id"]) > 1_024
+        or type(normalized.get("session_id")) is not str
+        or not normalized["session_id"]
+        or len(normalized["session_id"]) > 1_024
+        or type(normalized.get("level_number")) is not int
+        or normalized["level_number"] < 1
+        or type(normalized.get("coordinator_aggregate_id")) is not str
+        or not normalized["coordinator_aggregate_id"]
+        or len(normalized["coordinator_aggregate_id"]) > 4_096
+    ):
+        raise ValueError("pause owner exceeds its durable bounds")
+    return normalized
+
+
+def _normalize_acceptance_root_indices(value: object) -> list[int] | None:
+    """Normalize the immutable root set persisted at session publication."""
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Iterable):
+        raise ValueError("acceptance_root_indices must be an iterable of non-negative integers")
+    roots: set[int] = set()
+    for raw_root in value:
+        if isinstance(raw_root, bool) or not isinstance(raw_root, int) or raw_root < 0:
+            raise ValueError("acceptance_root_indices must contain non-negative integers")
+        roots.add(raw_root)
+    return sorted(roots)
+
+
+def _resolve_managed_publication_identity(
+    project_workspace: str,
+    task_workspace: TaskWorkspace,
+) -> ProjectIdentity:
+    """Prove the provider and frozen task workspace name the same managed directory."""
+    try:
+        same_directory = Path(project_workspace).samefile(task_workspace.effective_cwd)
+    except OSError as exc:
+        raise ValueError("managed execution workspace changed before publication") from exc
+    if not same_directory:
+        raise ValueError("managed execution workspace changed before publication")
+    return resolve_managed_project_identity(
+        project_workspace,
+        source_root=task_workspace.repo_root,
+        source_workspace=task_workspace.original_cwd,
+        worktree_root=task_workspace.worktree_path,
+    )
+
+
+async def _validate_project_identity_publication(
+    execution_contract: Mapping[str, Any] | None,
+    project_identity: ProjectIdentity | None,
+    project_workspace: str | None,
+    project_task_workspace: TaskWorkspace | None,
+) -> None:
+    """Require the immutable top-level and nested project scopes to agree."""
+    raw_proof = (
+        execution_contract.get("frugality_proof")
+        if isinstance(execution_contract, Mapping)
+        else None
+    )
+    proof = raw_proof if isinstance(raw_proof, Mapping) else {}
+    scope_keys = frozenset({"project_root", "workspace_path"})
+    present_scope_keys = scope_keys.intersection(proof)
+    if present_scope_keys and present_scope_keys != scope_keys:
+        raise ValueError("execution_contract contains a partial project identity")
+    nested_identity = {key: proof[key] for key in scope_keys} if present_scope_keys else None
+    if execution_contract is not None and nested_identity is None:
+        raise ValueError("execution contract requires a resolved project identity")
+    if (project_identity is None) != (nested_identity is None):
+        raise ValueError("project identity and execution contract must be published together")
+    if (project_identity is None) != (project_workspace is None):
+        raise ValueError("project identity and actual workspace must be published together")
+    if project_task_workspace is not None and project_identity is None:
+        raise ValueError("managed project workspace requires a project identity")
+    if project_identity is not None and nested_identity != project_identity.to_workspace_data():
+        raise ValueError("project identity conflicts with execution contract")
+    if project_identity is not None and project_workspace is not None:
+        if project_task_workspace is None:
+            # The runner deposits resolver-issued evidence in a scope it owns;
+            # nothing about the fast path is caller-suppliable through this
+            # module's API. Acceptance is still re-proven here: issuance,
+            # identity, workspace anchor, closure completeness, stability.
+            evidence = active_publication_evidence()
+            if (
+                evidence is not None
+                and evidence.identity == project_identity
+                and await asyncio.to_thread(
+                    publication_evidence_is_stable,
+                    evidence,
+                    project_workspace,
+                )
+            ):
+                # The resolver's whole repo-local input closure is unchanged
+                # since construction, so re-running it must reproduce the same
+                # identity; the recheck issues no Git query, so the V1 probe
+                # invariant is vacuously satisfied. Any doubt fell through to
+                # the full re-resolution below, which probes for itself.
+                return
+            revalidated_identity = await asyncio.to_thread(
+                resolve_project_identity,
+                project_workspace,
+            )
+        else:
+            revalidated_identity = await asyncio.to_thread(
+                _resolve_managed_publication_identity,
+                project_workspace,
+                project_task_workspace,
+            )
+        if revalidated_identity != project_identity:
+            raise ValueError("project workspace identity changed before publication")
+
+
+_STABLE_RUNTIME_RESUME_BACKENDS: dict[str, str] = {
+    "codex": "codex_cli",
+    "codex_cli": "codex_cli",
+    "goose": "goose",
+    "pi": "pi",
+    "omp": "omp",
+    "hermes": "hermes_cli",
+    "hermes_cli": "hermes_cli",
+    "opencode": "opencode",
+}
+
+
+def runtime_resume_identity_from_payload(value: object) -> dict[str, str] | None:
+    """Extract a stable resume id for runtimes without intentional ID rebinding.
+
+    Claude can intentionally fork to a new child session during recovery, so a
+    generic forever-first-id rule would reject legitimate lineage transitions.
+    Codex, Goose, Pi, Hermes, and direct OpenCode sessions have no such transition:
+    once their stable id is observed, a different id in progress is corruption
+    and must fail closed.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    backend = value.get("backend")
+    normalized_backend = (
+        _STABLE_RUNTIME_RESUME_BACKENDS.get(backend.strip().lower())
+        if isinstance(backend, str)
+        else None
+    )
+    if normalized_backend is None:
+        return None
+    metadata = value.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    candidates = (
+        ("native_session_id", value.get("native_session_id")),
+        ("conversation_id", value.get("conversation_id")),
+        ("server_session_id", metadata.get("server_session_id")),
+    )
+    selected_kind: str | None = None
+    selected_id: str | None = None
+    for kind, candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            selected_kind = kind
+            selected_id = candidate.strip()
+            break
+    if selected_kind is None or selected_id is None:
+        return None
+    return {
+        "status": "bound",
+        "backend": normalized_backend,
+        "id_kind": selected_kind,
+        "id": selected_id,
+    }
+
+
+_PARALLEL_ACTIVITY_EVENT_TYPES = frozenset(
+    {
+        "execution.session.started",
+        "execution.session.resumed",
+        "execution.session.completed",
+        "execution.session.failed",
+        "execution.tool.started",
+        "execution.agent.thinking",
+        "execution.coordinator.tool.started",
+        "execution.coordinator.thinking",
+    }
+)
+
+
+# =============================================================================
+# Session Status
+# =============================================================================
+
+
+class SessionStatus(StrEnum):
+    """Status of an orchestrator session."""
+
+    RUNNING = "running"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+# =============================================================================
+# Session Tracker (Immutable)
+# =============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class SessionTracker:
+    """Immutable session state for orchestrator execution.
+
+    This dataclass tracks the current state of an orchestrator session.
+    Updates create new instances via with_* methods (immutable pattern).
+
+    Attributes:
+        session_id: Unique identifier for this session.
+        execution_id: Associated workflow execution ID.
+        seed_id: ID of the seed being executed.
+        status: Current session status.
+        start_time: When the session started.
+        progress: Progress data (message count, current step, etc.).
+        messages_processed: Number of messages processed so far.
+        last_message_time: Timestamp of last processed message.
+    """
+
+    session_id: str
+    execution_id: str
+    seed_id: str
+    status: SessionStatus
+    start_time: datetime
+    progress: dict[str, Any] = field(default_factory=dict)
+    messages_processed: int = 0
+    last_message_time: datetime | None = None
+
+    @classmethod
+    def create(
+        cls,
+        execution_id: str,
+        seed_id: str,
+        session_id: str | None = None,
+    ) -> SessionTracker:
+        """Create a new session tracker.
+
+        Args:
+            execution_id: Workflow execution ID.
+            seed_id: Seed ID being executed.
+            session_id: Optional custom session ID.
+
+        Returns:
+            New SessionTracker instance.
+        """
+        return cls(
+            session_id=session_id or f"orch_{uuid4().hex[:12]}",
+            execution_id=execution_id,
+            seed_id=seed_id,
+            status=SessionStatus.RUNNING,
+            start_time=datetime.now(UTC),
+        )
+
+    def with_progress(self, update: dict[str, Any]) -> SessionTracker:
+        """Return new tracker with updated progress.
+
+        The ``messages_processed`` counter is set from the update dict when
+        present, otherwise it is incremented by one.  This avoids the double-
+        increment that would occur when the caller also tracks a separate
+        counter and stores it in the update.
+
+        Args:
+            update: Progress data to merge.
+
+        Returns:
+            New SessionTracker with merged progress.
+        """
+        merged_progress = {**self.progress, **update}
+        new_count = update.get("messages_processed")
+        if isinstance(new_count, int):
+            messages_processed = new_count
+        else:
+            messages_processed = self.messages_processed + 1
+        return replace(
+            self,
+            progress=merged_progress,
+            messages_processed=messages_processed,
+            last_message_time=datetime.now(UTC),
+        )
+
+    def with_status(self, status: SessionStatus) -> SessionTracker:
+        """Return new tracker with updated status.
+
+        Args:
+            status: New session status.
+
+        Returns:
+            New SessionTracker with updated status.
+        """
+        return replace(self, status=status)
+
+    @property
+    def is_active(self) -> bool:
+        """Return True if session is still active (running or paused)."""
+        return self.status in (SessionStatus.RUNNING, SessionStatus.PAUSED)
+
+    @property
+    def is_completed(self) -> bool:
+        """Return True if session completed successfully."""
+        return self.status == SessionStatus.COMPLETED
+
+    @property
+    def is_failed(self) -> bool:
+        """Return True if session failed."""
+        return self.status == SessionStatus.FAILED
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for serialization.
+
+        Returns:
+            Dictionary representation.
+        """
+        return {
+            "session_id": self.session_id,
+            "execution_id": self.execution_id,
+            "seed_id": self.seed_id,
+            "status": self.status.value,
+            "start_time": self.start_time.isoformat(),
+            "progress": self.progress,
+            "messages_processed": self.messages_processed,
+            "last_message_time": self.last_message_time.isoformat()
+            if self.last_message_time
+            else None,
+        }
+
+
+# =============================================================================
+# Session Repository (Event-based)
+# =============================================================================
+
+
+class SessionRepository:
+    """Manages sessions via event store.
+
+    Sessions are persisted entirely through events, following the
+    event sourcing pattern. This avoids dual-write problems and
+    keeps events as the single source of truth.
+
+    Event Types:
+        - orchestrator.session.started: Session created
+        - orchestrator.progress.updated: Progress update
+        - orchestrator.session.completed: Session finished successfully
+        - orchestrator.session.failed: Session failed
+        - orchestrator.session.cancelled: Session cancelled
+        - orchestrator.session.paused: Session paused for resumption
+    """
+
+    def __init__(self, event_store: EventStore) -> None:
+        """Initialize repository with event store.
+
+        Args:
+            event_store: Event store for persistence.
+        """
+        self._event_store = event_store
+
+    @staticmethod
+    def _normalize_progress_payload(progress: dict[str, Any]) -> dict[str, Any]:
+        """Normalize persisted progress payloads for stable session reconstruction."""
+        sanitized_progress = sanitize_event_data_for_persistence(progress)
+        runtime = sanitized_progress.get("runtime")
+        if not isinstance(runtime, dict):
+            return sanitized_progress
+
+        backend = runtime.get("backend")
+        if backend != "opencode":
+            return sanitized_progress
+
+        sanitized_progress = dict(sanitized_progress)
+        normalized_runtime: dict[str, Any] = {}
+        for key in ("backend", "kind", "native_session_id", "cwd", "approval_mode"):
+            if key in runtime:
+                normalized_runtime[key] = runtime[key]
+
+        metadata = runtime.get("metadata")
+        if isinstance(metadata, dict):
+            normalized_metadata = sanitize_event_data_for_persistence(metadata)
+            normalized_metadata.pop("runtime_event_type", None)
+            normalized_runtime["metadata"] = normalized_metadata
+
+        sanitized_progress["runtime"] = normalized_runtime
+        return sanitized_progress
+
+    @staticmethod
+    def _coerce_runtime_status(value: object) -> SessionStatus | None:
+        """Map normalized runtime-status strings onto SessionStatus values."""
+        if not isinstance(value, str):
+            return None
+
+        normalized = value.strip().lower()
+        if normalized == "running":
+            return SessionStatus.RUNNING
+        if normalized == "paused":
+            return SessionStatus.PAUSED
+        if normalized == "completed":
+            return SessionStatus.COMPLETED
+        if normalized == "failed":
+            return SessionStatus.FAILED
+        if normalized == "cancelled":
+            return SessionStatus.CANCELLED
+        return None
+
+    @classmethod
+    def _status_from_event(
+        cls,
+        event_type: object,
+        event_data: object,
+    ) -> SessionStatus | None:
+        """Derive a session status from either terminal events or runtime progress."""
+        if event_type == "orchestrator.session.completed":
+            return SessionStatus.COMPLETED
+        if event_type == "orchestrator.session.failed":
+            return SessionStatus.FAILED
+        if event_type == "orchestrator.session.paused":
+            return SessionStatus.PAUSED
+        if event_type == "orchestrator.session.cancelled":
+            return SessionStatus.CANCELLED
+
+        if event_type not in {
+            "orchestrator.progress.updated",
+            "workflow.progress.updated",
+        } or not isinstance(
+            event_data,
+            dict,
+        ):
+            return None
+
+        progress = event_data.get("progress")
+        if isinstance(progress, dict):
+            status = cls._coerce_runtime_status(
+                progress.get("runtime_status") or event_data.get("runtime_status")
+            )
+            if status is not None:
+                return status
+
+        return cls._coerce_runtime_status(event_data.get("runtime_status"))
+
+    @staticmethod
+    def _workflow_is_incomplete(progress: dict[str, Any]) -> bool:
+        """Return True when workflow progress shows unfinished acceptance criteria."""
+        completed_count = progress.get("completed_count")
+        total_count = progress.get("total_count")
+        return (
+            isinstance(completed_count, int)
+            and isinstance(total_count, int)
+            and total_count > 0
+            and completed_count < total_count
+        )
+
+    @staticmethod
+    def _workflow_progress_from_event(event_data: object) -> dict[str, Any]:
+        """Normalize execution-scoped workflow progress into session progress fields."""
+        if not isinstance(event_data, dict):
+            return {}
+
+        progress: dict[str, Any] = {}
+        for key in (
+            "acceptance_criteria",
+            "completed_count",
+            "total_count",
+            "current_ac_index",
+            "current_phase",
+            "activity",
+            "activity_detail",
+            "elapsed_display",
+            "estimated_remaining",
+            "messages_count",
+            "tool_calls_count",
+            "estimated_tokens",
+            "estimated_cost_usd",
+            "last_update",
+        ):
+            value = event_data.get(key)
+            if value is not None:
+                progress[key] = value
+
+        messages_count = event_data.get("messages_count")
+        if isinstance(messages_count, int):
+            progress["messages_processed"] = messages_count
+
+        return progress
+
+    @staticmethod
+    def _pause_progress_from_event(event_data: object) -> dict[str, Any]:
+        """Normalize pause lifecycle metadata into session progress fields."""
+        if not isinstance(event_data, dict):
+            return {}
+
+        progress: dict[str, Any] = {"runtime_status": SessionStatus.PAUSED.value}
+        for key in (
+            "pause_kind",
+            "pause_seconds",
+            "resume_after",
+            "paused_at",
+            "resume_hint",
+        ):
+            value = event_data.get(key)
+            if value is not None:
+                progress[key] = value
+
+        pause_owner = event_data.get("pause_owner")
+        if pause_owner is not None:
+            # The durable PAUSED owner is effect-bearing resume authority.
+            # Re-apply the same closed schema used at publication instead of
+            # trusting an arbitrary JSON mapping recovered from the store.
+            progress["pause_owner"] = _normalize_pause_owner(pause_owner)
+
+        reason = event_data.get("reason")
+        if reason is not None:
+            progress["pause_reason"] = reason
+
+        return progress
+
+    @staticmethod
+    def _coerce_snapshot_datetime(value: object) -> datetime | None:
+        """Normalize timestamp values returned by snapshot queries."""
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=UTC)
+            return value
+        if isinstance(value, str) and value:
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                log.warning(
+                    "orchestrator.session.timestamp_parse_failed",
+                    value=value,
+                )
+                return None
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=UTC)
+            return parsed
+        return None
+
+    @staticmethod
+    def _coerce_positive_seconds(value: object) -> int | None:
+        """Normalize persisted positive-second values from pause metadata.
+
+        Non-finite values are rejected rather than converted, matching
+        ``recoverable_failure._duration_value_to_seconds`` — the sibling parser for
+        this same ``pause_seconds`` key — so persisted ``inf``/``nan`` degrades to
+        "no usable resume metadata" instead of raising out of orphan cleanup.
+        """
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int | float):
+            if not math.isfinite(value):
+                return None
+            seconds = int(value)
+            return seconds if seconds > 0 else None
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = float(value.strip())
+            except ValueError:
+                return None
+            if not math.isfinite(parsed):
+                return None
+            seconds = int(parsed)
+            return seconds if seconds > 0 else None
+        return None
+
+    @classmethod
+    def _usage_limit_pause_resume_after(cls, progress: dict[str, Any]) -> datetime | None:
+        """Return the resume time for usage-limit pauses, if metadata is valid."""
+        pause_kind = progress.get("pause_kind")
+        if not isinstance(pause_kind, str) or pause_kind.strip().lower() != "usage_limit":
+            return None
+
+        resume_after = cls._coerce_snapshot_datetime(progress.get("resume_after"))
+        if resume_after is not None:
+            return resume_after
+
+        paused_at = cls._coerce_snapshot_datetime(progress.get("paused_at"))
+        pause_seconds = cls._coerce_positive_seconds(progress.get("pause_seconds"))
+        if paused_at is None or pause_seconds is None:
+            return None
+
+        return paused_at + timedelta(seconds=pause_seconds)
+
+    @classmethod
+    def _usage_limit_pause_cleanup_deferred(
+        cls,
+        tracker: SessionTracker,
+        *,
+        now: datetime,
+        staleness_threshold: timedelta,
+    ) -> bool:
+        """Return True while quota pauses should be protected from orphan cleanup."""
+        if tracker.status != SessionStatus.PAUSED:
+            return False
+
+        resume_after = cls._usage_limit_pause_resume_after(tracker.progress)
+        if resume_after is None:
+            return False
+
+        return now <= resume_after + staleness_threshold
+
+    @classmethod
+    def _status_from_snapshot(cls, snapshot: SessionActivitySnapshot) -> SessionStatus:
+        """Derive session status from a snapshot row."""
+        status = cls._status_from_event(snapshot.status_event_type, {})
+        if status is not None:
+            return status
+
+        runtime_status = cls._coerce_runtime_status(snapshot.runtime_status)
+        if runtime_status is not None:
+            return runtime_status
+
+        return SessionStatus.RUNNING
+
+    async def _find_orphaned_sessions_via_snapshots(
+        self,
+        snapshots: list[SessionActivitySnapshot],
+        alive_sessions: set[str],
+        staleness_threshold: timedelta,
+        now: datetime,
+    ) -> list[SessionTracker]:
+        """Detect orphaned sessions from pre-aggregated session snapshots."""
+        orphaned: list[SessionTracker] = []
+
+        for snapshot in snapshots:
+            status = self._status_from_snapshot(snapshot)
+            if status not in (SessionStatus.RUNNING, SessionStatus.PAUSED):
+                continue
+
+            if snapshot.session_id in alive_sessions:
+                log.info(
+                    "orchestrator.orphan_detection.heartbeat_alive",
+                    session_id=snapshot.session_id,
+                )
+                continue
+
+            last_activity = self._coerce_snapshot_datetime(snapshot.last_activity)
+            if last_activity is None:
+                last_activity = self._coerce_snapshot_datetime(snapshot.start_time)
+            if last_activity is None:
+                continue
+
+            if (now - last_activity) <= staleness_threshold:
+                continue
+
+            result = await self.reconstruct_session(snapshot.session_id)
+            if result.is_ok:
+                if result.value.status not in (
+                    SessionStatus.RUNNING,
+                    SessionStatus.PAUSED,
+                ):
+                    continue
+                if self._usage_limit_pause_cleanup_deferred(
+                    result.value,
+                    now=now,
+                    staleness_threshold=staleness_threshold,
+                ):
+                    continue
+                orphaned.append(result.value)
+
+        return orphaned
+
+    @staticmethod
+    def _merge_event_streams(
+        primary_events: list[BaseEvent],
+        related_events: list[BaseEvent],
+    ) -> list[BaseEvent]:
+        """Merge event streams by id and return them in replay order."""
+        seen_ids: set[str] = set()
+        merged: list[BaseEvent] = []
+
+        for event in [*primary_events, *related_events]:
+            if event.id in seen_ids:
+                continue
+            seen_ids.add(event.id)
+            merged.append(event)
+
+        def _get_aware_timestamp(event: BaseEvent) -> datetime:
+            ts = event.timestamp
+            if ts is None:
+                return datetime.min.replace(tzinfo=UTC)
+            if ts.tzinfo is None:
+                return ts.replace(tzinfo=UTC)
+            return ts
+
+        merged.sort(
+            key=lambda event: (
+                _get_aware_timestamp(event),
+                event.id,
+            ),
+        )
+        return merged
+
+    @staticmethod
+    def _merge_progress_payloads(
+        existing: dict[str, Any],
+        update: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge progress updates while preserving reconnectable OpenCode runtime state."""
+        merged = {**existing, **update}
+
+        existing_runtime = existing.get("runtime")
+        update_runtime = update.get("runtime")
+        if not isinstance(existing_runtime, dict) or not isinstance(update_runtime, dict):
+            return merged
+
+        if (
+            existing_runtime.get("backend") != "opencode"
+            or update_runtime.get("backend") != "opencode"
+        ):
+            return merged
+
+        merged_runtime = dict(existing_runtime)
+        for key, value in update_runtime.items():
+            if key == "metadata":
+                continue
+            if value is not None:
+                merged_runtime[key] = value
+
+        existing_metadata = existing_runtime.get("metadata")
+        update_metadata = update_runtime.get("metadata")
+        if isinstance(existing_metadata, dict) or isinstance(update_metadata, dict):
+            merged_metadata = dict(existing_metadata) if isinstance(existing_metadata, dict) else {}
+            if isinstance(update_metadata, dict):
+                merged_metadata.update(
+                    {key: value for key, value in update_metadata.items() if value is not None}
+                )
+            if merged_metadata:
+                merged_runtime["metadata"] = merged_metadata
+
+        merged["runtime"] = merged_runtime
+        return merged
+
+    async def create_session(
+        self,
+        execution_id: str,
+        seed_id: str,
+        session_id: str | None = None,
+        seed_goal: str | None = None,
+        runtime_backend: str | None = None,
+        llm_backend: str | None = None,
+        gate_forced: bool | None = None,
+        execution_contract: Mapping[str, Any] | None = None,
+        acceptance_root_indices: Iterable[int] | None = None,
+        project_identity: ProjectIdentity | None = None,
+        project_workspace: str | None = None,
+        project_task_workspace: TaskWorkspace | None = None,
+    ) -> Result[SessionTracker, PersistenceError]:
+        """Create a new session and persist start event.
+
+        Args:
+            execution_id: Workflow execution ID.
+            seed_id: Seed ID being executed.
+            session_id: Optional custom session ID.
+            seed_goal: Optional goal text to persist with the start event.
+            runtime_backend: Agent runtime backend (claude/codex/hermes/…), persisted
+                so observers (the live dashboard) can tag the run's provider even for
+                simple, non-decomposed runs that emit no per-worker session events.
+            llm_backend: Resolved LLM backend, persisted alongside for the same reason.
+            gate_forced: Whether the Seed bypassed the ambiguity gate. ``None``
+                preserves the legacy event shape when the decision is unknown.
+            execution_contract: Resolved immutable run inputs needed for safe
+                resume and proof-cohort attribution. The same payload is also
+                written to the initial progress checkpoint by the runner.
+            acceptance_root_indices: Immutable root AC indices persisted before
+                the session is exposed, so pre-execution terminalization cannot
+                lose undecided roots.
+            project_identity: Canonical cross-run project/workspace anchor. It
+                is additive metadata only and grants no execution authority.
+            project_workspace: Actual runner cwd re-resolved immediately before
+                immutable publication. It is validation input, not event data.
+            project_task_workspace: Frozen managed source/execution paths to
+                revalidate together at the immutable publication boundary.
+
+        Returns:
+            Result containing new SessionTracker.
+        """
+        execution_contract_snapshot = (
+            sanitize_event_data_for_persistence(dict(execution_contract))
+            if execution_contract is not None
+            else None
+        )
+        await _validate_project_identity_publication(
+            execution_contract_snapshot,
+            project_identity,
+            project_workspace,
+            project_task_workspace,
+        )
+        tracker = SessionTracker.create(execution_id, seed_id, session_id)
+
+        event_data = {
+            "execution_id": execution_id,
+            "seed_id": seed_id,
+            "start_time": tracker.start_time.isoformat(),
+        }
+        if acceptance_root_indices is not None:
+            event_data[ACCEPTANCE_ROOT_INDICES_PROGRESS_KEY] = _normalize_acceptance_root_indices(
+                acceptance_root_indices
+            )
+        if seed_goal:
+            event_data["seed_goal"] = seed_goal
+        if runtime_backend:
+            event_data["runtime_backend"] = runtime_backend
+        if llm_backend:
+            event_data["llm_backend"] = llm_backend
+        if gate_forced is not None:
+            event_data["gate_forced"] = gate_forced
+        if project_identity is not None:
+            event_data.update(project_identity.to_event_data())
+        if execution_contract_snapshot is not None:
+            event_data["execution_contract"] = execution_contract_snapshot
+
+        event = BaseEvent(
+            type="orchestrator.session.started",
+            aggregate_type="session",
+            aggregate_id=tracker.session_id,
+            data=event_data,
+        )
+
+        try:
+            await self._event_store.append(event)
+            log.info(
+                "orchestrator.session.created",
+                session_id=tracker.session_id,
+                execution_id=execution_id,
+            )
+            return Result.ok(tracker)
+        except Exception as e:
+            log.exception(
+                "orchestrator.session.create_failed",
+                session_id=tracker.session_id,
+                error=str(e),
+            )
+            if isinstance(e, PersistenceError):
+                return Result.err(e)
+            return Result.err(
+                PersistenceError(
+                    message=f"Failed to create session: {e}",
+                    details={"session_id": tracker.session_id},
+                )
+            )
+
+    async def track_progress(
+        self,
+        session_id: str,
+        progress: dict[str, Any],
+    ) -> Result[None, PersistenceError]:
+        """Emit progress event for session.
+
+        Args:
+            session_id: Session to update.
+            progress: Progress data to record.
+
+        Returns:
+            Result indicating success or failure.
+        """
+        sanitized_progress = self._normalize_progress_payload(progress)
+        event = BaseEvent(
+            type="orchestrator.progress.updated",
+            aggregate_type="session",
+            aggregate_id=session_id,
+            data={
+                "progress": sanitized_progress,
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
+        )
+
+        try:
+            await self._event_store.append(event)
+            return Result.ok(None)
+        except Exception as e:
+            log.warning(
+                "orchestrator.progress.track_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+            return Result.err(
+                PersistenceError(
+                    message=f"Failed to track progress: {e}",
+                    details={"session_id": session_id},
+                )
+            )
+
+    async def mark_completed(
+        self,
+        session_id: str,
+        summary: dict[str, Any] | None = None,
+        *,
+        messages_processed: int = 0,
+        acceptance_finalizations: list[dict[str, Any]] | None = None,
+    ) -> Result[bool, PersistenceError]:
+        """Mark session as completed.
+
+        Args:
+            session_id: Session to complete.
+            summary: Optional completion summary.
+            messages_processed: Total runtime messages observed before completion.
+
+        Returns:
+            Result whose value is ``True`` when this completion became durable,
+            or ``False`` when another terminal transition already won.
+        """
+        data: dict[str, Any] = {
+            "summary": summary or {},
+            "messages_processed": max(messages_processed, 0),
+            "completed_at": datetime.now(UTC).isoformat(),
+        }
+        if acceptance_finalizations is not None:
+            data["acceptance_finalizations"] = acceptance_finalizations
+        event = BaseEvent(
+            type="orchestrator.session.completed",
+            aggregate_type="session",
+            aggregate_id=session_id,
+            data=data,
+        )
+
+        try:
+            persisted = await self._event_store.append(event)
+            if persisted is False:
+                log.info(
+                    "orchestrator.session.terminal_transition_preserved",
+                    session_id=session_id,
+                    requested_status=SessionStatus.COMPLETED.value,
+                )
+            else:
+                log.info(
+                    "orchestrator.session.completed",
+                    session_id=session_id,
+                )
+            return Result.ok(persisted is not False)
+        except Exception as e:
+            log.exception(
+                "orchestrator.session.complete_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+            return Result.err(
+                PersistenceError(
+                    message=f"Failed to mark session completed: {e}",
+                    details={"session_id": session_id},
+                )
+            )
+
+    async def mark_failed(
+        self,
+        session_id: str,
+        error_message: str,
+        error_details: dict[str, Any] | None = None,
+        *,
+        error_type: str | None = None,
+        messages_processed: int = 0,
+        acceptance_finalizations: list[dict[str, Any]] | None = None,
+    ) -> Result[bool, PersistenceError]:
+        """Mark session as failed.
+
+        Args:
+            session_id: Session that failed.
+            error_message: Error description.
+            error_details: Optional error details.
+            error_type: Optional stable failure class.
+            messages_processed: Total runtime messages observed before failure.
+
+        Returns:
+            Result whose value is ``True`` when this failure became durable,
+            or ``False`` when another terminal transition already won.
+        """
+        data: dict[str, Any] = {
+            "error": error_message,
+            "error_details": error_details or {},
+            "error_type": error_type,
+            "messages_processed": max(messages_processed, 0),
+            "failed_at": datetime.now(UTC).isoformat(),
+        }
+        if acceptance_finalizations is not None:
+            data["acceptance_finalizations"] = acceptance_finalizations
+        event = BaseEvent(
+            type="orchestrator.session.failed",
+            aggregate_type="session",
+            aggregate_id=session_id,
+            data=data,
+        )
+
+        try:
+            persisted = await self._event_store.append(event)
+            if persisted is False:
+                log.info(
+                    "orchestrator.session.terminal_transition_preserved",
+                    session_id=session_id,
+                    requested_status=SessionStatus.FAILED.value,
+                )
+            else:
+                log.error(
+                    "orchestrator.session.failed",
+                    session_id=session_id,
+                    error=error_message,
+                )
+            return Result.ok(persisted is not False)
+        except Exception as e:
+            log.exception(
+                "orchestrator.session.fail_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+            return Result.err(
+                PersistenceError(
+                    message=f"Failed to mark session failed: {e}",
+                    details={"session_id": session_id},
+                )
+            )
+
+    async def mark_failed_if_active(
+        self,
+        session_id: str,
+        error_message: str,
+        error_details: dict[str, Any] | None = None,
+        *,
+        acceptance_finalizations: list[dict[str, Any]] | None = None,
+    ) -> Result[bool, PersistenceError]:
+        """Fail an active session without overwriting an existing terminal result.
+
+        ``False`` is a successful no-op: another terminal lifecycle event was
+        already durable. All terminal writers now use the same CAS boundary;
+        this compatibility name delegates to the canonical method.
+        """
+        return await self.mark_failed(
+            session_id,
+            error_message,
+            error_details,
+            acceptance_finalizations=acceptance_finalizations,
+        )
+
+    async def mark_paused(
+        self,
+        session_id: str,
+        reason: str,
+        resume_hint: str | None = None,
+        *,
+        pause_seconds: int | None = None,
+        resume_after: datetime | None = None,
+        pause_kind: str | None = None,
+        pause_owner: Mapping[str, object] | None = None,
+    ) -> Result[bool, PersistenceError]:
+        """Mark session as paused and resumable.
+
+        Args:
+            session_id: Session being paused.
+            reason: Why the session was paused.
+            resume_hint: Optional retry guidance.
+
+        Returns:
+            Result whose value is ``True`` when PAUSED became durable, or
+            ``False`` when an explicit terminal session event already won.
+        """
+        data: dict[str, Any] = {
+            "reason": reason,
+            "resume_hint": resume_hint,
+            "paused_at": datetime.now(UTC).isoformat(),
+        }
+        if pause_seconds is not None:
+            data["pause_seconds"] = pause_seconds
+        if resume_after is not None:
+            data["resume_after"] = resume_after.isoformat()
+        if pause_kind is not None:
+            data["pause_kind"] = pause_kind
+        if pause_owner is not None:
+            data["pause_owner"] = _normalize_pause_owner(pause_owner)
+
+        event = BaseEvent(
+            type="orchestrator.session.paused",
+            aggregate_type="session",
+            aggregate_id=session_id,
+            data=data,
+        )
+
+        try:
+            persisted = await self._event_store.append_session_pause_if_active(event)
+            if persisted:
+                log.info(
+                    "orchestrator.session.paused",
+                    session_id=session_id,
+                    reason=reason,
+                )
+            else:
+                log.info(
+                    "orchestrator.session.pause_terminal_preserved",
+                    session_id=session_id,
+                )
+            return Result.ok(persisted)
+        except Exception as e:
+            log.exception(
+                "orchestrator.session.pause_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+            return Result.err(
+                PersistenceError(
+                    message=f"Failed to mark session paused: {e}",
+                    details={"session_id": session_id},
+                )
+            )
+
+    async def mark_cancelled(
+        self,
+        session_id: str,
+        reason: str,
+        cancelled_by: str = "user",
+        *,
+        acceptance_finalizations: list[dict[str, Any]] | None = None,
+    ) -> Result[bool, PersistenceError]:
+        """Mark session as cancelled.
+
+        Args:
+            session_id: Session to cancel.
+            reason: Why the session was cancelled.
+            cancelled_by: Who/what initiated cancellation ("user", "auto_cleanup").
+
+        Returns:
+            Result whose value is ``True`` when this cancellation became
+            durable, or ``False`` when another terminal transition already won.
+        """
+        data: dict[str, Any] = {
+            "reason": reason,
+            "cancelled_by": cancelled_by,
+            "cancelled_at": datetime.now(UTC).isoformat(),
+        }
+        if acceptance_finalizations is not None:
+            data["acceptance_finalizations"] = acceptance_finalizations
+        event = BaseEvent(
+            type="orchestrator.session.cancelled",
+            aggregate_type="session",
+            aggregate_id=session_id,
+            data=data,
+        )
+
+        try:
+            persisted = await self._event_store.append(event)
+            if persisted is False:
+                log.info(
+                    "orchestrator.session.terminal_transition_preserved",
+                    session_id=session_id,
+                    requested_status=SessionStatus.CANCELLED.value,
+                )
+            else:
+                log.info(
+                    "orchestrator.session.cancelled",
+                    session_id=session_id,
+                    reason=reason,
+                    cancelled_by=cancelled_by,
+                )
+            return Result.ok(persisted is not False)
+        except Exception as e:
+            log.exception(
+                "orchestrator.session.cancel_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+            return Result.err(
+                PersistenceError(
+                    message=f"Failed to mark session cancelled: {e}",
+                    details={"session_id": session_id},
+                )
+            )
+
+    async def mark_cancelled_if_active(
+        self,
+        session_id: str,
+        reason: str,
+        cancelled_by: str = "user",
+        *,
+        acceptance_finalizations: list[dict[str, Any]] | None = None,
+    ) -> Result[bool, PersistenceError]:
+        """Cancel an active session without overwriting another terminal result.
+
+        ``False`` means the durable session was already terminal.  It is not a
+        persistence failure. All terminal writers now use the same CAS boundary;
+        this compatibility name delegates to the canonical method.
+        """
+        return await self.mark_cancelled(
+            session_id,
+            reason,
+            cancelled_by,
+            acceptance_finalizations=acceptance_finalizations,
+        )
+
+    async def reconstruct_session(
+        self,
+        session_id: str,
+        *,
+        strict_related_events: bool = False,
+    ) -> Result[SessionTracker, PersistenceError]:
+        """Reconstruct session state from events.
+
+        Replays all events for the session to rebuild the current state.
+        This is used for session resumption. Read-only projections that must
+        never publish a status from incomplete history can require the related
+        execution-event read to succeed; ordinary resume retains the existing
+        best-effort compatibility behavior.
+
+        Args:
+            session_id: Session to reconstruct.
+            strict_related_events: Fail reconstruction when the complete
+                related execution-event stream cannot be read or represented.
+
+        Returns:
+            Result containing reconstructed SessionTracker.
+        """
+        try:
+            events = await self._event_store.replay("session", session_id)
+
+            if not events:
+                return Result.err(
+                    PersistenceError(
+                        message=f"No events found for session: {session_id}",
+                        details={"session_id": session_id},
+                    )
+                )
+
+            # Find the start event to get initial state
+            start_event = next(
+                (e for e in events if e.type == "orchestrator.session.started"),
+                None,
+            )
+
+            if not start_event:
+                return Result.err(
+                    PersistenceError(
+                        message=f"No start event found for session: {session_id}",
+                        details={"session_id": session_id},
+                    )
+                )
+
+            # Create initial tracker from start event
+            start_time = self._coerce_snapshot_datetime(start_event.data.get("start_time"))
+            if start_time is None:
+                start_time = self._coerce_snapshot_datetime(start_event.timestamp)
+            if start_time is None:
+                start_time = datetime.now(UTC)
+
+            tracker = SessionTracker(
+                session_id=session_id,
+                execution_id=start_event.data.get("execution_id", ""),
+                seed_id=start_event.data.get("seed_id", ""),
+                status=SessionStatus.RUNNING,
+                start_time=start_time,
+            )
+
+            execution_id = start_event.data.get("execution_id", "")
+            all_events = list(events)
+            query_related = getattr(self._event_store, "query_session_related_events", None)
+            if callable(query_related):
+                try:
+                    related_events = await query_related(
+                        session_id=session_id,
+                        execution_id=execution_id or None,
+                        limit=None,
+                    )
+                    if not isinstance(related_events, list):
+                        if strict_related_events:
+                            raise TypeError("related event query did not return a list")
+                        related_events = []
+                    if related_events:
+                        all_events = self._merge_event_streams(events, related_events)
+                except Exception:
+                    if strict_related_events:
+                        raise
+                    log.warning(
+                        "orchestrator.session.related_event_query_failed",
+                        session_id=session_id,
+                        execution_id=execution_id,
+                    )
+            elif strict_related_events:
+                raise RuntimeError("related event query is unavailable")
+
+            # Replay subsequent events
+            messages_processed = 0
+            start_identity = {
+                key: sanitize_event_data_for_persistence(start_event.data[key])
+                for key in (
+                    "execution_id",
+                    "seed_id",
+                    "seed_goal",
+                    "runtime_backend",
+                    "llm_backend",
+                    "gate_forced",
+                    "project_id",
+                    "project_root",
+                    "workspace_path",
+                )
+                if key in start_event.data
+            }
+            last_progress: dict[str, Any] = {
+                SESSION_START_IDENTITY_PROGRESS_KEY: start_identity,
+            }
+            if ACCEPTANCE_ROOT_INDICES_PROGRESS_KEY in start_event.data:
+                last_progress[ACCEPTANCE_ROOT_INDICES_PROGRESS_KEY] = (
+                    _normalize_acceptance_root_indices(
+                        start_event.data[ACCEPTANCE_ROOT_INDICES_PROGRESS_KEY]
+                    )
+                )
+            if "execution_contract" in start_event.data:
+                start_execution_contract = start_event.data.get("execution_contract")
+                # The start event is the durable fallback for the immutable run
+                # contract. A later progress event normally repeats it and may
+                # overwrite this copy, but losing that progress row must never make
+                # a new-format session look legacy and silently recompute routing.
+                # Preserve malformed-present values too: the runner distinguishes
+                # a missing legacy key from a corrupt current-format contract and
+                # must fail closed on the latter.
+                last_progress["execution_contract"] = (
+                    dict(start_execution_contract)
+                    if isinstance(start_execution_contract, Mapping)
+                    else start_execution_contract
+                )
+            runtime_identity: dict[str, Any] | None = None
+            explicit_terminal_status: SessionStatus | None = None
+
+            def observe_runtime_identity(progress_payload: Mapping[str, Any]) -> None:
+                nonlocal runtime_identity
+                observed = runtime_resume_identity_from_payload(progress_payload.get("runtime"))
+                if observed is None:
+                    return
+                if runtime_identity is None:
+                    runtime_identity = dict(observed)
+                    return
+                if runtime_identity.get("status") == "conflict":
+                    return
+                if runtime_identity != observed:
+                    runtime_identity = {
+                        "status": "conflict",
+                        "first": dict(runtime_identity),
+                        "later": dict(observed),
+                    }
+
+            for event in all_events:
+                if event.type == "orchestrator.progress.updated":
+                    progress_update = event.data.get("progress", {})
+                    if not isinstance(progress_update, dict):
+                        continue
+                    progress_update = self._normalize_progress_payload(progress_update)
+                    observe_runtime_identity(progress_update)
+                    last_progress = self._merge_progress_payloads(last_progress, progress_update)
+                    persisted_messages = progress_update.get("messages_processed")
+                    if isinstance(persisted_messages, int):
+                        messages_processed = max(messages_processed, persisted_messages)
+                    else:
+                        messages_processed += 1
+                elif event.type == "workflow.progress.updated":
+                    workflow_progress = self._normalize_progress_payload(
+                        self._workflow_progress_from_event(event.data),
+                    )
+                    if workflow_progress:
+                        observe_runtime_identity(workflow_progress)
+                        last_progress = self._merge_progress_payloads(
+                            last_progress,
+                            workflow_progress,
+                        )
+                        persisted_messages = workflow_progress.get("messages_processed")
+                        if isinstance(persisted_messages, int):
+                            messages_processed = max(messages_processed, persisted_messages)
+                elif event.type == "orchestrator.session.paused":
+                    pause_progress = self._pause_progress_from_event(event.data)
+                    last_progress = self._merge_progress_payloads(
+                        last_progress,
+                        pause_progress,
+                    )
+                elif event.type in _PARALLEL_ACTIVITY_EVENT_TYPES:
+                    messages_processed += 1
+                status_update = self._status_from_event(event.type, event.data)
+                if status_update is not None:
+                    # A durable terminal lifecycle event is authoritative. A
+                    # delayed runtime/progress observation must not revive a
+                    # cancelled, failed, or completed session during replay.
+                    # ``PAUSED`` deliberately remains resumable: a subsequent
+                    # running progress checkpoint is the existing resume signal.
+                    if explicit_terminal_status in {
+                        SessionStatus.COMPLETED,
+                        SessionStatus.FAILED,
+                        SessionStatus.CANCELLED,
+                    }:
+                        continue
+                    tracker = tracker.with_status(status_update)
+                    if status_update == SessionStatus.RUNNING:
+                        explicit_terminal_status = None
+                        for key in (
+                            "pause_kind",
+                            "pause_seconds",
+                            "resume_after",
+                            "resume_hint",
+                            "paused_at",
+                            "pause_reason",
+                            "pause_owner",
+                        ):
+                            last_progress.pop(key, None)
+                    elif event.type in {
+                        "orchestrator.session.completed",
+                        "orchestrator.session.failed",
+                        "orchestrator.session.cancelled",
+                        "orchestrator.session.paused",
+                    }:
+                        explicit_terminal_status = status_update
+
+            # This snapshot is derived from the authoritative start event, not
+            # from mutable progress. Re-assert it after replay so even a corrupt
+            # or colliding progress key cannot rewrite the identity used by
+            # legacy contract migration.
+            last_progress[SESSION_START_IDENTITY_PROGRESS_KEY] = start_identity
+            if runtime_identity is None:
+                last_progress.pop(SESSION_RUNTIME_IDENTITY_PROGRESS_KEY, None)
+            else:
+                last_progress[SESSION_RUNTIME_IDENTITY_PROGRESS_KEY] = runtime_identity
+
+            # Sanitize stale runtime metadata when an explicit lifecycle event
+            # provides the authoritative session state. Progress events captured
+            # during execution may contain
+            # ``runtime_status: running`` which contradicts the authoritative
+            # terminal status and confuses downstream consumers (#188).
+            if explicit_terminal_status is not None and last_progress.get("runtime_status"):
+                last_progress["runtime_status"] = explicit_terminal_status.value
+
+            # Apply accumulated progress
+            tracker = replace(
+                tracker,
+                progress=last_progress,
+                messages_processed=messages_processed,
+            )
+
+            # Child AC runtime streams emit terminal runtime_status values into the
+            # shared session audit log. Those should not flip the parent session to
+            # completed/failed while workflow progress still shows unfinished ACs.
+            if (
+                explicit_terminal_status is None
+                and tracker.status
+                in {
+                    SessionStatus.COMPLETED,
+                    SessionStatus.FAILED,
+                    SessionStatus.CANCELLED,
+                }
+                and self._workflow_is_incomplete(last_progress)
+            ):
+                tracker = tracker.with_status(SessionStatus.RUNNING)
+
+            log.info(
+                "orchestrator.session.reconstructed",
+                session_id=session_id,
+                status=tracker.status.value,
+                messages_processed=messages_processed,
+            )
+
+            return Result.ok(tracker)
+
+        except Exception as e:
+            log.exception(
+                "orchestrator.session.reconstruct_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+            return Result.err(
+                PersistenceError(
+                    message=f"Failed to reconstruct session: {e}",
+                    details={"session_id": session_id},
+                )
+            )
+
+    async def find_orphaned_sessions(
+        self,
+        staleness_threshold: timedelta = timedelta(hours=1),
+    ) -> list[SessionTracker]:
+        """Find orphaned sessions that are still running but have gone stale.
+
+        A session is considered orphaned if:
+        1. Its current status is RUNNING (or PAUSED)
+        2. Its last activity timestamp (last event) is older than the staleness threshold
+        3. No active heartbeat exists for the session (runtime-agnostic check)
+
+        The heartbeat mechanism is extensible: any runtime (codex, claude_code,
+        or future runtimes) just needs to call write_heartbeat(session_id) during
+        execution. No process-name coupling required.
+
+        Args:
+            staleness_threshold: How long since last activity before a session
+                is considered orphaned. Defaults to 1 hour.
+
+        Returns:
+            List of SessionTracker instances for orphaned sessions.
+        """
+        from ouroboros.orchestrator.heartbeat import get_alive_sessions
+
+        alive_sessions = get_alive_sessions()
+        now = datetime.now(UTC)
+        orphaned: list[SessionTracker] = []
+
+        try:
+            get_snapshots = getattr(self._event_store, "get_session_activity_snapshots", None)
+            if callable(get_snapshots):
+                snapshots = await get_snapshots()
+                if isinstance(snapshots, list):
+                    orphaned = await self._find_orphaned_sessions_via_snapshots(
+                        snapshots,
+                        alive_sessions,
+                        staleness_threshold,
+                        now,
+                    )
+                    log.info(
+                        "orchestrator.orphan_detection.complete",
+                        total_sessions=len(snapshots),
+                        orphaned_count=len(orphaned),
+                        strategy="snapshot",
+                    )
+                    return orphaned
+
+            # Get all session start events to enumerate sessions
+            start_events = await self._event_store.get_all_sessions()
+
+            for start_event in start_events:
+                session_id = start_event.aggregate_id
+
+                # Replay all events for this session
+                try:
+                    events = await self._event_store.replay("session", session_id)
+                except Exception:
+                    log.warning(
+                        "orchestrator.orphan_detection.replay_failed",
+                        session_id=session_id,
+                    )
+                    continue
+
+                if not events:
+                    continue
+
+                # Determine current status by replaying events
+                status = SessionStatus.RUNNING
+                for event in events:
+                    status_update = self._status_from_event(event.type, event.data)
+                    if status_update is not None:
+                        if status in {
+                            SessionStatus.COMPLETED,
+                            SessionStatus.FAILED,
+                            SessionStatus.CANCELLED,
+                        }:
+                            continue
+                        status = status_update
+
+                # Only consider active sessions (RUNNING or PAUSED)
+                if status not in (SessionStatus.RUNNING, SessionStatus.PAUSED):
+                    continue
+
+                # Check the last event's timestamp for staleness
+                last_event = events[-1]
+                last_activity = last_event.timestamp
+                if last_activity is None:
+                    # If no timestamp, use start_time from event data as fallback
+                    start_time_str = start_event.data.get("start_time")
+                    if start_time_str:
+                        last_activity = self._coerce_snapshot_datetime(start_time_str)
+                    else:
+                        continue
+                if last_activity is None:
+                    continue
+
+                # Ensure timezone-aware comparison
+                if last_activity.tzinfo is None:
+                    last_activity = last_activity.replace(tzinfo=UTC)
+
+                if (now - last_activity) > staleness_threshold:
+                    # Skip if the session has an active heartbeat
+                    if session_id in alive_sessions:
+                        log.info(
+                            "orchestrator.orphan_detection.heartbeat_alive",
+                            session_id=session_id,
+                        )
+                        continue
+
+                    # Reconstruct full tracker for the orphaned session
+                    result = await self.reconstruct_session(session_id)
+                    if result.is_ok:
+                        if result.value.status not in (
+                            SessionStatus.RUNNING,
+                            SessionStatus.PAUSED,
+                        ):
+                            continue
+                        if self._usage_limit_pause_cleanup_deferred(
+                            result.value,
+                            now=now,
+                            staleness_threshold=staleness_threshold,
+                        ):
+                            continue
+                        orphaned.append(result.value)
+
+            log.info(
+                "orchestrator.orphan_detection.complete",
+                total_sessions=len(start_events),
+                orphaned_count=len(orphaned),
+                strategy="replay",
+            )
+
+        except Exception as e:
+            log.exception(
+                "orchestrator.orphan_detection.failed",
+                error=str(e),
+            )
+
+        return orphaned
+
+    async def cancel_orphaned_sessions(
+        self,
+        staleness_threshold: timedelta = timedelta(hours=1),
+    ) -> list[SessionTracker]:
+        """Detect and cancel orphaned sessions.
+
+        This is the auto-cleanup routine intended to run during MCP server
+        startup. It finds all sessions that are still active (RUNNING/PAUSED)
+        but have had no activity for longer than the staleness threshold,
+        cancels each one, and logs the cancellations to stderr.
+
+        Args:
+            staleness_threshold: How long since last activity before a session
+                is considered orphaned. Defaults to 1 hour.
+
+        Returns:
+            List of SessionTracker instances that were cancelled.
+        """
+        import sys
+
+        orphaned = await self.find_orphaned_sessions(staleness_threshold)
+
+        if not orphaned:
+            log.info("orchestrator.auto_cleanup.no_orphans")
+            return []
+
+        cancelled: list[SessionTracker] = []
+
+        # Orphan cleanup is another terminal writer.  Route it through the
+        # same process-local cancellation protocol as user/MCP cancellation so
+        # the Foundation B acceptance plan is collected before the terminal
+        # session CAS.  Import lazily to keep the session model independent of
+        # the authority registry at module import time.
+        from ouroboros.orchestrator.execution_authority import (
+            ProcessLocalCancellationDisposition,
+            collect_cancellation_acceptance_plan,
+            request_process_local_cancellation,
+        )
+
+        for tracker in orphaned:
+            reason = (
+                f"Auto-cancelled on startup: session was {tracker.status.value} "
+                f"with no activity for over {staleness_threshold}"
+            )
+            outcome = await request_process_local_cancellation(
+                tracker,
+                self,
+                reason=reason,
+                cancelled_by="auto_cleanup",
+            )
+
+            if outcome is None:
+                # Historical sessions may not carry Foundation A's persisted
+                # process-local contract.  Keep the compatibility fallback,
+                # but still use the same B plan and atomic terminal CAS.
+                try:
+                    acceptance_finalizations = await collect_cancellation_acceptance_plan(
+                        session_id=tracker.session_id,
+                        execution_id=tracker.execution_id,
+                        event_store=self._event_store,
+                        expected_root_indices=(
+                            tuple(tracker.progress[ACCEPTANCE_ROOT_INDICES_PROGRESS_KEY])
+                            if isinstance(
+                                tracker.progress.get(ACCEPTANCE_ROOT_INDICES_PROGRESS_KEY),
+                                (list, tuple),
+                            )
+                            else None
+                        ),
+                    )
+                    result = await self.mark_cancelled(
+                        session_id=tracker.session_id,
+                        reason=reason,
+                        cancelled_by="auto_cleanup",
+                        acceptance_finalizations=acceptance_finalizations,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "orchestrator.auto_cleanup.cancel_failed",
+                        session_id=tracker.session_id,
+                        error=str(exc),
+                    )
+                    continue
+                if result.is_ok and result.value is not False:
+                    cancelled.append(tracker)
+                    print(
+                        f"[ouroboros] Auto-cancelled orphaned session "
+                        f"{tracker.session_id} (execution={tracker.execution_id}, "
+                        f"previous_status={tracker.status.value})",
+                        file=sys.stderr,
+                    )
+                elif result.is_err:
+                    log.warning(
+                        "orchestrator.auto_cleanup.cancel_failed",
+                        session_id=tracker.session_id,
+                        error=str(result.error),
+                    )
+                continue
+
+            if outcome.disposition is ProcessLocalCancellationDisposition.CANCELLED:
+                cancelled.append(tracker)
+                # Log to stderr so it's visible in MCP stdio mode
+                print(
+                    f"[ouroboros] Auto-cancelled orphaned session "
+                    f"{tracker.session_id} (execution={tracker.execution_id}, "
+                    f"previous_status={tracker.status.value})",
+                    file=sys.stderr,
+                )
+            elif outcome.disposition is ProcessLocalCancellationDisposition.ALREADY_TERMINAL:
+                log.info(
+                    "orchestrator.auto_cleanup.terminal_transition_preserved",
+                    session_id=tracker.session_id,
+                )
+                log.info(
+                    "orchestrator.auto_cleanup.cancelled",
+                    session_id=tracker.session_id,
+                    execution_id=tracker.execution_id,
+                    previous_status=tracker.status.value,
+                )
+            else:
+                log.warning(
+                    "orchestrator.auto_cleanup.cancel_failed",
+                    session_id=tracker.session_id,
+                    error=str(outcome.error),
+                )
+
+            # Continue with the next stale session even if one cancellation
+            # remains retryable; a single unreadable telemetry stream must not
+            # prevent cleanup of unrelated orphaned sessions.
+            continue
+
+        log.info(
+            "orchestrator.auto_cleanup.complete",
+            orphaned_count=len(orphaned),
+            cancelled_count=len(cancelled),
+        )
+
+        return cancelled
+
+
+__all__ = [
+    "SessionRepository",
+    "SessionStatus",
+    "SessionTracker",
+]

@@ -1,0 +1,392 @@
+import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { isKnownSinkPeerClosedError } from "../src/broken-pipe";
+import { parseCrashEventLine } from "../src/crash-journal";
+import { getCrashEventsPath, getCrashLogPath } from "../src/dirs";
+
+interface ScenarioResult {
+	stdout: string;
+	stderr: string;
+	exitCode: number;
+}
+
+interface FixtureResult {
+	count: number;
+	exitBeforeCleanupFinished?: boolean;
+	started?: boolean;
+}
+
+const fixturePath = path.join(import.meta.dir, "postmortem-fixture.ts");
+const utilsDirectory = path.join(import.meta.dir, "..");
+
+/**
+ * Every scenario here deliberately crashes a real subprocess, and the fatal
+ * handler writes to whatever `getCrashLogPath()` resolves to. Without an
+ * override that is the developer's own `~/.gjc/agent/gjc-crash.log`, so a test
+ * run injected a dozen `fixture: ...` signatures into their real crash store --
+ * visible in `gjc crash list`, offered up by `gjc crash report`, eligible for
+ * the opt-in upstream relay, and competing for the log's fixed byte cap against
+ * the genuine crash they might actually need to file.
+ *
+ * Redirect the whole store into a temp directory instead. This is scoped to the
+ * spawned child only; the parent test process is untouched. The directory is
+ * not created here because the crash writer already does `mkdirSync` on its
+ * target's parent.
+ */
+const fixtureAgentDir = path.join(os.tmpdir(), `gjc-postmortem-agent-${process.pid}-${Date.now()}`);
+
+async function captureProcess(command: string[], cwd: string): Promise<ScenarioResult> {
+	const proc = Bun.spawn(command, {
+		cwd,
+		env: { ...process.env, GJC_CODING_AGENT_DIR: fixtureAgentDir },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	return { stdout, stderr, exitCode };
+}
+
+async function runScenario(scenario: string, extraArgs: readonly string[] = []): Promise<ScenarioResult> {
+	return captureProcess([process.execPath, fixturePath, scenario, ...extraArgs], utilsDirectory);
+}
+
+async function runPipelineCommand(command: readonly string[]): Promise<ScenarioResult> {
+	return captureProcess(
+		["bash", "-o", "pipefail", "-c", '"$@" | true', "postmortem-pipeline", ...command],
+		utilsDirectory,
+	);
+}
+
+async function runPipelineScenario(scenario: string, extraArgs: readonly string[] = []): Promise<ScenarioResult> {
+	return runPipelineCommand([process.execPath, fixturePath, scenario, ...extraArgs]);
+}
+
+function parseResult(stdout: string): FixtureResult {
+	const line = stdout.trim().split("\n").at(-1);
+	if (!line) {
+		throw new Error("postmortem fixture produced no JSON result");
+	}
+	return JSON.parse(line) as FixtureResult;
+}
+
+function combinedOutput(result: ScenarioResult): string {
+	return `${result.stdout}\n${result.stderr}`;
+}
+
+function hasRecursiveCleanupError(stderr: string): boolean {
+	return stderr.includes('"level":"error"') && stderr.includes('"message":"Cleanup invoked recursively"');
+}
+
+function expectOrdinaryFatal(result: ScenarioResult, label: string, message: string): void {
+	expect(result.exitCode).toBe(1);
+	expect(result.stderr).toContain(`[${label}]`);
+	expect(result.stderr).toContain(message);
+}
+
+describe("postmortem cleanup re-entry", () => {
+	it("does not log an error when the exit handler re-enters while cleanup is running", async () => {
+		const result = await runScenario("exit-reentry-while-running");
+
+		expect(result.exitCode).toBe(0);
+		expect(parseResult(result.stdout).count).toBe(1);
+		expect(hasRecursiveCleanupError(combinedOutput(result))).toBe(false);
+	});
+
+	it("keeps the recursive cleanup error for non-exit re-entry", async () => {
+		const result = await runScenario("non-exit-recursive-cleanup");
+
+		expect(result.exitCode).toBe(0);
+		expect(parseResult(result.stdout).count).toBe(1);
+		expect(hasRecursiveCleanupError(combinedOutput(result))).toBe(true);
+		expect(combinedOutput(result)).toContain('"stack"');
+	});
+
+	it("waits for cleanup when synchronous re-entry calls quit", async () => {
+		const result = await runScenario("quit-reentry-waits-for-cleanup");
+
+		expect(result.exitCode).toBe(0);
+		expect(parseResult(result.stdout)).toEqual({ count: 2, exitBeforeCleanupFinished: false });
+	});
+
+	it("keeps completed cleanup a no-op when the exit handler fires", async () => {
+		const result = await runScenario("completed-cleanup-exit-noop");
+
+		expect(result.exitCode).toBe(0);
+		expect(parseResult(result.stdout).count).toBe(1);
+		expect(hasRecursiveCleanupError(combinedOutput(result))).toBe(false);
+	});
+});
+
+describe("postmortem cleanup deadline contract (issue #2556)", () => {
+	it("a second termination signal joins the in-flight cleanup instead of truncating it", async () => {
+		const result = await runScenario("consecutive-signals-share-cleanup");
+
+		// The first signal (SIGHUP) owns the exit; the teardown callback runs
+		// exactly once and completes despite the SIGTERM 20ms later.
+		expect(result.exitCode).toBe(129);
+		expect(parseResult(result.stdout).count).toBe(1);
+		expect(result.stdout).toContain('"reason":"sighup"');
+		expect(hasRecursiveCleanupError(combinedOutput(result))).toBe(false);
+	});
+
+	it("a hung cleanup callback cannot outlive the deadline on a signal exit; owner code preserved", async () => {
+		const result = await runScenario("cleanup-deadline-signal");
+
+		expect(result.exitCode).toBe(143);
+		expect(parseResult(result.stdout).started).toBe(true);
+		expect(result.stderr).toContain("cleanup deadline (300ms) expired for sigterm");
+	});
+
+	it("a hung cleanup callback cannot hang quit(); quit's exit code is preserved", async () => {
+		const result = await runScenario("cleanup-deadline-quit");
+
+		expect(result.exitCode).toBe(7);
+		expect(parseResult(result.stdout).started).toBe(true);
+		expect(result.stderr).toContain("cleanup deadline (300ms) expired for manual");
+	});
+
+	it("a hung cleanup callback cannot hang a fatal exit; fatal diagnostic and status 1 preserved", async () => {
+		const result = await runScenario("cleanup-deadline-fatal");
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toContain("[Uncaught Exception]");
+		expect(result.stderr).toContain("fixture: fatal with hung cleanup");
+		expect(result.stderr).toContain("cleanup deadline (300ms) expired for uncaught_exception");
+	});
+
+	it("quit drains backpressured stderr before preserving the requested exit code", async () => {
+		const proc = Bun.spawn([process.execPath, fixturePath, "quit-drains-backpressured-stderr"], {
+			cwd: utilsDirectory,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+
+		// Hold the read side briefly so the fixture's diagnostics exceed the pipe
+		// capacity and must be drained by quit() rather than merely queued.
+		await Bun.sleep(250);
+		const stderrPromise = new Response(proc.stderr).text();
+		const exitCode = await Promise.race([proc.exited, Bun.sleep(5_000).then(() => "timeout" as const)]);
+		if (exitCode === "timeout") proc.kill();
+		const stderr = await stderrPromise;
+
+		const diagnosticLine = "timing-diagnostic\n";
+		const terminalMarker = "TIMING_DIAGNOSTICS_COMPLETE\n";
+		expect(exitCode).not.toBe("timeout");
+		expect(exitCode).toBe(23);
+		expect(stderr.length).toBe(diagnosticLine.length * 131_072 + terminalMarker.length);
+		expect(stderr.endsWith(terminalMarker)).toBe(true);
+	}, 15_000);
+});
+
+describe("known-sink peer closure classification", () => {
+	it("accepts structural errors without requiring Error instances", () => {
+		expect(isKnownSinkPeerClosedError({ code: "EPIPE" })).toBe(true);
+		expect(isKnownSinkPeerClosedError({ code: "ERR_STREAM_DESTROYED" })).toBe(true);
+		expect(isKnownSinkPeerClosedError({ code: "ECONNRESET" })).toBe(false);
+	});
+});
+
+describe("postmortem process stdout EPIPE policy", () => {
+	it("exits quietly with 141 for a synchronous actual stdout pipe EPIPE", async () => {
+		const result = await runPipelineScenario("broken-pipe-stdout-write");
+
+		expect(result.exitCode).toBe(141); // 128 + SIGPIPE
+		expect(result.stderr).not.toContain("[Uncaught Exception]");
+		expect(result.stderr).not.toContain("EPIPE");
+	}, 15_000);
+
+	it("exits quietly with 141 for an attributed stdout EPIPE unhandled rejection", async () => {
+		const result = await runPipelineScenario("broken-pipe-unhandled-rejection");
+
+		expect(result.exitCode).toBe(141);
+		expect(result.stderr).not.toContain("[Unhandled Rejection]");
+		expect(result.stderr).not.toContain("EPIPE");
+	}, 15_000);
+
+	it("accepts an unmarked structural rejection only with process stdout's exact write descriptor", async () => {
+		const result = await runScenario("stdout-fd-unhandled-rejection");
+
+		expect(result.exitCode).toBe(141);
+		expect(result.stderr).not.toContain("[Unhandled Rejection]");
+	}, 15_000);
+
+	it("runs quiet cleanup once and suppresses cleanup-failure logging", async () => {
+		const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "postmortem-quiet-cleanup-"));
+		const resultPath = path.join(temporaryDirectory, "result.json");
+		try {
+			const result = await runPipelineScenario("quiet-cleanup-failure", [resultPath]);
+
+			expect(result.exitCode).toBe(141);
+			expect(JSON.parse(await fs.readFile(resultPath, "utf8"))).toEqual({ count: 1 });
+			expect(result.stderr).not.toContain("Cleanup callback failed");
+			expect(result.stderr).not.toContain("Cleanup invoked recursively");
+			expect(result.stderr).not.toContain("EPIPE");
+		} finally {
+			await fs.rm(temporaryDirectory, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("runs late quiet-cleanup registrations without diagnostics", async () => {
+		const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "postmortem-quiet-late-registration-"));
+		const resultPath = path.join(temporaryDirectory, "result.json");
+		try {
+			const result = await runPipelineScenario("quiet-cleanup-late-registration", [resultPath]);
+
+			expect(result.exitCode).toBe(141);
+			expect(JSON.parse(await fs.readFile(resultPath, "utf8"))).toEqual({ count: 2 });
+			expect(result.stderr).not.toContain("Cleanup callback failed");
+			expect(result.stderr).not.toContain("Cleanup invoked recursively");
+		} finally {
+			await fs.rm(temporaryDirectory, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("handles a rejecting async callback registered after plain cleanup without an unhandled rejection", async () => {
+		const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "postmortem-late-registration-"));
+		const resultPath = path.join(temporaryDirectory, "result.json");
+		try {
+			const result = await runScenario("late-registration-async-rejection", [resultPath]);
+
+			expect(result.exitCode).toBe(0);
+			expect(JSON.parse(await fs.readFile(resultPath, "utf8"))).toEqual({ count: 1 });
+			expect(combinedOutput(result)).toContain("Cleanup callback failed");
+			expect(combinedOutput(result)).not.toContain("[Unhandled Rejection]");
+		} finally {
+			await fs.rm(temporaryDirectory, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("keeps a later ordinary fatal diagnostic and status 1 without rerunning quiet cleanup", async () => {
+		const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "postmortem-ordinary-fatal-"));
+		const resultPath = path.join(temporaryDirectory, "result.json");
+		try {
+			const result = await runPipelineScenario("quiet-cleanup-ordinary-fatal", [resultPath]);
+
+			expect(JSON.parse(await fs.readFile(resultPath, "utf8"))).toEqual({ count: 1 });
+			expectOrdinaryFatal(result, "Uncaught Exception", "fixture: ordinary fatal during quiet cleanup");
+			expect(combinedOutput(result)).not.toContain('"message":"Uncaught exception"');
+		} finally {
+			await fs.rm(temporaryDirectory, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("keeps an earlier ordinary fatal status and cleanup behavior when stdout EPIPE arrives later", async () => {
+		const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "postmortem-ordinary-first-"));
+		const resultPath = path.join(temporaryDirectory, "result.json");
+		try {
+			const result = await runPipelineScenario("ordinary-fatal-then-broken-pipe", [resultPath]);
+
+			expect(JSON.parse(await fs.readFile(resultPath, "utf8"))).toEqual({ count: 1 });
+			expectOrdinaryFatal(result, "Uncaught Exception", "fixture: ordinary fatal before quiet EPIPE");
+		} finally {
+			await fs.rm(temporaryDirectory, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("keeps a socket send EPIPE fatal even when its fd is process stdout", async () => {
+		const result = await runScenario("socket-send-epipe");
+
+		expectOrdinaryFatal(result, "Uncaught Exception", "fixture: socket send EPIPE");
+	}, 15_000);
+
+	it("keeps an unrelated write EPIPE with another open fd fatal", async () => {
+		const result = await runScenario("unrelated-fd-write-epipe");
+
+		expectOrdinaryFatal(result, "Uncaught Exception", "fixture: unrelated fd write EPIPE");
+	}, 15_000);
+
+	it("keeps missing syscall and invalid descriptor evidence fatal", async () => {
+		const missingSyscall = await runScenario("stdout-fd-missing-syscall-epipe");
+		const missingFd = await runScenario("missing-fd-write-epipe");
+		const invalid = await runScenario("invalid-fd-write-epipe");
+		const closed = await runScenario("closed-fd-write-epipe");
+		const reused = await runScenario("reused-fd-write-epipe");
+
+		expectOrdinaryFatal(missingSyscall, "Uncaught Exception", "fixture: stdout fd EPIPE without syscall");
+		expectOrdinaryFatal(missingFd, "Uncaught Exception", "fixture: missing fd write EPIPE");
+		expectOrdinaryFatal(invalid, "Uncaught Exception", "fixture: invalid fd write EPIPE");
+		expectOrdinaryFatal(closed, "Uncaught Exception", "fixture: closed fd write EPIPE");
+		expectOrdinaryFatal(reused, "Uncaught Exception", "fixture: reused fd write EPIPE");
+	}, 15_000);
+
+	it("keeps ERR_STREAM_DESTROYED fatal at process scope", async () => {
+		const result = await runScenario("destroyed-stream-error");
+
+		expectOrdinaryFatal(result, "Uncaught Exception", "fixture: destroyed stream");
+	}, 15_000);
+
+	it("keeps non-pipe exceptions and rejections unchanged", async () => {
+		const exception = await runScenario("non-pipe-uncaught-exception");
+		const rejection = await runScenario("non-pipe-unhandled-rejection");
+
+		expectOrdinaryFatal(exception, "Uncaught Exception", "fixture: genuine fatal error");
+		expectOrdinaryFatal(rejection, "Unhandled Rejection", "fixture: genuine rejected fatal error");
+	}, 15_000);
+});
+
+describe("postmortem process stdout closed-stream family (EIO/EBADF, issue #3810)", () => {
+	it("exits quietly with 141 for an attributed stdout EIO (pty torn down)", async () => {
+		const result = await runScenario("stdout-fd-eio-unhandled-rejection");
+
+		expect(result.exitCode).toBe(141);
+		expect(result.stderr).not.toContain("[Unhandled Rejection]");
+		expect(result.stderr).not.toContain("EIO");
+	}, 15_000);
+
+	it("exits quietly with 141 for an attributed stdout EBADF (fd gone)", async () => {
+		const result = await runScenario("stdout-fd-ebadf-unhandled-rejection");
+
+		expect(result.exitCode).toBe(141);
+		expect(result.stderr).not.toContain("[Unhandled Rejection]");
+		expect(result.stderr).not.toContain("EBADF");
+	}, 15_000);
+
+	it("keeps a non-stdout EIO fatal — only stdout's own sink is benign", async () => {
+		const result = await runScenario("non-stdout-eio-fatal");
+
+		expectOrdinaryFatal(result, "Uncaught Exception", "fixture: non-stdout EIO stays fatal");
+	}, 15_000);
+});
+
+describe("postmortem fixture crash-store isolation", () => {
+	it("writes crash records into fixtureAgentDir, journals the fatal occurrence, and leaves the real store untouched", async () => {
+		const readOrNull = async (target: string): Promise<string | null> => {
+			try {
+				return await fs.readFile(target, "utf8");
+			} catch {
+				return null;
+			}
+		};
+		const realLog = getCrashLogPath();
+		const realEvents = getCrashEventsPath();
+		const beforeLog = await readOrNull(realLog);
+		const beforeEvents = await readOrNull(realEvents);
+
+		const result = await runScenario("non-pipe-uncaught-exception");
+		expectOrdinaryFatal(result, "Uncaught Exception", "fixture: genuine fatal error");
+
+		// The process-level fatal handler must journal an occurrence beside the
+		// crash log it writes -- without it the crash is invisible to indexing,
+		// listing, nudging, and the upstream relay -- and must print the record
+		// path rather than stringifying the record object.
+		expect(result.stderr).toContain("crash recorded at ");
+		expect(result.stderr).not.toContain("[object Object]");
+
+		const fixtureLog = await Bun.file(getCrashLogPath(fixtureAgentDir)).text();
+		expect(fixtureLog).toContain("gjc-crash-record.v1 ");
+		const fixtureEventLines = (await Bun.file(getCrashEventsPath(fixtureAgentDir)).text())
+			.split("\n")
+			.filter(Boolean);
+		expect(fixtureEventLines.length).toBeGreaterThan(0);
+		expect(parseCrashEventLine(fixtureEventLines.at(-1) ?? "")?.kind).toBe("occurrence");
+
+		expect(await readOrNull(realLog)).toBe(beforeLog);
+		expect(await readOrNull(realEvents)).toBe(beforeEvents);
+	}, 15_000);
+});

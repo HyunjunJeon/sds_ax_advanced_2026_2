@@ -1,0 +1,555 @@
+"""Tests for Stage 2 semantic evaluation."""
+
+import json
+from unittest.mock import AsyncMock
+
+import pytest
+
+from ouroboros.core.errors import ProviderError
+from ouroboros.core.types import Result
+from ouroboros.evaluation.models import ArtifactBundle, EvaluationContext, FileArtifact
+from ouroboros.evaluation.semantic import (
+    SemanticConfig,
+    SemanticEvaluator,
+    build_evaluation_prompt,
+    parse_semantic_response,
+    run_semantic_evaluation,
+)
+from ouroboros.providers.base import CompletionResponse, UsageInfo
+
+
+class TestBuildEvaluationPrompt:
+    """Tests for prompt building."""
+
+    def test_minimal_context(self) -> None:
+        """Build prompt with minimal context."""
+        context = EvaluationContext(
+            execution_id="exec-1",
+            seed_id="seed-1",
+            current_ac="User can login",
+            artifact="def login(): pass",
+        )
+        prompt = build_evaluation_prompt(context)
+
+        assert "User can login" in prompt
+        assert "def login(): pass" in prompt
+        assert "code" in prompt  # default artifact_type
+
+    def test_full_context(self) -> None:
+        """Build prompt with full context."""
+        context = EvaluationContext(
+            execution_id="exec-1",
+            seed_id="seed-1",
+            current_ac="User can login securely",
+            artifact="def login(username, password): ...",
+            artifact_type="python",
+            goal="Build authentication system",
+            constraints=("Must be secure", "No plaintext passwords"),
+        )
+        prompt = build_evaluation_prompt(context)
+
+        assert "User can login securely" in prompt
+        assert "Build authentication system" in prompt
+        assert "Must be secure" in prompt
+        assert "No plaintext passwords" in prompt
+
+    def test_prompt_includes_anti_gaming_and_transparency_sections(self) -> None:
+        """Prompt preserves Anti-Gaming and adds Evaluation Transparency (#367)."""
+        context = EvaluationContext(
+            execution_id="exec-1",
+            seed_id="seed-1",
+            current_ac="User can login",
+            artifact="def login(): pass",
+        )
+        prompt = build_evaluation_prompt(context)
+
+        # Anti-Gaming Verification MUST remain (reward_hacking_risk is preserved)
+        assert "Anti-Gaming Verification" in prompt
+        assert "reward_hacking_risk" in prompt
+
+        # New transparency section (#367)
+        assert "Evaluation Transparency" in prompt
+        assert "questions_used" in prompt
+        assert "evidence" in prompt
+
+    def test_file_artifacts_omit_inline_artifact_text(self) -> None:
+        """When collected files are present, the prompt should prefer file sections."""
+        context = EvaluationContext(
+            execution_id="exec-1",
+            seed_id="seed-1",
+            current_ac="User can login securely",
+            artifact="inline artifact text that should not be duplicated",
+            artifact_bundle=ArtifactBundle(
+                files=(
+                    FileArtifact(
+                        file_path="/tmp/.ouroboros_eval_artifact.md",
+                        content="artifact summary from file",
+                    ),
+                    FileArtifact(
+                        file_path="/tmp/src/auth.py",
+                        content="def login(username, password): ...",
+                    ),
+                ),
+                text_summary="artifact summary from file",
+                total_chars=64,
+            ),
+        )
+
+        prompt = build_evaluation_prompt(context)
+
+        assert "## Source Files" in prompt
+        assert "### /tmp/.ouroboros_eval_artifact.md" in prompt
+        assert "### /tmp/src/auth.py" in prompt
+        assert "artifact summary from file" in prompt
+        assert "## Artifact Content" not in prompt
+        assert "inline artifact text that should not be duplicated" not in prompt
+
+    def test_spec_with_contract_renders_contract_block(self) -> None:
+        """A spec-carrying AC renders the DECLARED SUCCESS CONTRACT block (PR-H)."""
+        from ouroboros.core.seed import AcceptanceCriterionSpec
+
+        context = EvaluationContext(
+            execution_id="exec-1",
+            seed_id="seed-1",
+            current_ac="CLI prints the version",
+            artifact="print('1.2.3')",
+            current_ac_spec=AcceptanceCriterionSpec(
+                description="CLI prints the version",
+                verify_command="mytool --version",
+                expected_artifacts=("mytool",),
+                output_assertion="stdout equals 1.2.3",
+            ),
+        )
+        prompt = build_evaluation_prompt(context)
+
+        assert "DECLARED SUCCESS CONTRACT" in prompt
+        assert "verify_command: mytool --version" in prompt
+        assert "expected_artifacts: mytool" in prompt
+        assert "output_assertion: stdout equals 1.2.3" in prompt
+        assert "The AC passes ONLY if the artifact demonstrates the declared contract" in prompt
+        assert "Cite the evidence line." in prompt
+
+    def test_bare_spec_without_contract_renders_no_contract_block(self) -> None:
+        """A description-only spec (no contract) leaves the prompt unchanged."""
+        from ouroboros.core.seed import AcceptanceCriterionSpec
+
+        context = EvaluationContext(
+            execution_id="exec-1",
+            seed_id="seed-1",
+            current_ac="User can login",
+            artifact="def login(): pass",
+            current_ac_spec=AcceptanceCriterionSpec(description="User can login"),
+        )
+        prompt = build_evaluation_prompt(context)
+
+        assert "DECLARED SUCCESS CONTRACT" not in prompt
+        assert "User can login" in prompt
+
+    def test_no_spec_renders_no_contract_block(self) -> None:
+        """When current_ac_spec is None the prompt has no contract block."""
+        context = EvaluationContext(
+            execution_id="exec-1",
+            seed_id="seed-1",
+            current_ac="User can login",
+            artifact="def login(): pass",
+        )
+        prompt = build_evaluation_prompt(context)
+
+        assert "DECLARED SUCCESS CONTRACT" not in prompt
+
+
+class TestParseSemanticResponse:
+    """Tests for response parsing."""
+
+    def test_valid_json_response(self) -> None:
+        """Parse valid JSON response."""
+        response = """{
+            "score": 0.85,
+            "ac_compliance": true,
+            "goal_alignment": 0.9,
+            "drift_score": 0.1,
+            "uncertainty": 0.2,
+            "reasoning": "Good implementation",
+            "reward_hacking_risk": 0.05
+        }"""
+        result = parse_semantic_response(response)
+
+        assert result.is_ok
+        semantic = result.value
+        assert semantic.score == 0.85
+        assert semantic.ac_compliance is True
+        assert semantic.goal_alignment == 0.9
+        assert semantic.drift_score == 0.1
+        assert semantic.uncertainty == 0.2
+        assert semantic.reasoning == "Good implementation"
+        assert semantic.reward_hacking_risk == 0.05
+
+    def test_tab_indented_pretty_raw_response(self) -> None:
+        response = json.dumps(
+            {
+                "score": 0.85,
+                "ac_compliance": True,
+                "goal_alignment": 0.9,
+                "drift_score": 0.1,
+                "uncertainty": 0.2,
+                "reasoning": "Pretty response remains intact",
+                "reward_hacking_risk": 0.05,
+                "evidence": ["nested array survives"],
+            },
+            indent="\t",
+        )
+
+        result = parse_semantic_response(response)
+
+        assert result.is_ok
+        assert result.value.reasoning == "Pretty response remains intact"
+        assert result.value.evidence == ("nested array survives",)
+
+    def test_json_with_surrounding_text(self) -> None:
+        """Parse JSON embedded in text."""
+        response = """Here is my evaluation:
+        {"score": 0.8, "ac_compliance": true, "goal_alignment": 0.85, "drift_score": 0.15, "uncertainty": 0.1, "reasoning": "Works well", "reward_hacking_risk": 0.0}
+        Thank you for asking."""
+        result = parse_semantic_response(response)
+
+        assert result.is_ok
+        assert result.value.score == 0.8
+
+    def test_values_clamped_to_range(self) -> None:
+        """Values outside [0,1] are clamped."""
+        response = """{
+            "score": 1.5,
+            "ac_compliance": true,
+            "goal_alignment": -0.1,
+            "drift_score": 2.0,
+            "uncertainty": 0.2,
+            "reasoning": "Test",
+            "reward_hacking_risk": 1.5
+        }"""
+        result = parse_semantic_response(response)
+
+        assert result.is_ok
+        assert result.value.score == 1.0  # clamped from 1.5
+        assert result.value.goal_alignment == 0.0  # clamped from -0.1
+        assert result.value.drift_score == 1.0  # clamped from 2.0
+        assert result.value.reward_hacking_risk == 1.0  # clamped from 1.5
+
+    def test_missing_required_field(self) -> None:
+        """Error when required field is missing."""
+        response = """{
+            "score": 0.8,
+            "ac_compliance": true
+        }"""
+        result = parse_semantic_response(response)
+
+        assert result.is_err
+        assert "Missing required fields" in result.error.message
+
+    def test_missing_reward_hacking_risk_defaults_to_zero(self) -> None:
+        """Omitting reward_hacking_risk should degrade gracefully to 0.0."""
+        response = """{
+            "score": 0.8,
+            "ac_compliance": true,
+            "goal_alignment": 0.85,
+            "drift_score": 0.15,
+            "uncertainty": 0.1,
+            "reasoning": "Looks good"
+        }"""
+        result = parse_semantic_response(response)
+
+        assert result.is_ok
+        assert result.value.reward_hacking_risk == 0.0
+
+    def test_parses_questions_used_and_evidence(self) -> None:
+        """questions_used and evidence arrays are parsed into tuples (#367)."""
+        response = """{
+            "score": 0.9,
+            "ac_compliance": true,
+            "goal_alignment": 0.9,
+            "drift_score": 0.1,
+            "uncertainty": 0.1,
+            "reasoning": "Strong implementation",
+            "reward_hacking_risk": 0.0,
+            "questions_used": [
+                "Does login() reject empty passwords?",
+                "Is the hash function resistant to timing attacks?"
+            ],
+            "evidence": [
+                "src/auth.py:42 uses bcrypt for hashing",
+                "tests/test_auth.py covers empty password rejection"
+            ]
+        }"""
+        result = parse_semantic_response(response)
+
+        assert result.is_ok
+        semantic = result.value
+        assert len(semantic.questions_used) == 2
+        assert "Does login() reject empty passwords?" in semantic.questions_used
+        assert len(semantic.evidence) == 2
+        assert "src/auth.py:42 uses bcrypt for hashing" in semantic.evidence
+
+    def test_missing_questions_and_evidence_degrade_gracefully(self) -> None:
+        """Missing transparency fields fall back to empty tuples, not errors."""
+        response = """{
+            "score": 0.8,
+            "ac_compliance": true,
+            "goal_alignment": 0.85,
+            "drift_score": 0.15,
+            "uncertainty": 0.1,
+            "reasoning": "Looks good",
+            "reward_hacking_risk": 0.1
+        }"""
+        result = parse_semantic_response(response)
+
+        assert result.is_ok
+        assert result.value.questions_used == ()
+        assert result.value.evidence == ()
+
+    def test_empty_strings_in_questions_evidence_are_dropped(self) -> None:
+        """Blank items in the transparency arrays are filtered out."""
+        response = """{
+            "score": 0.8,
+            "ac_compliance": true,
+            "goal_alignment": 0.85,
+            "drift_score": 0.15,
+            "uncertainty": 0.1,
+            "reasoning": "Looks good",
+            "reward_hacking_risk": 0.1,
+            "questions_used": ["", "Real question?", "   "],
+            "evidence": [" ", "Real evidence"]
+        }"""
+        result = parse_semantic_response(response)
+
+        assert result.is_ok
+        assert result.value.questions_used == ("Real question?",)
+        assert result.value.evidence == ("Real evidence",)
+
+    def test_no_json_in_response(self) -> None:
+        """Error when no JSON found."""
+        response = "This is just text without any JSON"
+        result = parse_semantic_response(response)
+
+        assert result.is_err
+        assert "Could not find JSON" in result.error.message
+
+    def test_invalid_json(self) -> None:
+        """Error on malformed JSON."""
+        response = '{"score": 0.8, "ac_compliance": }'
+        result = parse_semantic_response(response)
+
+        assert result.is_err
+        assert "JSON" in result.error.message
+
+
+class TestSemanticConfig:
+    """Tests for SemanticConfig."""
+
+    def test_default_values(self) -> None:
+        """Verify default configuration."""
+        config = SemanticConfig()
+        assert config.temperature == 0.2
+        assert config.max_tokens == 2048
+        assert config.satisfaction_threshold == 0.8
+
+    def test_custom_values(self) -> None:
+        """Create config with custom values."""
+        config = SemanticConfig(
+            model="gpt-4o",
+            temperature=0.5,
+            satisfaction_threshold=0.9,
+        )
+        assert config.model == "gpt-4o"
+        assert config.temperature == 0.5
+
+
+class TestSemanticEvaluator:
+    """Tests for SemanticEvaluator class."""
+
+    @pytest.fixture
+    def mock_llm(self) -> AsyncMock:
+        """Create mock LLM adapter."""
+        mock = AsyncMock()
+        return mock
+
+    @pytest.fixture
+    def sample_context(self) -> EvaluationContext:
+        """Create sample evaluation context."""
+        return EvaluationContext(
+            execution_id="exec-1",
+            seed_id="seed-1",
+            current_ac="User can login",
+            artifact="def login(): pass",
+            goal="Build auth",
+        )
+
+    @pytest.mark.asyncio
+    async def test_evaluate_success(
+        self,
+        mock_llm: AsyncMock,
+        sample_context: EvaluationContext,
+    ) -> None:
+        """Successful evaluation."""
+        mock_llm.complete.return_value = Result.ok(
+            CompletionResponse(
+                content="""{
+                    "score": 0.85,
+                    "ac_compliance": true,
+                    "goal_alignment": 0.9,
+                    "drift_score": 0.1,
+                    "uncertainty": 0.15,
+                    "reasoning": "Good implementation",
+                    "reward_hacking_risk": 0.05
+                }""",
+                model="test-model",
+                usage=UsageInfo(100, 50, 150),
+            )
+        )
+
+        evaluator = SemanticEvaluator(mock_llm)
+        result = await evaluator.evaluate(sample_context)
+
+        assert result.is_ok
+        semantic_result, events = result.value
+        assert semantic_result.score == 0.85
+        assert semantic_result.ac_compliance is True
+        assert len(events) == 2  # start + complete
+
+    @pytest.mark.asyncio
+    async def test_evaluate_generates_events(
+        self,
+        mock_llm: AsyncMock,
+        sample_context: EvaluationContext,
+    ) -> None:
+        """Events are generated correctly."""
+        mock_llm.complete.return_value = Result.ok(
+            CompletionResponse(
+                content="""{
+                    "score": 0.8,
+                    "ac_compliance": true,
+                    "goal_alignment": 0.8,
+                    "drift_score": 0.2,
+                    "uncertainty": 0.1,
+                    "reasoning": "OK",
+                    "reward_hacking_risk": 0.0
+                }""",
+                model="test",
+                usage=UsageInfo(0, 0, 0),
+            )
+        )
+
+        evaluator = SemanticEvaluator(mock_llm)
+        result = await evaluator.evaluate(sample_context)
+
+        assert result.is_ok
+        _, events = result.value
+        assert events[0].type == "evaluation.stage2.started"
+        assert events[1].type == "evaluation.stage2.completed"
+        assert events[1].data["score"] == 0.8
+
+    @pytest.mark.asyncio
+    async def test_evaluate_passes_json_response_format(
+        self,
+        mock_llm: AsyncMock,
+        sample_context: EvaluationContext,
+    ) -> None:
+        """Evaluator requests JSON response format from LLM."""
+        mock_llm.complete.return_value = Result.ok(
+            CompletionResponse(
+                content="""{
+                    "score": 0.85,
+                    "ac_compliance": true,
+                    "goal_alignment": 0.9,
+                    "drift_score": 0.1,
+                    "uncertainty": 0.15,
+                    "reasoning": "Good",
+                    "reward_hacking_risk": 0.0
+                }""",
+                model="test",
+                usage=UsageInfo(0, 0, 0),
+            )
+        )
+
+        evaluator = SemanticEvaluator(mock_llm)
+        await evaluator.evaluate(sample_context)
+
+        # Verify response_format was passed in the CompletionConfig
+        call_args = mock_llm.complete.call_args
+        config = call_args[0][1]  # second positional arg
+        assert config.response_format is not None
+        assert config.response_format["type"] == "json_schema"
+        assert "json_schema" in config.response_format
+        schema = config.response_format["json_schema"]
+        assert "score" in schema["required"]
+        assert "ac_compliance" in schema["required"]
+        assert config.role == "semantic_evaluation"
+        assert config.model_is_explicit is False
+
+    @pytest.mark.asyncio
+    async def test_evaluate_llm_error(
+        self,
+        mock_llm: AsyncMock,
+        sample_context: EvaluationContext,
+    ) -> None:
+        """Handle LLM error."""
+        mock_llm.complete.return_value = Result.err(ProviderError("API error", provider="test"))
+
+        evaluator = SemanticEvaluator(mock_llm)
+        result = await evaluator.evaluate(sample_context)
+
+        assert result.is_err
+        assert isinstance(result.error, ProviderError)
+
+    @pytest.mark.asyncio
+    async def test_evaluate_parse_error(
+        self,
+        mock_llm: AsyncMock,
+        sample_context: EvaluationContext,
+    ) -> None:
+        """Handle parse error."""
+        mock_llm.complete.return_value = Result.ok(
+            CompletionResponse(
+                content="This is not valid JSON at all",
+                model="test",
+                usage=UsageInfo(0, 0, 0),
+            )
+        )
+
+        evaluator = SemanticEvaluator(mock_llm)
+        result = await evaluator.evaluate(sample_context)
+
+        assert result.is_err
+        assert "Could not find JSON" in result.error.message
+
+
+class TestRunSemanticEvaluation:
+    """Tests for convenience function."""
+
+    @pytest.mark.asyncio
+    async def test_convenience_function(self) -> None:
+        """Test the convenience function works."""
+        mock_llm = AsyncMock()
+        mock_llm.complete.return_value = Result.ok(
+            CompletionResponse(
+                content="""{
+                    "score": 0.9,
+                    "ac_compliance": true,
+                    "goal_alignment": 0.9,
+                    "drift_score": 0.05,
+                    "uncertainty": 0.1,
+                    "reasoning": "Excellent",
+                    "reward_hacking_risk": 0.0
+                }""",
+                model="test",
+                usage=UsageInfo(0, 0, 0),
+            )
+        )
+
+        context = EvaluationContext(
+            execution_id="exec-1",
+            seed_id="seed-1",
+            current_ac="Test AC",
+            artifact="test code",
+        )
+
+        result = await run_semantic_evaluation(context, mock_llm)
+        assert result.is_ok

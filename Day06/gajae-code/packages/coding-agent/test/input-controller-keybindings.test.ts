@@ -1,0 +1,1788 @@
+import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
+
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { Container } from "@gajae-code/tui";
+import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
+import { defaultEditorTheme } from "../../tui/test/test-themes";
+import { formatKeyHint as formatKeyHintForPlatform } from "../src/config/keybindings";
+import { resetSettingsForTest, Settings } from "../src/config/settings";
+import { CustomEditor, type PasteTextContext } from "../src/modes/components/custom-editor";
+import { QueuedMessageSelectorComponent } from "../src/modes/components/queued-message-selector";
+import { InputController } from "../src/modes/controllers/input-controller";
+import { initTheme } from "../src/modes/theme/theme";
+import type { CompactionQueuedMessage, ComposerSubmissionOptions, InteractiveModeContext } from "../src/modes/types";
+import type { QueuedMessageEditEntry } from "../src/session/agent-session";
+import type { LoadedPastedImageBatch, LoadPastedImageBatchOptions } from "../src/utils/pasted-image-loading";
+import { formatPastedImageReference } from "../src/utils/pasted-image-path";
+
+afterEach(() => {
+	vi.useRealTimers();
+});
+
+function pasteTextContext(signal = new AbortController().signal): PasteTextContext {
+	return { signal, commit: commit => commit() };
+}
+type FakeEditor = {
+	onEscape?: () => void;
+	shouldBypassAutocompleteOnEscape?: () => boolean;
+	onClear?: () => void;
+	onExit?: () => void;
+	onSuspend?: () => void;
+	onCycleThinkingLevel?: () => void;
+	onCycleModelForward?: () => void;
+	onCycleModelBackward?: () => void;
+	onSelectModelTemporary?: () => void;
+	onSelectModel?: () => void;
+	onHistorySearch?: () => void;
+	onShowHotkeys?: () => void;
+	onPasteImage?: () => Promise<boolean>;
+	onPasteText?: (text: string, context: PasteTextContext) => boolean | Promise<boolean>;
+	onCopyPrompt?: () => void;
+	onExpandTools?: () => void;
+	onToggleThinking?: () => void;
+	onExternalEditor?: () => void;
+	onDequeue?: () => void;
+	onQueue?: () => void | Promise<void>;
+	onChange?: (text: string) => void;
+	onSubmit?: (text: string) => void | Promise<void>;
+	onTabDeclined?: (text: string) => void;
+	onTab?: (text: string) => boolean | undefined;
+	setText(text: string): void;
+	getText(): string;
+	insertText(text: string): void;
+	getLines(): string[];
+	getCursor(): { line: number; col: number };
+	deleteTextBeforeCursor(text: string): boolean;
+	deleteTextRangeAroundCursor(startCol: number, endCol: number): boolean;
+	addToHistory(text: string): void;
+	setActionKeys(action: string, keys: string[]): void;
+	setCustomKeyHandler(key: string, handler: () => boolean | undefined): void;
+	clearCustomKeyHandlers(): void;
+};
+
+async function createContext(options?: {
+	busyPromptMode?: "steer" | "queue";
+	followUpKeys?: string[];
+	ircSidebarToggleKeys?: string[];
+	oauthCopyKeys?: string[];
+}) {
+	let editorText = "";
+	const keyMap: Record<string, string[]> = {
+		"app.model.selectTemporary": ["ctrl+y"],
+		"app.model.select": ["ctrl+l"],
+		"app.message.queue": ["alt+enter"],
+		"app.message.followUp": options?.followUpKeys ?? [],
+		"app.message.dequeue": ["alt+up", "alt+down"],
+		"app.irc.sidebar.toggle": options?.ircSidebarToggleKeys ?? ["alt+i"],
+		"tui.select.confirm": ["enter"],
+		"tui.select.cancel": ["escape"],
+		"tui.editor.deleteCharBackward": ["backspace"],
+		"app.todo.toggle": ["alt+shift+t"],
+		"app.clipboard.copyOAuthUrl": options?.oauthCopyKeys ?? ["alt+shift+u"],
+		"app.session.tree": ["alt+shift+s"],
+		"app.session.fork": ["alt+shift+f"],
+		"app.session.resume": ["alt+shift+r"],
+	};
+
+	const setActionKeys = vi.fn();
+	const showModelSelector = vi.fn();
+	const prompt = vi.fn(async () => {});
+	const followUp = vi.fn(async () => {});
+	const updatePendingMessagesDisplay = vi.fn();
+	const handleBashCommand = vi.fn(async () => {});
+	const showStatus = vi.fn();
+	const hasOAuthUrlForCopy = vi.fn(() => false);
+	const copyOAuthUrl = vi.fn(async () => {});
+	const onInputCallback = vi.fn();
+	const showHookSelector = vi.fn(async () => "Attach images" as string | undefined);
+	const toggleIrcSidebar = vi.fn();
+	const startPendingSubmission = vi.fn(
+		(
+			input: {
+				text: string;
+				images?: InteractiveModeContext["pendingImages"];
+				customType?: string;
+				display?: boolean;
+			},
+			_options?: ComposerSubmissionOptions,
+		) => ({
+			...input,
+			cancelled: false,
+			started: true,
+		}),
+	);
+	const compactionQueuedMessages: CompactionQueuedMessage[] = [];
+	const sessionQueuedMessages: string[] = [];
+	const queueCompactionMessage = vi.fn((text: string, mode: "steer" | "followUp") => {
+		compactionQueuedMessages.push({ text, mode });
+		editor.addToHistory(text);
+		editor.setText("");
+		updatePendingMessagesDisplay();
+		showStatus("Queued message for after compaction");
+	});
+	const popLastQueuedMessage = vi.fn(() => sessionQueuedMessages.pop());
+	const getQueuedMessageEntries = vi.fn(() =>
+		sessionQueuedMessages.map(
+			(text, index): QueuedMessageEditEntry => ({
+				id: `followUp:${index}`,
+				text,
+				mode: "followUp",
+				label: "Queued",
+			}),
+		),
+	);
+	const removeQueuedMessageForEditing = vi.fn((id: string) => {
+		const [mode, indexText] = id.split(":");
+		if (mode !== "followUp" || indexText === undefined) return undefined;
+		const index = Number(indexText);
+		if (!Number.isInteger(index)) return undefined;
+		const [removed] = sessionQueuedMessages.splice(index, 1);
+		return removed;
+	});
+	const moveQueuedMessageForEditing = vi.fn((id: string, direction: "up" | "down") => {
+		const [mode, indexText] = id.split(":");
+		if (mode !== "followUp" || indexText === undefined) return false;
+		const index = Number(indexText);
+		if (!Number.isInteger(index)) return false;
+		const targetIndex = direction === "up" ? index - 1 : index + 1;
+		if (index < 0 || index >= sessionQueuedMessages.length) return false;
+		if (targetIndex < 0 || targetIndex >= sessionQueuedMessages.length) return false;
+		const [entry] = sessionQueuedMessages.splice(index, 1);
+		if (entry === undefined) return false;
+		sessionQueuedMessages.splice(targetIndex, 0, entry);
+		return true;
+	});
+	const clearQueue = vi.fn(() => {
+		const followUp = [...sessionQueuedMessages];
+		sessionQueuedMessages.length = 0;
+		return { steering: [], followUp };
+	});
+	const editor: FakeEditor = {
+		setText(text: string) {
+			editorText = text;
+		},
+		getText() {
+			return editorText;
+		},
+		getLines() {
+			return editorText.split("\n");
+		},
+		getCursor() {
+			const lines = editorText.split("\n");
+			return { line: lines.length - 1, col: lines.at(-1)?.length ?? 0 };
+		},
+		deleteTextBeforeCursor(text: string) {
+			if (!editorText.endsWith(text)) return false;
+			editorText = editorText.slice(0, -text.length);
+			editor.onChange?.(editorText);
+			return true;
+		},
+		deleteTextRangeAroundCursor(startCol: number, endCol: number) {
+			const cursorCol = editorText.length;
+			if (
+				!Number.isInteger(startCol) ||
+				!Number.isInteger(endCol) ||
+				startCol < 0 ||
+				startCol >= endCol ||
+				endCol > editorText.length ||
+				startCol > cursorCol ||
+				endCol < cursorCol
+			)
+				return false;
+			editorText = editorText.slice(0, startCol) + editorText.slice(endCol);
+			editor.onChange?.(editorText);
+			return true;
+		},
+		insertText(text: string) {
+			editorText += text;
+		},
+		addToHistory: vi.fn(),
+		setActionKeys,
+		setCustomKeyHandler: vi.fn(),
+		clearCustomKeyHandlers: vi.fn(),
+	};
+	const editorContainerChildren: unknown[] = [];
+	const editorContainer = {
+		clear: vi.fn(() => {
+			editorContainerChildren.length = 0;
+		}),
+		detachChild: vi.fn((child: unknown) => {
+			const index = editorContainerChildren.indexOf(child);
+			if (index >= 0) editorContainerChildren.splice(index, 1);
+		}),
+		addChild: vi.fn((child: unknown) => {
+			editorContainerChildren.push(child);
+		}),
+	};
+	const ctx = {
+		editor: editor as unknown as InteractiveModeContext["editor"],
+		ui: {
+			requestRender: vi.fn(),
+			setFocus: vi.fn(),
+			addInputListener: vi.fn(() => () => {}),
+			followLiveViewport: vi.fn(),
+			scrollViewportPages: vi.fn(),
+		} as unknown as InteractiveModeContext["ui"],
+		editorContainer: editorContainer as unknown as InteractiveModeContext["editorContainer"],
+		loadingAnimation: undefined,
+		autoCompactionLoader: undefined,
+		retryLoader: undefined,
+		autoCompactionEscapeHandler: undefined,
+		retryEscapeHandler: undefined,
+		session: {
+			isStreaming: false,
+			isCompacting: false,
+			isGeneratingHandoff: false,
+			isBashRunning: false,
+			isEvalRunning: false,
+			messages: [],
+			abortBash: vi.fn(),
+			extensionRunner: undefined,
+			prompt,
+			followUp,
+			popLastQueuedMessage,
+			clearQueue,
+			getQueuedMessages: () => ({ steering: [], followUp: [...sessionQueuedMessages] }),
+			getQueuedMessageEntries,
+			removeQueuedMessageForEditing,
+			moveQueuedMessageForEditing,
+			getRoleModelCycleCandidateCount: vi.fn(() => 0),
+		} as unknown as InteractiveModeContext["session"],
+		keybindings: {
+			getKeys(action: string) {
+				return keyMap[action] ? [...keyMap[action]] : [];
+			},
+			getDisplayString(action: string) {
+				return (keyMap[action] ?? []).map(key => formatKeyHintForPlatform(key, { platform: "darwin" })).join("/");
+			},
+			formatKeyHint(key: string) {
+				return formatKeyHintForPlatform(key, { platform: "darwin" });
+			},
+		} as InteractiveModeContext["keybindings"],
+		pendingImages: [],
+		compactionQueuedMessages,
+		queueCompactionMessage,
+		onInputCallback,
+		startPendingSubmission,
+		flushPendingBashComponents: vi.fn(),
+		settings: {
+			get(path: string) {
+				if (path === "images.autoResize") return false;
+				if (path === "busyPromptMode") return options?.busyPromptMode ?? "steer";
+				return undefined;
+			},
+		} as unknown as InteractiveModeContext["settings"],
+		sessionManager: {
+			getCwd() {
+				return "/";
+			},
+			getSessionName() {
+				return "test-session";
+			},
+		} as unknown as InteractiveModeContext["sessionManager"],
+		locallySubmittedUserSignatures: new Set<string>(),
+		isKnownSlashCommand: () => false,
+		recordLocalSubmission(this: InteractiveModeContext, text: string, imageCount = 0) {
+			if (this.isKnownSlashCommand(text)) return () => {};
+			const sig = `${text}\u0000${imageCount}`;
+			this.locallySubmittedUserSignatures.add(sig);
+			let disposed = false;
+			return () => {
+				if (disposed) return;
+				disposed = true;
+				this.locallySubmittedUserSignatures.delete(sig);
+			};
+		},
+		async withLocalSubmission<T>(
+			this: InteractiveModeContext,
+			text: string,
+			fn: () => Promise<T>,
+			options?: { imageCount?: number },
+		): Promise<T> {
+			const dispose = this.recordLocalSubmission(text, options?.imageCount ?? 0);
+			try {
+				return await fn();
+			} catch (err) {
+				dispose();
+				throw err;
+			}
+		},
+		updatePendingMessagesDisplay,
+		isBashMode: false,
+		isBashNoContext: false,
+		isPythonMode: false,
+		handleHotkeysCommand: vi.fn(),
+		handlePlanModeCommand: vi.fn(),
+		handleClearCommand: vi.fn(),
+		showTreeSelector: vi.fn(),
+		showUserMessageSelector: vi.fn(),
+		showSessionSelector: vi.fn(),
+		handleSTTToggle: vi.fn(),
+		toggleIrcSidebar,
+		showDebugSelector: vi.fn(),
+		showHistorySearch: vi.fn(),
+		toggleThinkingBlockVisibility: vi.fn(),
+		showModelSelector,
+		updateEditorBorderColor: vi.fn(),
+		handleBashCommand,
+		showWarning: vi.fn(),
+		showStatus,
+		showError: vi.fn(),
+		beginOAuthUrlForCopy: vi.fn(() => vi.fn()),
+		hasOAuthUrlForCopy,
+		copyOAuthUrl,
+		showHookSelector,
+
+		hasActiveBtw: vi.fn(() => false),
+	} as unknown as InteractiveModeContext;
+
+	return {
+		InputController,
+		ctx,
+		editor,
+		spies: {
+			setActionKeys,
+			showModelSelector,
+			prompt,
+			followUp,
+			onInputCallback,
+			startPendingSubmission,
+			updatePendingMessagesDisplay,
+			handleBashCommand,
+			showStatus,
+			showHookSelector,
+			hasOAuthUrlForCopy,
+			copyOAuthUrl,
+			queueCompactionMessage,
+			popLastQueuedMessage,
+			clearQueue,
+			getQueuedMessageEntries,
+			removeQueuedMessageForEditing,
+			moveQueuedMessageForEditing,
+			toggleIrcSidebar,
+		},
+		queues: {
+			compactionQueuedMessages,
+			sessionQueuedMessages,
+			editorContainerChildren,
+		},
+	};
+}
+
+beforeAll(() => {
+	initTheme();
+});
+
+describe("InputController keybinding setup", () => {
+	it("reports model, streaming, and unfinished action availability", async () => {
+		const { InputController, ctx } = await createContext();
+		const session = ctx.session as unknown as {
+			isStreaming: boolean;
+			model: { reasoning?: boolean } | undefined;
+			getRoleModelCycleCandidateCount: Mock<() => number>;
+		};
+		const controller = new InputController(ctx);
+
+		expect(controller.actionRegistry.isAvailable("app.thinking.cycle")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.model.cycleForward")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.message.queue")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.session.togglePath")).toBe(false);
+		expect(controller.actionRegistry.isAvailable("app.transcript.browse")).toBe(false);
+
+		session.model = { reasoning: true };
+		session.getRoleModelCycleCandidateCount.mockReturnValue(2);
+		session.isStreaming = true;
+		await Promise.resolve();
+		expect(controller.actionRegistry.isAvailable("app.thinking.cycle")).toBe(true);
+		expect(controller.actionRegistry.isAvailable("app.model.cycleForward")).toBe(true);
+
+		expect(controller.actionRegistry.isAvailable("app.message.queue")).toBe(false);
+		ctx.editor.setText("queue this");
+		await Promise.resolve();
+		expect(controller.actionRegistry.isAvailable("app.message.queue")).toBe(true);
+	});
+
+	it("exposes OAuth copy only while a pending URL is available", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		expect(controller.actionRegistry.isAvailable("app.clipboard.copyOAuthUrl")).toBe(false);
+		spies.hasOAuthUrlForCopy.mockReturnValue(true);
+		await Promise.resolve();
+		expect(controller.actionRegistry.isAvailable("app.clipboard.copyOAuthUrl")).toBe(true);
+
+		expect(await controller.actionRegistry.execute("app.clipboard.copyOAuthUrl")).toBe(true);
+		expect(spies.copyOAuthUrl).toHaveBeenCalledTimes(1);
+	});
+
+	it("copies a pending OAuth URL from the global shortcut without changing focus", async () => {
+		const { InputController, ctx, spies } = await createContext({ oauthCopyKeys: ["alt+shift+k"] });
+		new InputController(ctx);
+		spies.hasOAuthUrlForCopy.mockReturnValue(true);
+		const addInputListener = ctx.ui.addInputListener as Mock<InteractiveModeContext["ui"]["addInputListener"]>;
+		const listener = addInputListener.mock.calls[0]?.[0] as (data: string) => { consume: boolean } | undefined;
+
+		expect(listener("\x1bK")).toEqual({ consume: true });
+		await Promise.resolve();
+		expect(spies.copyOAuthUrl).toHaveBeenCalledTimes(1);
+		expect(ctx.ui.setFocus as Mock<InteractiveModeContext["ui"]["setFocus"]>).not.toHaveBeenCalled();
+	});
+
+	it("does not let a remapped OAuth copy chord steal Ctrl+C cancellation", async () => {
+		for (const [copyKey, input] of [
+			["ctrl+c", "\x03"],
+			["escape", "\x1b"],
+		] as const) {
+			const { InputController, ctx, spies } = await createContext({ oauthCopyKeys: [copyKey] });
+			new InputController(ctx);
+			spies.hasOAuthUrlForCopy.mockReturnValue(true);
+			const addInputListener = ctx.ui.addInputListener as Mock<InteractiveModeContext["ui"]["addInputListener"]>;
+			const listener = addInputListener.mock.calls[0]?.[0] as (data: string) => { consume: boolean } | undefined;
+
+			expect(listener(input)).toBeUndefined();
+			await Promise.resolve();
+			expect(spies.copyOAuthUrl).not.toHaveBeenCalled();
+		}
+	});
+
+	it("enables model cycling from configured role candidates without a model scope", async () => {
+		const { InputController, ctx } = await createContext();
+		const session = ctx.session as unknown as {
+			scopedModels: unknown[];
+			getRoleModelCycleCandidateCount: Mock<() => number>;
+		};
+		session.scopedModels = [];
+		session.getRoleModelCycleCandidateCount.mockReturnValue(2);
+
+		expect(new InputController(ctx).actionRegistry.isAvailable("app.model.cycleForward")).toBe(true);
+	});
+
+	it("disables model cycling when a model scope has one cycleable candidate", async () => {
+		const { InputController, ctx } = await createContext();
+		const session = ctx.session as unknown as {
+			scopedModels: unknown[];
+			getRoleModelCycleCandidateCount: Mock<() => number>;
+		};
+		session.scopedModels = [{}, {}];
+		session.getRoleModelCycleCandidateCount.mockReturnValue(1);
+
+		expect(new InputController(ctx).actionRegistry.isAvailable("app.model.cycleBackward")).toBe(false);
+	});
+
+	it("registers temporary and persisted model selector actions separately", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+
+		expect(spies.setActionKeys).toHaveBeenCalledWith("app.model.selectTemporary", ["ctrl+y"]);
+		expect(spies.setActionKeys).toHaveBeenCalledWith("app.model.select", ["ctrl+l"]);
+		expect(editor.onSelectModelTemporary).toBeDefined();
+		expect(editor.onSelectModel).toBeDefined();
+		expect(editor.onSelectModelTemporary).not.toBe(editor.onSelectModel);
+
+		editor.onSelectModelTemporary?.();
+		await Bun.sleep(0);
+		editor.onSelectModel?.();
+		await Bun.sleep(0);
+
+		expect(spies.showModelSelector).toHaveBeenNthCalledWith(1, { temporaryOnly: true });
+		expect(spies.showModelSelector).toHaveBeenNthCalledWith(2);
+	});
+	it("routes accepted thinking visibility changes through the session", async () => {
+		const activeSettings = await Settings.init({ inMemory: true });
+		const set = vi.spyOn(activeSettings, "set");
+		const { InputController, ctx } = await createContext();
+		const setThinkingVisibility = vi.fn();
+		const session = ctx.session as unknown as { setThinkingVisibility: (visibility: "visible" | "hidden") => void };
+		session.setThinkingVisibility = setThinkingVisibility;
+		ctx.hideThinkingBlock = false;
+		ctx.chatContainer = {
+			detachChild: vi.fn(),
+			addChild: vi.fn(),
+		} as unknown as InteractiveModeContext["chatContainer"];
+		ctx.rebuildChatFromMessages = vi.fn();
+
+		try {
+			new InputController(ctx).toggleThinkingBlockVisibility();
+
+			expect(set).toHaveBeenCalledWith("hideThinkingBlock", true);
+			expect(setThinkingVisibility).toHaveBeenCalledWith("hidden");
+			expect(set.mock.invocationCallOrder[0]).toBeLessThan(setThinkingVisibility.mock.invocationCallOrder[0]);
+		} finally {
+			set.mockRestore();
+			resetSettingsForTest();
+		}
+	});
+
+	it("registers the default IRC sidebar shortcut and consumes its dispatch", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+
+		const registration = (editor.setCustomKeyHandler as Mock<FakeEditor["setCustomKeyHandler"]>).mock.calls.find(
+			([key]) => key === "alt+i",
+		);
+		expect(registration).toBeDefined();
+		const handler = registration?.[1] as () => boolean;
+
+		expect(handler()).toBe(true);
+		expect(spies.toggleIrcSidebar).toHaveBeenCalledTimes(1);
+	});
+
+	it("dispatches only a remapped IRC sidebar shortcut", async () => {
+		const { InputController, ctx, editor, spies } = await createContext({ ircSidebarToggleKeys: ["ctrl+alt+i"] });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+
+		const registration = (editor.setCustomKeyHandler as Mock<FakeEditor["setCustomKeyHandler"]>).mock.calls.find(
+			([key]) => key === "ctrl+alt+i",
+		);
+		expect(registration).toBeDefined();
+		expect(editor.setCustomKeyHandler).not.toHaveBeenCalledWith("alt+i", expect.any(Function));
+		expect((registration?.[1] as () => boolean)()).toBe(true);
+		expect(spies.toggleIrcSidebar).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not register a sidebar handler when the shortcut is explicitly unbound", async () => {
+		const { InputController, ctx, editor } = await createContext({ ircSidebarToggleKeys: [] });
+		new InputController(ctx).setupKeyHandlers();
+
+		expect(editor.setCustomKeyHandler).not.toHaveBeenCalledWith("alt+i", expect.any(Function));
+	});
+
+	it("registers an explicit queue action separately from immediate submit", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		editor.setText("queue after current response");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		await editor.onQueue?.();
+		await Bun.sleep(0);
+
+		expect(spies.setActionKeys).toHaveBeenCalledWith("app.message.queue", ["alt+enter"]);
+		expect(spies.setActionKeys).toHaveBeenCalledWith("app.message.dequeue", ["alt+up", "alt+down"]);
+		expect(ctx.locallySubmittedUserSignatures.has("queue after current response\u00000")).toBe(true);
+		expect(spies.prompt).toHaveBeenCalledWith("queue after current response", {
+			streamingBehavior: "followUp",
+			followUpQueuePolicy: "sequential",
+		});
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not register a default Ctrl+Enter follow-up handler", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+
+		expect(editor.setCustomKeyHandler).not.toHaveBeenCalledWith("ctrl+enter", expect.any(Function));
+	});
+
+	it("lets an explicit Ctrl+Enter follow-up remap fall through while idle", async () => {
+		const { InputController, ctx, editor, spies } = await createContext({ followUpKeys: ["ctrl+enter"] });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const followUpRegistration = (
+			editor.setCustomKeyHandler as Mock<FakeEditor["setCustomKeyHandler"]>
+		).mock.calls.find(([key]) => key === "ctrl+enter");
+		expect(followUpRegistration).toBeDefined();
+		const handler = followUpRegistration?.[1] as () => boolean | undefined;
+
+		expect(handler()).toBe(false);
+		expect(spies.prompt).not.toHaveBeenCalled();
+	});
+
+	it("consumes Ctrl+Enter as follow-up while streaming", async () => {
+		const { InputController, ctx, editor, spies } = await createContext({ followUpKeys: ["ctrl+enter"] });
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		editor.setText("follow up from shortcut");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const followUpRegistration = (
+			editor.setCustomKeyHandler as Mock<FakeEditor["setCustomKeyHandler"]>
+		).mock.calls.find(([key]) => key === "ctrl+enter");
+		const handler = followUpRegistration?.[1] as () => boolean | undefined;
+
+		expect(handler()).toBe(true);
+		await Bun.sleep(0);
+		expect(spies.prompt).toHaveBeenCalledWith("follow up from shortcut", {
+			streamingBehavior: "followUp",
+			followUpQueuePolicy: "sequential",
+		});
+	});
+
+	it("leaves streaming Tab available for editor autocomplete", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		editor.setText("/mo");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		await Bun.sleep(0);
+
+		// The prompt-suggestion onTab handler must not consume Tab while the
+		// composer has text, so editor autocomplete still sees the key.
+		expect(editor.onTab?.(editor.getText())).toBeFalsy();
+		expect(editor.onTabDeclined).toBeUndefined();
+		expect(spies.prompt).not.toHaveBeenCalled();
+		expect(spies.updatePendingMessagesDisplay).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("/mo");
+	});
+
+	it("leaves compaction Tab available for editor autocomplete", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isCompacting: boolean };
+		session.isCompacting = true;
+		editor.setText("/skill:autoresearch");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		await Bun.sleep(0);
+
+		// The prompt-suggestion onTab handler must not consume Tab while the
+		// composer has text, so editor autocomplete still sees the key.
+		expect(editor.onTab?.(editor.getText())).toBeFalsy();
+		expect(editor.onTabDeclined).toBeUndefined();
+		expect(spies.queueCompactionMessage).not.toHaveBeenCalled();
+		expect(spies.prompt).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("/skill:autoresearch");
+	});
+
+	it("queues explicit message action during compaction", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isCompacting: boolean; isStreaming: boolean };
+		session.isCompacting = true;
+		session.isStreaming = true;
+		editor.setText("queue while compacting via shortcut");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		await editor.onQueue?.();
+		await Bun.sleep(0);
+
+		expect(spies.queueCompactionMessage).toHaveBeenCalledWith("queue while compacting via shortcut", "followUp");
+		expect(spies.prompt).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("");
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+	it("queues skill text behind foreground bash instead of invoking the skill immediately", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isBashRunning: boolean };
+		session.isBashRunning = true;
+		editor.setText("/skill:autoresearch");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		await editor.onQueue?.();
+		await Bun.sleep(0);
+
+		expect(spies.followUp).toHaveBeenCalledWith("/skill:autoresearch", undefined, {
+			followUpQueuePolicy: "sequential",
+		});
+		expect(editor.getText()).toBe("");
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("restores a single compaction queued message for editing", async () => {
+		const { InputController, ctx, editor, spies, queues } = await createContext();
+		queues.compactionQueuedMessages.push({ text: "single compaction queue", mode: "followUp" });
+		editor.setText("current draft");
+		const controller = new InputController(ctx);
+
+		controller.handleDequeue();
+
+		expect(editor.getText()).toBe("single compaction queue");
+		expect(queues.compactionQueuedMessages).toEqual([]);
+		expect(spies.popLastQueuedMessage).not.toHaveBeenCalled();
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+	it("dispatches the dequeue shortcut for a compaction-only queued message", async () => {
+		const { InputController, ctx, editor, queues } = await createContext();
+		queues.compactionQueuedMessages.push({ text: "shortcut compaction queue", mode: "followUp" });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		await editor.onDequeue?.();
+
+		expect(editor.getText()).toBe("shortcut compaction queue");
+		expect(queues.compactionQueuedMessages).toEqual([]);
+	});
+	it("does not advertise dequeue for hidden next-turn work without editable entries", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		Object.defineProperty(ctx.session, "queuedMessageCount", { value: 1 });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		await editor.onDequeue?.();
+
+		expect(editor.getText()).toBe("");
+		expect(spies.popLastQueuedMessage).not.toHaveBeenCalled();
+	});
+
+	it("restores a single session queued message for editing", async () => {
+		const { InputController, ctx, editor, spies, queues } = await createContext();
+		queues.sessionQueuedMessages.push("single session queue");
+		editor.setText("current draft");
+		const controller = new InputController(ctx);
+
+		controller.handleDequeue();
+
+		expect(editor.getText()).toBe("single session queue");
+		expect(queues.sessionQueuedMessages).toEqual([]);
+		expect(spies.clearQueue).not.toHaveBeenCalled();
+		expect(spies.removeQueuedMessageForEditing).toHaveBeenCalledWith("followUp:0");
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("opens a selector so older queued messages can be restored", async () => {
+		const { InputController, ctx, editor, spies, queues } = await createContext();
+		queues.sessionQueuedMessages.push("older session queue", "newest session queue");
+		editor.setText("current draft");
+		const controller = new InputController(ctx);
+
+		controller.handleDequeue();
+
+		const selector = queues.editorContainerChildren[0];
+		if (!(selector instanceof QueuedMessageSelectorComponent)) {
+			throw new Error("Expected queued message selector to be shown");
+		}
+		expect(editor.getText()).toBe("current draft");
+		const rendered = selector.render(160).join("\n");
+		expect(rendered).toContain("⌥↑/⌥↓ select");
+		expect(rendered).toContain("↩ edit");
+		expect(rendered).toContain("⌦ remove");
+		expect(rendered).toContain("⌃↑/⌃↓ move");
+		expect(rendered).toContain("⎋ cancel");
+		selector.handleInput("\x1b\x1b[A");
+		selector.handleInput("\n");
+
+		expect(editor.getText()).toBe("older session queue");
+		expect(queues.sessionQueuedMessages).toEqual(["newest session queue"]);
+		expect(spies.removeQueuedMessageForEditing).toHaveBeenCalledWith("followUp:0");
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps a real composer alive across queued-message selector open/restore", async () => {
+		const { InputController, ctx, queues } = await createContext();
+		const editor = new CustomEditor(defaultEditorTheme);
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+		ctx.editor = editor as unknown as InteractiveModeContext["editor"];
+		ctx.editorContainer = editorContainer as unknown as InteractiveModeContext["editorContainer"];
+		queues.editorContainerChildren = editorContainer.children as unknown[];
+		const defaultWidth = getDefaultTabWidth();
+		const otherWidth = defaultWidth === 3 ? 4 : 3;
+		const invalidations = { count: 0 };
+		const originalInvalidate = editor.invalidate.bind(editor);
+		editor.invalidate = () => {
+			invalidations.count += 1;
+			originalInvalidate();
+		};
+		try {
+			editor.setText("current draft");
+			queues.sessionQueuedMessages.push("older session queue", "newest session queue");
+			const controller = new InputController(ctx);
+
+			for (let cycle = 0; cycle < 3; cycle += 1) {
+				controller.handleDequeue();
+				const selector = editorContainer.children[0];
+				if (!(selector instanceof QueuedMessageSelectorComponent)) {
+					throw new Error("Expected queued message selector to be shown");
+				}
+				expect(editorContainer.children).toEqual([selector]);
+				selector.handleInput("\x1b");
+
+				expect(editorContainer.children).toEqual([editor]);
+				setDefaultTabWidth(otherWidth);
+				setDefaultTabWidth(defaultWidth);
+			}
+
+			expect(invalidations.count).toBeGreaterThan(3);
+			editor.handleInput("x");
+			expect(editor.getText()).toBe("current draftx");
+		} finally {
+			setDefaultTabWidth(defaultWidth);
+			editor.dispose();
+		}
+	});
+
+	it("deletes the selected queued message from the selector", async () => {
+		const { InputController, ctx, editor, spies, queues } = await createContext();
+		queues.sessionQueuedMessages.push("older session queue", "newest session queue");
+		editor.setText("current draft");
+		const controller = new InputController(ctx);
+
+		controller.handleDequeue();
+
+		const selector = queues.editorContainerChildren[0];
+		if (!(selector instanceof QueuedMessageSelectorComponent)) {
+			throw new Error("Expected queued message selector to be shown");
+		}
+		selector.handleInput("\x1b[3~");
+
+		expect(editor.getText()).toBe("current draft");
+		expect(queues.sessionQueuedMessages).toEqual(["older session queue"]);
+		expect(spies.removeQueuedMessageForEditing).toHaveBeenCalledWith("followUp:1");
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+		expect(spies.showStatus).toHaveBeenCalledWith("Deleted queued message");
+		expect(queues.editorContainerChildren[0]).toBeInstanceOf(QueuedMessageSelectorComponent);
+	});
+
+	it("opens the selector focused on the newest queued message across queue types", async () => {
+		const { InputController, ctx, editor, spies, queues } = await createContext();
+		spies.getQueuedMessageEntries.mockReturnValue([
+			{
+				id: "steer:2",
+				text: "newer steer",
+				mode: "steer",
+				label: "Steer",
+			},
+			{
+				id: "followUp:1",
+				text: "older follow-up",
+				mode: "followUp",
+				label: "Queued",
+			},
+		]);
+		spies.removeQueuedMessageForEditing.mockImplementation(id => {
+			if (id === "steer:2") return "newer steer";
+			if (id === "followUp:1") return "older follow-up";
+			return undefined;
+		});
+		editor.setText("current draft");
+		const controller = new InputController(ctx);
+
+		controller.handleDequeue();
+
+		const selector = queues.editorContainerChildren[0];
+		if (!(selector instanceof QueuedMessageSelectorComponent)) {
+			throw new Error("Expected queued message selector to be shown");
+		}
+		selector.getSelectList().handleInput("\n");
+
+		expect(editor.getText()).toBe("newer steer");
+		expect(spies.removeQueuedMessageForEditing).toHaveBeenCalledWith("steer:2");
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("moves the selected queued message from the selector", async () => {
+		const { InputController, ctx, editor, spies, queues } = await createContext();
+		queues.sessionQueuedMessages.push("first session queue", "second session queue", "third session queue");
+		editor.setText("current draft");
+		const controller = new InputController(ctx);
+
+		controller.handleDequeue();
+
+		const selector = queues.editorContainerChildren[0];
+		if (!(selector instanceof QueuedMessageSelectorComponent)) {
+			throw new Error("Expected queued message selector to be shown");
+		}
+		selector.handleInput("\x1b[1;6A");
+
+		expect(editor.getText()).toBe("current draft");
+		expect(queues.sessionQueuedMessages).toEqual([
+			"first session queue",
+			"third session queue",
+			"second session queue",
+		]);
+		expect(spies.moveQueuedMessageForEditing).toHaveBeenCalledWith("followUp:2", "up");
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+		expect(spies.showStatus).toHaveBeenCalledWith("Moved queued message");
+
+		const nextSelector = queues.editorContainerChildren[0];
+		if (!(nextSelector instanceof QueuedMessageSelectorComponent)) {
+			throw new Error("Expected queued message selector to remain shown");
+		}
+		nextSelector.handleInput("\x1b[1;5B");
+
+		expect(queues.sessionQueuedMessages).toEqual([
+			"first session queue",
+			"second session queue",
+			"third session queue",
+		]);
+		expect(spies.moveQueuedMessageForEditing).toHaveBeenLastCalledWith("followUp:1", "down");
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(2);
+		expect(spies.showStatus).toHaveBeenLastCalledWith("Moved queued message");
+	});
+
+	it("steers streaming Enter submissions by default", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		editor.setText("steer by default while busy");
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("steer by default while busy");
+
+		expect(ctx.locallySubmittedUserSignatures.has("steer by default while busy\u00000")).toBe(true);
+		expect(spies.prompt).toHaveBeenCalledWith("steer by default while busy", {
+			streamingBehavior: "steer",
+			images: undefined,
+			steerQueuePolicy: "sequential",
+		});
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("preserves explicit steer busy setting for streaming Enter submissions", async () => {
+		const { InputController, ctx, editor, spies } = await createContext({ busyPromptMode: "steer" });
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		editor.setText("steer while busy");
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("steer while busy");
+
+		expect(ctx.locallySubmittedUserSignatures.has("steer while busy\u00000")).toBe(true);
+		expect(spies.prompt).toHaveBeenCalledWith("steer while busy", {
+			streamingBehavior: "steer",
+			images: undefined,
+			steerQueuePolicy: "sequential",
+		});
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+	it("deletes an attached image placeholder atomically and restores its attachment on undo", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		const image: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "image",
+			mimeType: "image/png",
+		};
+		const editor = new CustomEditor(defaultEditorTheme);
+		ctx.editor = editor;
+		ctx.pendingImages = [image];
+		editor.setText("describe [image 1]");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+		editor.handleInput("\x7f");
+
+		expect(editor.getText()).toBe("describe ");
+		expect(ctx.pendingImages).toEqual([]);
+
+		editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+		expect(editor.getText()).toBe("describe [image 1]");
+		expect(ctx.pendingImages).toEqual([image]);
+
+		await editor.onSubmit?.(editor.getText());
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
+			text: "describe [image 1]",
+			images: [image],
+		});
+	});
+	it("restores an attachment after undoing an intervening edit and the placeholder deletion", async () => {
+		const { InputController, ctx } = await createContext();
+		const image: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "image",
+			mimeType: "image/png",
+		};
+		const editor = new CustomEditor(defaultEditorTheme);
+		ctx.editor = editor;
+		ctx.pendingImages = [image];
+		editor.setText("describe [image 1]");
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+
+		editor.handleInput("\x7f");
+		editor.insertText("x");
+		editor.handleInput("\x1b[45;5u");
+		editor.handleInput("\x1b[45;5u");
+
+		expect(editor.getText()).toBe("describe [image 1]");
+		expect(ctx.pendingImages).toEqual([image]);
+	});
+	it.each([
+		["at the reference end", false],
+		["immediately after the placeholder", true],
+	])("deletes an attached pasted-path reference atomically %s", async (_name, moveAfterPlaceholder) => {
+		const { InputController, ctx } = await createContext();
+		const image: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "image",
+			mimeType: "image/png",
+		};
+		const editor = new CustomEditor(defaultEditorTheme);
+		const reference = formatPastedImageReference("[image 1]", String.raw`C:\shots\final "one".png`);
+		ctx.editor = editor;
+		ctx.pendingImages = [image];
+		editor.setText(`describe ${reference}`);
+		if (moveAfterPlaceholder) {
+			for (let index = 0; index < reference.length - "[image 1]".length; index += 1) {
+				editor.handleInput("\x1b[D");
+			}
+		}
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.handleInput("\x7f");
+
+		expect(editor.getText()).toBe("describe ");
+		expect(ctx.pendingImages).toEqual([]);
+
+		editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+		expect(editor.getText()).toBe(`describe ${reference}`);
+		expect(ctx.pendingImages).toEqual([image]);
+	});
+
+	it("leaves ordinary Backspace handling to the editor", async () => {
+		const { InputController, ctx } = await createContext();
+		const editor = new CustomEditor(defaultEditorTheme);
+		ctx.editor = editor;
+		ctx.pendingImages = [{ type: "image", data: "image", mimeType: "image/png" }];
+		editor.setText("describe image");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.handleInput("\x7f");
+
+		expect(editor.getText()).toBe("describe imag");
+	});
+	it("omits pasted image attachments when their placeholders were deleted", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const deletedImage: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "deleted-image",
+			mimeType: "image/png",
+		};
+		ctx.pendingImages = [deletedImage];
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("send text after deleting the pasted image");
+
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
+			text: "send text after deleting the pasted image",
+			images: undefined,
+		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
+		expect(spies.onInputCallback).toHaveBeenCalledWith({
+			text: "send text after deleting the pasted image",
+			images: undefined,
+			cancelled: false,
+			started: true,
+		});
+		expect(ctx.pendingImages).toEqual([]);
+	});
+
+	it("submits only pasted images whose placeholders remain", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const firstImage: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "first-image",
+			mimeType: "image/png",
+		};
+		const secondImage: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "second-image",
+			mimeType: "image/png",
+		};
+		ctx.pendingImages = [firstImage, secondImage];
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("describe only [image 2]");
+
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
+			text: "describe only [image 2]",
+			images: [secondImage],
+		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
+		expect(spies.onInputCallback).toHaveBeenCalledWith({
+			text: "describe only [image 2]",
+			images: [secondImage],
+			cancelled: false,
+			started: true,
+		});
+		expect(ctx.pendingImages).toEqual([]);
+	});
+	it("keeps pasted clipboard images when submit reset fires before the submit callback", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const image: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "clipboard-image",
+			mimeType: "image/png",
+		};
+		ctx.pendingImages = [image];
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+
+		editor.setText("describe [image 1]");
+		editor.setText("");
+		editor.onChange?.("");
+		await editor.onSubmit?.("describe [image 1]");
+
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
+			text: "describe [image 1]",
+			images: [image],
+		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
+		expect(spies.onInputCallback).toHaveBeenCalledWith({
+			text: "describe [image 1]",
+			images: [image],
+			cancelled: false,
+			started: true,
+		});
+		expect(ctx.pendingImages).toEqual([]);
+	});
+
+	it("preserves successor composer images while an input extension is awaiting", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const firstImage: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "first-image",
+			mimeType: "image/png",
+		};
+		const secondImage: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "second-image",
+			mimeType: "image/png",
+		};
+		const extension = Promise.withResolvers<void>();
+		const emitInput = vi.fn(async () => {
+			await extension.promise;
+			return undefined;
+		});
+		(ctx.session as unknown as { extensionRunner: unknown }).extensionRunner = {
+			hasHandlers: () => true,
+			getShortcuts: () => [],
+			emitInput,
+		};
+		ctx.pendingImages = [firstImage];
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+
+		editor.setText("");
+		editor.onChange?.("");
+		const firstSubmit = editor.onSubmit?.("describe [image 1]");
+		expect(emitInput).toHaveBeenCalledTimes(1);
+
+		ctx.pendingImages = [...ctx.pendingImages, secondImage];
+		editor.setText("follow up [image 2]");
+		await Promise.resolve();
+		expect(ctx.pendingImages).toEqual([firstImage, secondImage]);
+
+		extension.resolve();
+		await firstSubmit;
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0]).toEqual({
+			text: "describe [image 1]",
+			images: [firstImage],
+		});
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
+		expect(ctx.pendingImages).toEqual([firstImage, secondImage]);
+
+		await editor.onSubmit?.("follow up [image 2]");
+		expect(spies.startPendingSubmission.mock.calls[1]?.[0]).toEqual({
+			text: "follow up [image 2]",
+			images: [secondImage],
+		});
+		expect(spies.startPendingSubmission.mock.calls[1]?.[1]).toEqual({ ownsComposer: true, editor: ctx.editor });
+		expect(ctx.pendingImages).toEqual([]);
+	});
+
+	it("still clears pending images after the composer is manually emptied", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		const image: InteractiveModeContext["pendingImages"][number] = {
+			type: "image",
+			data: "clipboard-image",
+			mimeType: "image/png",
+		};
+		ctx.pendingImages = [image];
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+
+		editor.setText("");
+		editor.onChange?.("");
+		expect(ctx.pendingImages).toEqual([image]);
+
+		await Promise.resolve();
+
+		expect(ctx.pendingImages).toEqual([]);
+	});
+
+	it("marks streaming follow-up submissions as local", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		editor.setText("follow up after current response");
+		const controller = new InputController(ctx);
+
+		await controller.handleFollowUp();
+
+		expect(ctx.locallySubmittedUserSignatures.has("follow up after current response\u00000")).toBe(true);
+		expect(spies.prompt).toHaveBeenCalledWith("follow up after current response", {
+			streamingBehavior: "followUp",
+			followUpQueuePolicy: "sequential",
+		});
+		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("marks idle follow-up submissions as local", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		// Default fake session is idle.
+		editor.setText("plain idle submit");
+		const controller = new InputController(ctx);
+
+		await controller.handleFollowUp();
+
+		expect(ctx.locallySubmittedUserSignatures.has("plain idle submit\u00000")).toBe(true);
+		// Idle submit calls prompt() with no streamingBehavior.
+		expect(spies.prompt).toHaveBeenCalledWith("plain idle submit");
+	});
+
+	it("removes the signature when an idle follow-up submission rejects", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		spies.prompt.mockImplementationOnce(async () => {
+			throw new Error("boom");
+		});
+		editor.setText("doomed submit");
+		const controller = new InputController(ctx);
+
+		await expect(controller.handleFollowUp()).rejects.toThrow("boom");
+
+		// Contract: a thrown delivery error must not leave a stale signature
+		// behind, otherwise the next attempt with the same text would silently
+		// suppress the editor-clear protection that was meant for the failed call.
+		expect(ctx.locallySubmittedUserSignatures.has("doomed submit\u00000")).toBe(false);
+	});
+
+	it("removes the signature when a streaming follow-up rejects", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const session = ctx.session as unknown as { isStreaming: boolean };
+		session.isStreaming = true;
+		spies.prompt.mockImplementationOnce(async () => {
+			throw new Error("queue full");
+		});
+		editor.setText("queued during stream");
+		const controller = new InputController(ctx);
+
+		await expect(controller.handleFollowUp()).rejects.toThrow("queue full");
+
+		expect(ctx.locallySubmittedUserSignatures.has("queued during stream\u00000")).toBe(false);
+	});
+});
+
+describe("InputController pasted image path transactions", () => {
+	const RED_1X1_PNG_BASE64 =
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+	it("attaches one clipboard-temp image without confirmation", async () => {
+		const imagePath = path.join(os.tmpdir(), `clipboard-2026-06-04-120441-${process.pid.toString(36)}CAC144E7.png`);
+		await Bun.write(imagePath, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		try {
+			const { InputController, ctx, editor, spies } = await createContext();
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+			const handled = await editor.onPasteText?.(`${imagePath}\n`, pasteTextContext());
+
+			expect(handled).toBe(true);
+			expect(editor.getText()).toBe(`[image 1] source=${JSON.stringify(imagePath)} `);
+			expect(ctx.pendingImages).toHaveLength(1);
+			expect(ctx.pendingImages[0]?.mimeType).toBe("image/png");
+			expect(spies.showHookSelector).not.toHaveBeenCalled();
+			expect(spies.showStatus).toHaveBeenCalledWith(`Attached image: ${path.basename(imagePath)}`, { dim: true });
+		} finally {
+			await fs.rm(imagePath, { force: true });
+		}
+	});
+
+	it("consumes iTerm's generated Gajae Pet drag path without changing the composer", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+
+		const handled = await editor.onPasteText?.(
+			"/var/folders/cp/9506bhz103gc1rg1k4xq3vcw0000gn/T/iTerm2.d54w3v.gajae-pet.gif\n",
+			pasteTextContext(),
+		);
+
+		expect(handled).toBe(true);
+		expect(editor.getText()).toBe("");
+		expect(ctx.pendingImages).toEqual([]);
+		expect(spies.showStatus).toHaveBeenCalledWith("Ignored dragged Gajae Pet image.", { dim: true });
+	});
+
+	it("consumes marked iTerm Pet drag paths in Bash and Python modes but leaves ordinary image paths literal", async () => {
+		const dragPaths = [
+			"/var/folders/cp/9506bhz103gc1rg1k4xq3vcw0000gn/T/iTerm2.d54w3v.gajae-pet.gif\n",
+			"/var/folders/cp/9506bhz103gc1rg1k4xq3vcw0000gn/T/iTerm2.d54w3v.gajae-pet.png\n",
+		];
+		for (const mode of ["bash", "python"] as const) {
+			for (const dragPath of dragPaths) {
+				const { InputController, ctx, editor, spies } = await createContext();
+				ctx.isBashMode = mode === "bash";
+				ctx.isPythonMode = mode === "python";
+				const controller = new InputController(ctx);
+				controller.setupKeyHandlers();
+
+				const handled = await editor.onPasteText?.(dragPath, pasteTextContext());
+
+				expect(handled).toBe(true);
+				expect(editor.getText()).toBe("");
+				expect(ctx.pendingImages).toEqual([]);
+				expect(spies.showStatus).toHaveBeenCalledWith("Ignored dragged Gajae Pet image.", { dim: true });
+			}
+
+			const { InputController, ctx, editor, spies } = await createContext();
+			ctx.isBashMode = mode === "bash";
+			ctx.isPythonMode = mode === "python";
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+			const handled = await editor.onPasteText?.("/tmp/ordinary-image.png\n", pasteTextContext());
+
+			expect(handled).toBe(false);
+			expect(spies.showStatus).not.toHaveBeenCalled();
+		}
+	});
+
+	it("confirms and atomically attaches saved-image batches in source order", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-controller-pasted-images-"));
+		const first = path.join(directory, "first.png");
+		const second = path.join(directory, "second.png");
+		await Bun.write(first, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		await Bun.write(second, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		try {
+			const { InputController, ctx, editor, spies } = await createContext();
+			ctx.pendingImages = [{ type: "image", data: "existing", mimeType: "image/png" }];
+			const insertText = vi.spyOn(editor, "insertText");
+			const requestRender = vi.spyOn(ctx.ui, "requestRender");
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+
+			const handled = await editor.onPasteText?.(`${first} ${second}`, pasteTextContext());
+
+			expect(handled).toBe(true);
+			expect(spies.showHookSelector).toHaveBeenCalledWith(
+				expect.stringContaining("Attach 2 pasted images?"),
+				["Attach images", "Paste paths literally"],
+				expect.objectContaining({ signal: expect.any(AbortSignal) }),
+			);
+			expect(editor.getText()).toBe(
+				`${formatPastedImageReference("[image 2]", first)} ${formatPastedImageReference("[image 3]", second)} `,
+			);
+			expect(ctx.pendingImages).toHaveLength(3);
+			expect(insertText).toHaveBeenCalledTimes(1);
+			expect(requestRender).toHaveBeenCalledTimes(1);
+			expect(spies.showStatus).toHaveBeenCalledWith("Attached 2 images", { dim: true });
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("rolls back composer state when the attachment commit throws", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-controller-rollback-"));
+		const first = path.join(directory, "first.png");
+		const second = path.join(directory, "second.png");
+		await Bun.write(first, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		await Bun.write(second, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		try {
+			const { InputController, ctx, editor } = await createContext();
+			const existingImage: InteractiveModeContext["pendingImages"][number] = {
+				type: "image",
+				data: "existing",
+				mimeType: "image/png",
+			};
+			ctx.pendingImages = [existingImage];
+			editor.setText("draft ");
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+			const setText = editor.setText.bind(editor);
+			vi.spyOn(editor, "setText").mockImplementation(text => {
+				setText(text);
+				editor.onChange?.(text);
+			});
+			vi.spyOn(editor, "insertText").mockImplementationOnce(text => {
+				editor.setText(`partial ${text}`);
+				throw new Error("commit failed");
+			});
+
+			const handled = await editor.onPasteText?.(`${first} ${second}`, pasteTextContext());
+
+			expect(handled).toBe(false);
+			expect(editor.getText()).toBe("draft ");
+			expect(ctx.pendingImages).toEqual([existingImage]);
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a successful attachment consumed when status rendering fails", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-controller-status-"));
+		const first = path.join(directory, "first.png");
+		const second = path.join(directory, "second.png");
+		await Bun.write(first, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		await Bun.write(second, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		try {
+			const { InputController, ctx, editor, spies } = await createContext();
+			spies.showStatus.mockImplementationOnce(() => {
+				throw new Error("render failed");
+			});
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+
+			const handled = await editor.onPasteText?.(`${first} ${second}`, pasteTextContext());
+
+			expect(handled).toBe(true);
+			expect(editor.getText()).toContain("[image 1]");
+			expect(ctx.pendingImages).toHaveLength(2);
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("uses confirmation rejection as a literal-paste bypass without filesystem access", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		spies.showHookSelector.mockResolvedValueOnce("Paste paths literally");
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+
+		const handled = await editor.onPasteText?.("/missing/first.png /missing/second.png", pasteTextContext());
+
+		expect(handled).toBe(false);
+		expect(editor.getText()).toBe("");
+		expect(ctx.pendingImages).toEqual([]);
+		expect(spies.showStatus).not.toHaveBeenCalled();
+	});
+
+	it("leaves image path lists literal in bash and Python composer modes", async () => {
+		for (const mode of ["bash", "python"] as const) {
+			const { InputController, ctx, editor, spies } = await createContext();
+			ctx.isBashMode = mode === "bash";
+			ctx.isPythonMode = mode === "python";
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+			const handled = await editor.onPasteText?.("/tmp/first.png /tmp/second.png", pasteTextContext());
+			expect(handled).toBe(false);
+			expect(spies.showHookSelector).not.toHaveBeenCalled();
+		}
+	});
+
+	it("does not attach after the paste transaction is aborted", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		const abortController = new AbortController();
+		abortController.abort(new Error("expired"));
+
+		const handled = await editor.onPasteText?.(
+			"/tmp/first.png /tmp/second.png",
+			pasteTextContext(abortController.signal),
+		);
+
+		expect(handled).toBe(false);
+		expect(editor.getText()).toBe("");
+		expect(ctx.pendingImages).toEqual([]);
+		expect(spies.showStatus).not.toHaveBeenCalled();
+	});
+
+	it("integrates editor timeout abort with controller loading and exact replay", async () => {
+		vi.useFakeTimers();
+		const { InputController, ctx } = await createContext();
+		const realEditor = new CustomEditor(defaultEditorTheme);
+		ctx.editor = realEditor;
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const finished = Promise.withResolvers<void>();
+		const loadPastedImageBatch = vi.fn(
+			async (options: LoadPastedImageBatchOptions): Promise<LoadedPastedImageBatch> => {
+				started.resolve();
+				try {
+					await release.promise;
+					options.signal.throwIfAborted();
+					return { images: [], loadedInputs: [], sourcePaths: [] };
+				} finally {
+					finished.resolve();
+				}
+			},
+		);
+		const controller = new InputController(ctx, { loadPastedImageBatch });
+		controller.setupKeyHandlers();
+
+		realEditor.handleInput("before ");
+		realEditor.handleInput("\x1b[200~/tmp/first.png /tmp/second.png \x1b[201~");
+		realEditor.handleInput("after");
+		await started.promise;
+		expect(realEditor.getText()).toBe("before ");
+
+		vi.advanceTimersByTime(5_000);
+		expect(realEditor.getText()).toBe("before /tmp/first.png /tmp/second.png after");
+		expect(ctx.pendingImages).toEqual([]);
+
+		release.resolve();
+		await finished.promise;
+		expect(realEditor.getText()).toBe("before /tmp/first.png /tmp/second.png after");
+		expect(ctx.pendingImages).toEqual([]);
+		realEditor.dispose();
+	});
+
+	it("processes a command prefix before a coalesced image-path paste", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		const realEditor = new CustomEditor(defaultEditorTheme);
+		ctx.editor = realEditor;
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+
+		realEditor.handleInput("!echo \x1b[200~/tmp/first.png /tmp/second.png\x1b[201~");
+		await Bun.sleep(0);
+
+		expect(ctx.isBashMode).toBe(true);
+		expect(realEditor.getText()).toBe("!echo /tmp/first.png /tmp/second.png");
+		expect(spies.showHookSelector).not.toHaveBeenCalled();
+		expect(ctx.pendingImages).toEqual([]);
+		realEditor.dispose();
+	});
+
+	it("replays confirmed path text literally when the user declines attachment", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		spies.showHookSelector.mockResolvedValueOnce("Paste paths literally");
+		const realEditor = new CustomEditor(defaultEditorTheme);
+		ctx.editor = realEditor;
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+
+		realEditor.handleInput("before \x1b[200~/tmp/first.png /tmp/second.png\x1b[201~ after");
+		await Bun.sleep(0);
+
+		expect(realEditor.getText()).toBe("before /tmp/first.png /tmp/second.png after");
+		expect(ctx.pendingImages).toEqual([]);
+		realEditor.dispose();
+	});
+
+	it("does not commit into a successor composer", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-controller-successor-"));
+		const first = path.join(directory, "first.png");
+		const second = path.join(directory, "second.png");
+		await Bun.write(first, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		await Bun.write(second, Buffer.from(RED_1X1_PNG_BASE64, "base64"));
+		try {
+			const { InputController, ctx, editor, spies } = await createContext();
+			const successorInsertText = vi.fn();
+			const replacementImage: InteractiveModeContext["pendingImages"][number] = {
+				type: "image",
+				data: "replacement",
+				mimeType: "image/png",
+			};
+			const successor = {
+				...editor,
+				insertText: successorInsertText,
+			} as unknown as InteractiveModeContext["editor"];
+			spies.showHookSelector.mockImplementationOnce(async () => {
+				editor.setText("replacement draft");
+				ctx.pendingImages = [replacementImage];
+				ctx.editor = successor;
+				return "Attach images";
+			});
+			const controller = new InputController(ctx);
+			controller.setupKeyHandlers();
+
+			const handled = await editor.onPasteText?.(`${first} ${second}`, pasteTextContext());
+
+			expect(handled).toBe(false);
+			expect(editor.getText()).toBe("replacement draft");
+			expect(successorInsertText).not.toHaveBeenCalled();
+			expect(ctx.pendingImages).toEqual([replacementImage]);
+			expect(spies.showStatus).not.toHaveBeenCalled();
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects over-limit lists before opening paths", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		const text = Array.from({ length: 17 }, (_, index) => `/missing/${index}.png`).join(" ");
+
+		const handled = await editor.onPasteText?.(text, pasteTextContext());
+
+		expect(handled).toBe(false);
+		expect(ctx.pendingImages).toEqual([]);
+		expect(spies.showHookSelector).not.toHaveBeenCalled();
+		expect(spies.showStatus).toHaveBeenCalledWith("Cannot attach more than 16 pasted images.");
+	});
+
+	it("leaves ordinary single saved paths literal", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		const handled = await editor.onPasteText?.("/tmp/not-a-clipboard-image.png", pasteTextContext());
+		expect(handled).toBe(false);
+		expect(editor.getText()).toBe("");
+		expect(ctx.pendingImages).toHaveLength(0);
+	});
+});
+
+describe("InputController shell mode cues", () => {
+	it("marks leading bang input as shell mode without rewriting editor text", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("!pwd");
+		editor.onChange?.("!pwd");
+
+		expect(ctx.isBashMode).toBe(true);
+		expect(ctx.isBashNoContext).toBe(false);
+		expect(ctx.isPythonMode).toBe(false);
+		expect(editor.getText()).toBe("!pwd");
+		expect(ctx.updateEditorBorderColor).toHaveBeenCalled();
+	});
+
+	it("marks double bang input as no-context shell mode", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("!!pwd");
+		editor.onChange?.("!!pwd");
+
+		expect(ctx.isBashMode).toBe(true);
+		expect(ctx.isBashNoContext).toBe(true);
+		expect(ctx.updateEditorBorderColor).toHaveBeenCalled();
+	});
+
+	it("keeps existing shell submit and history semantics", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+		await editor.onSubmit?.("!!pwd");
+
+		expect(spies.handleBashCommand).toHaveBeenCalledWith("pwd", true);
+		expect(editor.addToHistory).toHaveBeenCalledWith("!!pwd");
+		expect(ctx.isBashMode).toBe(false);
+		expect(ctx.isBashNoContext).toBe(false);
+	});
+
+	it("executes a command typed after entering shell mode", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+		ctx.isBashMode = true;
+		await editor.onSubmit?.("pwd");
+
+		expect(spies.handleBashCommand).toHaveBeenCalledWith("pwd", false);
+		expect(ctx.isBashMode).toBe(false);
+		expect(ctx.isBashNoContext).toBe(false);
+	});
+	it("preserves explicit single-bang parsing in no-context mode", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+		ctx.isBashMode = true;
+		ctx.isBashNoContext = true;
+		await editor.onSubmit?.("!pwd");
+
+		expect(spies.handleBashCommand).toHaveBeenCalledWith("pwd", false);
+	});
+
+	it("keeps prefix-less shell history replayable", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		controller.setupEditorSubmitHandler();
+		ctx.isBashMode = true;
+		await editor.onSubmit?.("pwd");
+
+		expect(editor.addToHistory).toHaveBeenCalledWith("!pwd");
+		expect(spies.handleBashCommand).toHaveBeenCalledWith("pwd", false);
+	});
+
+	it("dispatches the todo toggle chord only while a phase has tasks", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		const toggleTodoExpansion = vi.fn();
+		ctx.toggleTodoExpansion = toggleTodoExpansion;
+		ctx.todoPhases = [];
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+
+		const handler = (
+			editor.setCustomKeyHandler as Mock<(key: string, handler: () => boolean) => void>
+		).mock.calls.find(([key]) => key === "alt+shift+t")?.[1];
+		if (!handler) throw new Error("Expected an alt+shift+t handler for app.todo.toggle");
+
+		// Empty model: the chord must fall through rather than toggling an empty HUD.
+		expect(handler()).toBe(false);
+		expect(toggleTodoExpansion).not.toHaveBeenCalled();
+
+		ctx.todoPhases = [
+			{ title: "Phase 1", tasks: [{ text: "do the thing", status: "pending" }] },
+		] as unknown as InteractiveModeContext["todoPhases"];
+		// ActionRegistry memoizes availability for the current microtask and clears
+		// it on a queued microtask, so yield before re-probing.
+		await Bun.sleep(0);
+
+		expect(handler()).toBe(true);
+		expect(toggleTodoExpansion).toHaveBeenCalledTimes(1);
+	});
+
+	it("leaves the new alt+shift chords unclaimed by built-in editor actions", () => {
+		// `CustomEditor.#actionKeys` decides whether a built-in editor action
+		// consumes a chord before custom handlers run, so a collision there would
+		// silently shadow the new bindings even with no KEYBINDINGS conflict.
+		const editor = new CustomEditor(defaultEditorTheme);
+		for (const chord of ["alt+shift+t", "alt+shift+s", "alt+shift+f", "alt+shift+r"] as const) {
+			expect(editor.hasActionKey(chord)).toBe(false);
+		}
+	});
+
+	it("activates the session navigation chords, leaving tree and fork inert on an empty session", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		(ctx.session as { messages: unknown[] }).messages = [];
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+
+		const handlerFor = (key: string) =>
+			(editor.setCustomKeyHandler as Mock<(key: string, handler: () => boolean) => void>).mock.calls.find(
+				([registered]) => registered === key,
+			)?.[1];
+
+		const tree = handlerFor("alt+shift+s");
+		const fork = handlerFor("alt+shift+f");
+		const resume = handlerFor("alt+shift+r");
+		if (!tree || !fork || !resume) throw new Error("Expected the three session navigation chords to be bound");
+
+		// The loops consume the chord, but ActionRegistry refuses an unavailable
+		// action, so nothing opens against an empty session.
+		expect(tree()).toBe(true);
+		expect(fork()).toBe(true);
+		expect(ctx.showTreeSelector).not.toHaveBeenCalled();
+		expect(ctx.showUserMessageSelector).not.toHaveBeenCalled();
+
+		// `app.session.resume` has no message precondition.
+		expect(resume()).toBe(true);
+		await Bun.sleep(0);
+		expect(ctx.showSessionSelector).toHaveBeenCalledTimes(1);
+
+		(ctx.session as { messages: unknown[] }).messages = [{ role: "user", content: "hi" }];
+		await Bun.sleep(0);
+
+		expect(tree()).toBe(true);
+		await Bun.sleep(0);
+		expect(ctx.showTreeSelector).toHaveBeenCalledTimes(1);
+	});
+});

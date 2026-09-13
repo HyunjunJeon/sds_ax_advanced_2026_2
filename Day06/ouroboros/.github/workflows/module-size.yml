@@ -1,0 +1,43 @@
+name: module-size
+
+# Ratchets the size of `src/ouroboros` modules: a module already over the cap
+# may shrink but never grow, and a module under the cap may not cross it.
+#
+# Why this exists: per #1797, the 26 modules above 2,000 lines hold 35.3% of
+# all source, and nothing prevented them from growing further -- #1769 added
+# ~324 lines to `runner.py` while under review and no gate noticed. The
+# extraction work in #1797 is worth little if the modules re-inflate between
+# PRs; this gate is the floor under it.
+#
+# Runs on push to main as well as on PRs so the recorded budgets stay honest
+# even for the rare change that lands without a PR run.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  enforce-module-size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # Need the event's immutable predecessor so the gate can compare all
+          # editable policy literals against trusted history. Without it a PR
+          # could grow a module and loosen its policy in the same commit.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Enforce module size ratchet
+        env:
+          BASELINE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: python3 scripts/check-module-size.py --baseline-ref "${BASELINE_REF}"

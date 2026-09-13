@@ -1,0 +1,2389 @@
+"""Plugin invocation firewall.
+
+Every UserLevel plugin command must pass through `invoke_plugin`. The
+firewall is the single chokepoint that:
+
+  1. Pre-invocation trust check (locked Q1 of Q00/ouroboros-plugins#9):
+     refuse + clean error if a `required: true` permission is not trusted;
+     emit only `plugin.failed (status=blocked)`. NO `plugin.invoked` is
+     emitted in this case.
+  2. Single confirmation gate (locked Q2): if the command sets
+     `requires_confirmation: true`, prompt the user once. No second
+     prompt for permission risk.
+  3. Emit `plugin.invoked` before launching the entrypoint subprocess.
+  4. Emit `plugin.permission_used` for each `required: true` permission
+     declared by the manifest. v0 uses Option (a): coarse declared-set
+     emission, not per-call granular tracking.
+  5. Run the entrypoint out-of-process via subprocess.
+  6. Emit `plugin.completed` (status=success) or `plugin.failed`
+     (status=failed) on terminal.
+
+Command audit events conform to schemas/0.1/audit-event.schema.json;
+v0.3 lifecycle hook events conform to schemas/0.3/audit-event.schema.json.
+Bounded payloads: argv stored as-is, raw stdout/stderr replaced with a
+sha256 hash. Tokens, channel IDs, free-form user messages are forbidden
+by contract.
+
+The firewall does NOT own the audit log. Callers pass an `event_sink`
+(any callable taking a dict) which is typically wired to the core
+ledger writer (#737). Tests pass a list-appender for inspection.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+import hashlib
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import time
+from typing import Literal
+
+from ouroboros.plugin.digest import (
+    EscapingSymlinkError,
+    UnsupportedFileTypeError,
+    canonical_tree_hash,
+)
+from ouroboros.plugin.hooks import (
+    HOOK_BLOCKED_EVENT,
+    HOOK_COMPLETED_EVENT,
+    HOOK_FAILED_EVENT,
+    HOOK_INVOKED_EVENT,
+    HOOK_REWIND_OBSERVE_SCOPE,
+    HOOK_TOOL_INTERCEPT_BLOCKED_EVENT,
+    HOOK_TOOL_INTERCEPT_COMPLETED_EVENT,
+    HOOK_TOOL_INTERCEPT_REQUESTED_EVENT,
+    HOOK_TOOL_INTERCEPT_SCOPE,
+    HOOK_TOOL_OBSERVE_RECORDED_EVENT,
+    TERMINAL_OBSERVABILITY_HOOK_KINDS,
+    HookFailurePolicy,
+    HookKind,
+)
+from ouroboros.plugin.manifest import HookSpec, PluginManifest
+from ouroboros.plugin.trust_store import TrustRecord, TrustStore
+from ouroboros.plugin.userlevel_registry import RegisteredProgram
+
+SCHEMA_VERSION = "0.1"
+HOOK_AUDIT_SCHEMA_VERSION = "0.3"
+DEFAULT_PLUGIN_INVOCATION_TIMEOUT_SECONDS = 300.0
+REWIND_HOOK_AUDIT_SCHEMA_VERSION = "0.6"
+
+logger = logging.getLogger(__name__)
+
+EventSink = Callable[[dict], None]
+ConfirmFn = Callable[[str], bool]
+
+
+@dataclass(frozen=True)
+class InvocationResult:
+    """Outcome of a plugin invocation through the firewall.
+
+    `stdout_sha256` / `stderr_sha256` are the hashes that land on the
+    audit ledger (the RFC's bounded-payload contract). The raw
+    `stdout_bytes` / `stderr_bytes` fields are the captured streams
+    themselves — kept in memory for in-process consumers (e.g., the
+    `ooo <plugin>` dispatcher needs to re-emit plugin output to the
+    user's terminal). Audit-event emission never reads those bytes
+    directly; only the hashes go on the wire. They default to `None`
+    for blocked/failed paths where the entrypoint never produced
+    output.
+    """
+
+    status: Literal["success", "blocked", "failed"]
+    exit_code: int | None = None
+    message: str = ""
+    stdout_sha256: str | None = None
+    stderr_sha256: str | None = None
+    stdout_bytes: bytes | None = None
+    stderr_bytes: bytes | None = None
+    events: tuple[dict, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class RewindHookDispatchResult:
+    """Bounded outcome for one post-commit rewind hook candidate."""
+
+    status: Literal["completed", "blocked", "failed"]
+    reason: str | None = None
+    events: tuple[dict, ...] = field(default_factory=tuple)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _source_type_for_event(manifest: PluginManifest) -> str:
+    return manifest.source.type
+
+
+# --- argv redaction ---------------------------------------------------------
+#
+# Per the locked RFC ("Audit-event compatibility / Bounded payloads — argv
+# handling"), the firewall MUST apply a built-in argv redaction policy
+# before ledger write. This is the safety net for the case where a plugin
+# accidentally accepts secrets via argv despite documentation telling
+# users not to.
+#
+# The minimum policy is enumerated in the RFC and implemented here:
+#   1. Values of well-known secret flags (`--token`, `--password`, etc.),
+#      whether `--flag=value` or `--flag value`. The flag NAME survives;
+#      only the VALUE is replaced with the literal `[redacted]`.
+#   2. Tokens with high-confidence formats: `Bearer …`, GitHub
+#      `gh[oprsu]_…`, OpenAI `sk-…`, AWS `AKIA…` access keys, and
+#      JWT-shaped strings (three dot-separated base64url segments).
+#
+# The hash of the original argv (sha256 over the un-redacted form) MAY be
+# recorded alongside the redacted argv for forensic reconciliation; we
+# attach it to the event provenance under `argv_sha256` when redaction
+# actually fired so the original value can be re-confirmed against an
+# out-of-band store but never read straight off the ledger.
+
+_REDACTED = "[redacted]"
+
+_SECRET_FLAG_NAMES: frozenset[str] = frozenset(
+    {
+        "--token",
+        "-t",
+        "--password",
+        "--passwd",
+        "--api-key",
+        "--apikey",
+        "--secret",
+        "--auth",
+        "--authorization",
+        "--client-secret",
+        "--access-token",
+        "--refresh-token",
+        "--bearer",
+        "--credential",
+        "--credentials",
+    }
+)
+
+# High-confidence secret patterns. Anchored where useful; safe to err on
+# the side of redacting things that look secret-shaped.
+_SECRET_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # GitHub PAT / app / OAuth tokens
+    re.compile(r"^gh[oprsu]_[A-Za-z0-9]{20,}$"),
+    # OpenAI keys
+    re.compile(r"^sk-[A-Za-z0-9_-]{20,}$"),
+    # AWS access key id
+    re.compile(r"^AKIA[0-9A-Z]{16}$"),
+    # JWT-shaped: three dot-separated base64url segments
+    re.compile(r"^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$"),
+)
+
+
+def _is_secret_value(value: str) -> bool:
+    """Return True for argv values that match one of the locked
+    high-confidence secret formats. Conservative: bare strings that don't
+    match are passed through untouched so non-secret argv stays readable
+    in the ledger."""
+    if value.startswith("Bearer ") and len(value) > len("Bearer "):
+        return True
+    return any(p.fullmatch(value) for p in _SECRET_VALUE_PATTERNS)
+
+
+def _redact_argv(argv: list[str]) -> tuple[list[str], bool]:
+    """Apply the RFC's built-in argv redaction policy.
+
+    Returns a tuple ``(redacted_argv, redaction_fired)``. ``redaction_fired``
+    is True iff at least one element was rewritten — the caller uses that
+    to decide whether to record the sha256 of the original argv on the
+    event for forensic reconciliation.
+    """
+    redacted: list[str] = []
+    fired = False
+    pending_value_redact = False
+    pending_bearer_tail_redact = False
+    for token in argv:
+        if pending_bearer_tail_redact:
+            redacted.append(_REDACTED)
+            fired = True
+            pending_bearer_tail_redact = False
+            continue
+        if pending_value_redact:
+            redacted.append(_REDACTED)
+            fired = True
+            pending_value_redact = False
+            if token == "Bearer":
+                pending_bearer_tail_redact = True
+            continue
+        # `--flag=value` form: split on first `=`.
+        if token.startswith("-") and "=" in token:
+            flag, _, value = token.partition("=")
+            if flag in _SECRET_FLAG_NAMES:
+                redacted.append(f"{flag}={_REDACTED}")
+                fired = True
+                if value == "Bearer":
+                    pending_bearer_tail_redact = True
+                continue
+        # Bare flag form: value is the next argv element.
+        if token in _SECRET_FLAG_NAMES:
+            redacted.append(token)
+            pending_value_redact = True
+            continue
+        # High-confidence value-shaped match (Bearer …, gh*_…, sk-…,
+        # AKIA…, JWT-shaped).  Split ``Bearer`` auth values are only
+        # treated as secret context when introduced by a known secret flag
+        # above; a standalone literal ``Bearer`` may be ordinary user input
+        # and must not hide subsequent real flags from prompts/audit logs.
+        if _is_secret_value(token):
+            redacted.append(_REDACTED)
+            fired = True
+            continue
+        redacted.append(token)
+    if pending_value_redact:
+        # Trailing `--token` with no value: nothing to redact, but the
+        # plugin will reject it at parse-time anyway. Emit it as-is.
+        pass
+    if pending_bearer_tail_redact:
+        # Trailing `Bearer` without a credential tail was already
+        # redacted above. Nothing else to consume.
+        pass
+    return redacted, fired
+
+
+def _argv_sha256(argv: list[str]) -> str:
+    """Hex sha256 over the un-redacted argv joined by a record separator
+    that cannot appear in argv tokens (so the digest is collision-resistant
+    across argv boundary). Forensic-only — never persisted alongside the
+    raw value."""
+    h = hashlib.sha256()
+    for token in argv:
+        h.update(token.encode("utf-8", errors="surrogateescape"))
+        h.update(b"\x1f")  # ASCII unit separator
+    return h.hexdigest()
+
+
+def _argv_summary(argv: list[str]) -> dict:
+    """Compute a bounded fingerprint of argv for the audit envelope.
+
+    Returns ``{argc, byte_length, sha256}``. Hashing uses NUL as the
+    element separator so two different argv lists with the same
+    concatenation cannot collide
+    (``["ab", "cd"]`` vs ``["abcd"]``). ``byte_length`` excludes the
+    separators so the number reflects the operator-visible payload
+    size. The summary is computed over the **redacted** argv (the
+    same value that lands in ``cmd["argv"]``) so the byte-length and
+    sha256 describe what actually appears on the audit ledger; this
+    keeps the observation-only metric consistent with the redaction
+    contract that secret values never reach persisted state.
+    """
+    parts = [s.encode("utf-8", errors="replace") for s in argv]
+    digest = hashlib.sha256(b"\x00".join(parts)).hexdigest()
+    return {
+        "argc": len(argv),
+        "byte_length": sum(len(p) for p in parts),
+        "sha256": digest,
+    }
+
+
+def _event_envelope(
+    *,
+    event_type: str,
+    manifest: PluginManifest,
+    namespace: str,
+    command_name: str,
+    argv: list[str] | None,
+    trust_state: str,
+    capabilities_used: Iterable[str] = (),
+    permissions_used: Iterable[str] = (),
+    result: dict | None = None,
+    provenance: dict[str, str] | None = None,
+    schema_version: str = SCHEMA_VERSION,
+) -> dict:
+    """Build an event matching schemas/0.1/audit-event.schema.json.
+
+    Per the RFC's bounded-payload argv contract, ``argv`` is run through
+    ``_redact_argv`` before reaching the ledger; when redaction fires, a
+    ``argv_sha256`` field is added to ``provenance`` for forensic
+    reconciliation against the un-redacted argv stored out-of-band.
+    """
+    cmd: dict = {"namespace": namespace, "name": command_name}
+    redaction_fired = False
+    argv_hash: str | None = None
+    if argv is not None:
+        redacted, redaction_fired = _redact_argv(list(argv))
+        cmd["argv"] = redacted
+        # ``argv_summary`` is observation-only sizing of what actually
+        # lands on the ledger. Compute it over the redacted argv so the
+        # byte_length / sha256 describe the persisted shape, not the
+        # pre-redaction one — secret-shaped values must not contribute
+        # to a hash that an audit consumer might reverse-correlate.
+        cmd["argv_summary"] = _argv_summary(redacted)
+        if redaction_fired:
+            argv_hash = _argv_sha256(list(argv))
+    event: dict = {
+        "schema_version": schema_version,
+        "event_type": event_type,
+        "occurred_at": _utc_now_iso(),
+        "plugin": {
+            "name": manifest.name,
+            "version": manifest.version,
+            "source_type": _source_type_for_event(manifest),
+        },
+        "command": cmd,
+        "trust_state": trust_state,
+        "capabilities_used": list(capabilities_used),
+        "permissions_used": list(permissions_used),
+        "result": result or {"status": "success"},
+    }
+    final_provenance: dict[str, str] = dict(provenance) if provenance is not None else {}
+    if argv_hash is not None:
+        final_provenance.setdefault("argv_sha256", argv_hash)
+    if final_provenance:
+        event["provenance"] = final_provenance
+    return event
+
+
+_REWIND_PROVENANCE_KEYS = frozenset(
+    {
+        "correlation_id",
+        "hook_name",
+        "failure_policy",
+        "reason",
+        "returncode",
+        "timeout_seconds",
+        "stdout_sha256",
+        "stderr_sha256",
+        "skipped_count",
+    }
+)
+
+
+def _rewind_event_envelope(
+    *,
+    event_type: str,
+    manifest: PluginManifest,
+    rewind_event_id: str,
+    lineage_id: str,
+    trust_state: str,
+    permissions_used: Iterable[str],
+    result: dict | None = None,
+    provenance: dict[str, str] | None = None,
+) -> dict:
+    """Build the truthful v0.6 observation audit subject for rewind hooks."""
+    final_provenance = dict(provenance or {})
+    unexpected = set(final_provenance).difference(_REWIND_PROVENANCE_KEYS)
+    if unexpected:
+        raise ValueError(f"unsupported rewind provenance keys: {sorted(unexpected)!r}")
+    event: dict = {
+        "schema_version": REWIND_HOOK_AUDIT_SCHEMA_VERSION,
+        "event_type": event_type,
+        "occurred_at": datetime.now(tz=UTC)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z"),
+        "plugin": {
+            "name": manifest.name,
+            "version": manifest.version,
+            "source_type": _source_type_for_event(manifest),
+        },
+        "observation": {
+            "kind": "rewind",
+            "id": rewind_event_id,
+            "aggregate_type": "lineage",
+            "aggregate_id": lineage_id,
+        },
+        "trust_state": trust_state,
+        "capabilities_used": [],
+        "permissions_used": list(permissions_used),
+        "result": result or {"status": "success"},
+    }
+    if final_provenance:
+        event["provenance"] = final_provenance
+    return event
+
+
+def _coerce_rewind_output(value: object) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="surrogateescape")
+    return b""
+
+
+def dispatch_rewind_hook(
+    *,
+    manifest: PluginManifest,
+    hook_index: int,
+    plugin_home: Path,
+    source_type: str,
+    source_identity: str,
+    artifact_digest: str,
+    trust_store: TrustStore,
+    rewind_event_id: str,
+    lineage_id: str,
+    payload_json: str,
+    timeout_seconds: float,
+    event_sink: EventSink,
+    subprocess_runner: Callable[..., subprocess.CompletedProcess] | None = None,
+    deadline: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    skipped_count: int = 1,
+) -> RewindHookDispatchResult:
+    """Validate and launch one v0.6 post-commit rewind observer.
+
+    This helper has no return channel that can alter the committed rewind. Its
+    result is diagnostic only; every trust, digest, subprocess, and audit-sink
+    failure is contained to the observer phase.
+    """
+    emitted: list[dict] = []
+
+    def _emit(event: dict) -> None:
+        emitted.append(event)
+        try:
+            event_sink(event)
+        except Exception as exc:
+            logger.warning(
+                "plugin.rewind_audit_sink_failed",
+                extra={
+                    "plugin": manifest.name,
+                    "rewind_event_id": rewind_event_id,
+                    "error": str(exc),
+                },
+            )
+
+    def _finish(
+        *,
+        status: Literal["blocked", "failed"],
+        reason: str,
+        message: str,
+        trust_state: str = "blocked",
+        provenance: dict[str, str] | None = None,
+    ) -> RewindHookDispatchResult:
+        details = {
+            "correlation_id": rewind_event_id,
+            "hook_name": "on_rewind",
+            "failure_policy": "fail_open",
+            "reason": reason,
+            **(provenance or {}),
+        }
+        _emit(
+            _rewind_event_envelope(
+                event_type=HOOK_BLOCKED_EVENT if status == "blocked" else HOOK_FAILED_EVENT,
+                manifest=manifest,
+                rewind_event_id=rewind_event_id,
+                lineage_id=lineage_id,
+                trust_state=trust_state,
+                permissions_used=(HOOK_REWIND_OBSERVE_SCOPE,),
+                result={"status": status, "message": message},
+                provenance=details,
+            )
+        )
+        return RewindHookDispatchResult(status=status, reason=reason, events=tuple(emitted))
+
+    def _budget_exhausted() -> bool:
+        return deadline is not None and monotonic() >= deadline
+
+    def _finish_budget_exhausted() -> RewindHookDispatchResult:
+        emit_rewind_budget_exhausted(
+            manifest=manifest,
+            rewind_event_id=rewind_event_id,
+            lineage_id=lineage_id,
+            skipped_count=skipped_count,
+            event_sink=_emit,
+        )
+        return RewindHookDispatchResult(
+            status="blocked",
+            reason="dispatch_budget_exhausted",
+            events=tuple(emitted),
+        )
+
+    if _budget_exhausted():
+        return _finish_budget_exhausted()
+
+    try:
+        hook = manifest.hooks[hook_index]
+    except IndexError:
+        return _finish(
+            status="blocked",
+            reason="invalid_hook_index",
+            message="rewind hook declaration index is out of range",
+        )
+
+    required_rewind_permission = any(
+        permission.scope == HOOK_REWIND_OBSERVE_SCOPE and permission.required
+        for permission in manifest.permissions
+    )
+    if (
+        manifest.schema_version != REWIND_HOOK_AUDIT_SCHEMA_VERSION
+        or hook.name != HookKind.ON_REWIND.value
+        or hook.failure_policy != HookFailurePolicy.FAIL_OPEN.value
+        or hook.permissions != (HOOK_REWIND_OBSERVE_SCOPE,)
+        or not required_rewind_permission
+    ):
+        return _finish(
+            status="blocked",
+            reason="invalid_hook_contract",
+            message="rewind hook must be v0.6, fail_open, and hold required observe scope",
+        )
+
+    if not source_type or not source_identity or not artifact_digest:
+        return _finish(
+            status="blocked",
+            reason="incomplete_install_metadata",
+            message="rewind hooks require complete source and artifact metadata",
+        )
+    if source_type != manifest.source.type or source_type == "first_party":
+        return _finish(
+            status="blocked",
+            reason="install_subject_mismatch",
+            message="lockfile source type does not match an eligible installed plugin",
+        )
+
+    if _budget_exhausted():
+        return _finish_budget_exhausted()
+    try:
+        current_digest = canonical_tree_hash(plugin_home)
+    except (OSError, ValueError, EscapingSymlinkError, UnsupportedFileTypeError) as exc:
+        return _finish(
+            status="blocked",
+            reason="plugin_home_unreadable",
+            message=f"installed plugin bytes are unreadable: {type(exc).__name__}",
+        )
+    if _budget_exhausted():
+        return _finish_budget_exhausted()
+    if current_digest != artifact_digest:
+        return _finish(
+            status="blocked",
+            reason="artifact_digest_mismatch",
+            message="installed plugin bytes no longer match the lockfile digest",
+        )
+
+    if _budget_exhausted():
+        return _finish_budget_exhausted()
+    try:
+        is_disabled = trust_store.is_disabled_for_subject(
+            manifest.name,
+            source_type=source_type,
+            source_identity=source_identity,
+        )
+        trust_record = trust_store.read(manifest.name)
+    except (OSError, ValueError) as exc:
+        return _finish(
+            status="blocked",
+            reason="trust_state_unreadable",
+            message=f"plugin trust state is unreadable: {type(exc).__name__}",
+        )
+    if _budget_exhausted():
+        return _finish_budget_exhausted()
+    if is_disabled:
+        return _finish(
+            status="blocked",
+            reason="disabled",
+            message="plugin is disabled for this install subject",
+            trust_state="disabled",
+        )
+    if (
+        trust_record is None
+        or not trust_record.source_type
+        or not trust_record.source_identity
+        or not trust_record.artifact_digest
+        or trust_record.version != manifest.version
+        or trust_record.source_type != source_type
+        or trust_record.source_identity != source_identity
+        or trust_record.artifact_digest != artifact_digest
+    ):
+        return _finish(
+            status="blocked",
+            reason="trust_subject_mismatch",
+            message="plugin trust record does not match the complete install subject",
+        )
+    if not trust_record.has_scope(HOOK_REWIND_OBSERVE_SCOPE):
+        return _finish(
+            status="blocked",
+            reason="permission_not_trusted",
+            message="plugin:rewind:observe is not trusted for this install subject",
+        )
+
+    try:
+        hook_argv = shlex.split(hook.entrypoint.command)
+    except ValueError as exc:
+        return _finish(
+            status="failed",
+            reason="entrypoint_invalid",
+            message=f"hook entrypoint is not parseable: {exc}",
+            trust_state="trusted",
+            provenance={"timeout_seconds": f"{timeout_seconds:g}"},
+        )
+    if not hook_argv:
+        return _finish(
+            status="failed",
+            reason="entrypoint_invalid",
+            message="hook entrypoint command is empty after tokenization",
+            trust_state="trusted",
+            provenance={"timeout_seconds": f"{timeout_seconds:g}"},
+        )
+
+    effective_timeout = timeout_seconds
+    if deadline is not None:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return _finish_budget_exhausted()
+        effective_timeout = min(effective_timeout, remaining)
+
+    provenance = {
+        "correlation_id": rewind_event_id,
+        "hook_name": hook.name,
+        "failure_policy": hook.failure_policy,
+        "timeout_seconds": f"{effective_timeout:g}",
+    }
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["OUROBOROS_PLUGIN_HOME"] = str(plugin_home)
+    env["OUROBOROS_PLUGIN_REWIND_PAYLOAD"] = payload_json
+    if deadline is not None:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return _finish_budget_exhausted()
+        effective_timeout = min(effective_timeout, remaining)
+        provenance["timeout_seconds"] = f"{effective_timeout:g}"
+    _emit(
+        _rewind_event_envelope(
+            event_type=HOOK_INVOKED_EVENT,
+            manifest=manifest,
+            rewind_event_id=rewind_event_id,
+            lineage_id=lineage_id,
+            trust_state="trusted",
+            permissions_used=hook.permissions,
+            provenance=provenance,
+        )
+    )
+
+    runner = subprocess_runner or subprocess.run
+    try:
+        completed = runner(
+            hook_argv,
+            capture_output=True,
+            check=False,
+            timeout=effective_timeout,
+            cwd=str(plugin_home),
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return _finish(
+            status="failed",
+            reason="timeout",
+            message=f"on_rewind hook timed out after {effective_timeout:g}s",
+            trust_state="trusted",
+            provenance={
+                "timeout_seconds": f"{effective_timeout:g}",
+                "stdout_sha256": hashlib.sha256(_coerce_rewind_output(exc.stdout)).hexdigest(),
+                "stderr_sha256": hashlib.sha256(_coerce_rewind_output(exc.stderr)).hexdigest(),
+            },
+        )
+    except OSError as exc:
+        return _finish(
+            status="failed",
+            reason="startup_error",
+            message=f"on_rewind hook failed to start: {type(exc).__name__}",
+            trust_state="trusted",
+            provenance={"timeout_seconds": f"{effective_timeout:g}"},
+        )
+
+    stdout = _coerce_rewind_output(completed.stdout)
+    stderr = _coerce_rewind_output(completed.stderr)
+    run_provenance = {
+        **provenance,
+        "returncode": str(completed.returncode),
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+        "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+    }
+    if completed.returncode != 0:
+        return _finish(
+            status="failed",
+            reason="nonzero_exit",
+            message=f"on_rewind hook exited with code {completed.returncode}",
+            trust_state="trusted",
+            provenance={
+                "timeout_seconds": f"{effective_timeout:g}",
+                "returncode": str(completed.returncode),
+                "stdout_sha256": run_provenance["stdout_sha256"],
+                "stderr_sha256": run_provenance["stderr_sha256"],
+            },
+        )
+
+    _emit(
+        _rewind_event_envelope(
+            event_type=HOOK_COMPLETED_EVENT,
+            manifest=manifest,
+            rewind_event_id=rewind_event_id,
+            lineage_id=lineage_id,
+            trust_state="trusted",
+            permissions_used=hook.permissions,
+            provenance=run_provenance,
+        )
+    )
+    return RewindHookDispatchResult(status="completed", events=tuple(emitted))
+
+
+def emit_rewind_budget_exhausted(
+    *,
+    manifest: PluginManifest,
+    rewind_event_id: str,
+    lineage_id: str,
+    skipped_count: int,
+    event_sink: EventSink,
+) -> RewindHookDispatchResult:
+    """Record deterministic skipping after the global rewind deadline."""
+    event = _rewind_event_envelope(
+        event_type=HOOK_BLOCKED_EVENT,
+        manifest=manifest,
+        rewind_event_id=rewind_event_id,
+        lineage_id=lineage_id,
+        trust_state="blocked",
+        permissions_used=(HOOK_REWIND_OBSERVE_SCOPE,),
+        result={"status": "blocked", "message": "rewind dispatch budget exhausted"},
+        provenance={
+            "correlation_id": rewind_event_id,
+            "hook_name": "on_rewind",
+            "failure_policy": "fail_open",
+            "reason": "dispatch_budget_exhausted",
+            "skipped_count": str(skipped_count),
+        },
+    )
+    try:
+        event_sink(event)
+    except Exception as exc:
+        logger.warning(
+            "plugin.rewind_audit_sink_failed",
+            extra={
+                "plugin": manifest.name,
+                "rewind_event_id": rewind_event_id,
+                "error": str(exc),
+            },
+        )
+    return RewindHookDispatchResult(
+        status="blocked",
+        reason="dispatch_budget_exhausted",
+        events=(event,),
+    )
+
+
+def _matching_hooks(manifest: PluginManifest, hook_kind: HookKind) -> tuple[HookSpec, ...]:
+    if manifest.schema_version not in {"0.3", "0.4", "0.6"}:
+        return ()
+    return tuple(hook for hook in manifest.hooks if hook.name == hook_kind.value)
+
+
+def _hook_timeout_seconds(hook: HookSpec) -> float:
+    return float(hook.timeout_seconds or DEFAULT_PLUGIN_INVOCATION_TIMEOUT_SECONDS)
+
+
+def _required_permissions(manifest: PluginManifest) -> list[str]:
+    return [p.scope for p in manifest.permissions if p.required]
+
+
+def _record_matches_subject(
+    manifest: PluginManifest,
+    trust_record: TrustRecord | None,
+    *,
+    expected_source_identity: str | None,
+    expected_artifact_digest: str | None,
+) -> bool:
+    """A trust record is authoritative iff it matches the install subject.
+
+    Per the locked RFC ("Trust identity"), the subject is
+    ``(version, source.type, source_identity, artifact_digest)``. ANY
+    field changing voids the grant. When `expected_*` are None, fall
+    back to the legacy version-only check (so unit tests of the firewall
+    that don't plumb a plugin_home stay green).
+    """
+    if trust_record is None or trust_record.version != manifest.version:
+        return False
+    # When the caller plumbs the lockfile-recorded ``expected_*``
+    # (production CLI dispatch path), we are operating under the new
+    # subject contract: a record that is silent on a subject column
+    # cannot prove it was granted for THIS install subject. Refuse such
+    # legacy/partial records so a same-version reinstall from a
+    # different repo / path / bytes does NOT silently inherit pre-RFC
+    # grants. Firewall unit tests that don't plumb ``expected_*`` keep
+    # the legacy version-only behavior for backwards compatibility.
+    if expected_source_identity is not None or expected_artifact_digest is not None:
+        if (
+            not trust_record.source_type
+            or not trust_record.source_identity
+            or not trust_record.artifact_digest
+        ):
+            return False
+    if trust_record.source_type and trust_record.source_type != manifest.source.type:
+        return False
+    if expected_source_identity is not None:
+        if (
+            trust_record.source_identity
+            and trust_record.source_identity != expected_source_identity
+        ):
+            return False
+    if expected_artifact_digest is not None:
+        if (
+            trust_record.artifact_digest
+            and trust_record.artifact_digest != expected_artifact_digest
+        ):
+            return False
+    return True
+
+
+def _trust_state_label(
+    manifest: PluginManifest,
+    trust_record: TrustRecord | None,
+    *,
+    expected_source_identity: str | None = None,
+    expected_artifact_digest: str | None = None,
+) -> str:
+    """Return the trust state label for `manifest`.
+
+    `"trusted"` is reserved for the state in which an invocation will NOT
+    be blocked on the trust check: the record matches the installed
+    subject, has at least one granted scope, and covers every
+    `required: true` permission. A partial grant set still leaves the
+    plugin gated by `_missing_required`, so reporting it as `"trusted"`
+    would mis-label a permission boundary in audit events and in the
+    `inspect`/`list` UX.
+    """
+    if manifest.source.type == "first_party":
+        return "first_party"
+    if not _record_matches_subject(
+        manifest,
+        trust_record,
+        expected_source_identity=expected_source_identity,
+        expected_artifact_digest=expected_artifact_digest,
+    ):
+        return "installed"
+    assert trust_record is not None  # narrowed by _record_matches_subject
+    if not trust_record.granted_scopes:
+        return "installed"
+    required = _required_permissions(manifest)
+    if required and trust_record.missing(required):
+        return "installed"
+    return "trusted"
+
+
+def _missing_required(
+    manifest: PluginManifest,
+    trust_record: TrustRecord | None,
+    *,
+    expected_source_identity: str | None,
+    expected_artifact_digest: str | None,
+) -> list[str]:
+    required = _required_permissions(manifest)
+    if not required:
+        return []
+    if not _record_matches_subject(
+        manifest,
+        trust_record,
+        expected_source_identity=expected_source_identity,
+        expected_artifact_digest=expected_artifact_digest,
+    ):
+        # Treat a subject-mismatched record as if no trust were granted:
+        # the user must re-grant scopes against the new subject.
+        return list(required)
+    assert trust_record is not None  # narrowed by _record_matches_subject
+    return trust_record.missing(required)
+
+
+def _format_blocked_message(plugin_name: str, missing: list[str], risks: dict[str, str]) -> str:
+    """Per locked Q1: name the missing scope and the exact trust command."""
+    first = missing[0]
+    risk = risks.get(first, "?")
+    return (
+        f"plugin requires `{first}` ({risk}), which is not yet trusted. "
+        f"Run: ooo plugin trust {plugin_name} --scope {first}"
+    )
+
+
+def _scope_risk_index(manifest: PluginManifest) -> dict[str, str]:
+    return {p.scope: p.risk for p in manifest.permissions}
+
+
+def invoke_plugin(
+    program: RegisteredProgram,
+    *,
+    command_name: str,
+    argv: list[str],
+    trust_record: TrustRecord | None,
+    event_sink: EventSink,
+    correlation_id: str,
+    confirm: ConfirmFn = lambda _msg: True,
+    subprocess_runner: Callable[..., subprocess.CompletedProcess] | None = None,
+    plugin_home: Path | None = None,
+    expected_source_identity: str | None = None,
+    expected_artifact_digest: str | None = None,
+    is_disabled: bool = False,
+    cancellation_requested: bool = False,
+) -> InvocationResult:
+    """Invoke a UserLevel plugin command through the firewall.
+
+    Args:
+        program: Registered UserLevel program (from `userlevel_registry`).
+        command_name: The name of the command within the plugin's namespace.
+        argv: User-provided argument vector for the command.
+        trust_record: The plugin's TrustRecord (None if not yet trusted).
+            For first-party programs, may be None — the firewall does not
+            consult it for them.
+        event_sink: Callable that receives audit events. Wire to the core
+            ledger writer (#737) in production; pass `events.append` in
+            tests.
+        correlation_id: Cross-event correlation id for the ledger.
+        confirm: Optional callable for confirmation prompts. Default is
+            "auto-confirm" (returns True). CLI passes a function that
+            actually prompts.
+        subprocess_runner: Optional override (for tests) of subprocess.run.
+        plugin_home: Path to the installed plugin directory. When
+            provided, the entrypoint is launched with ``cwd=plugin_home``
+            so that manifest-declared interpreters like
+            ``python -m github_pr_ops`` resolve the plugin's modules from
+            its installed root rather than from the user's terminal cwd.
+            The firewall ALSO recomputes the canonical tree hash of this
+            directory before invocation and refuses to launch on drift
+            (RFC: ``result.status="trust_subject_changed"``).
+        expected_source_identity: The lockfile's recorded
+            ``source_identity`` for this plugin. When set, the trust
+            record's ``source_identity`` must match.
+        expected_artifact_digest: The lockfile's recorded
+            ``artifact_digest``. When set, the firewall recomputes the
+            canonical tree hash of ``plugin_home`` and refuses to launch
+            if it does not match (closes the code-substitution path).
+        is_disabled: When True, the firewall refuses invocation
+            unconditionally. RFC: "the firewall MUST consult the disable
+            record before any invocation, independently of whether trust
+            records exist".
+        cancellation_requested: When True, the firewall short-circuits
+            the invocation: no command entrypoint is launched, the
+            terminal ``plugin.failed`` event records reason
+            ``cancelled``, and observability ``on_cancel`` hooks (if any)
+            run after the terminal event. The hook dispatch is fail-open
+            by contract — a hook failure cannot mask the original
+            cancellation cause from the returned ``InvocationResult``.
+
+    Returns:
+        `InvocationResult` with status, exit code, sha256 hashes of
+        stdout/stderr, and the events emitted (also pushed to event_sink).
+    """
+    manifest = program.manifest
+    namespace = program.namespace
+    command = program.find_command(command_name)
+    if command is None:
+        # Treat unknown command as a failure that emits no events — the
+        # caller (CLI) is responsible for surfacing this. Returning a
+        # failed result keeps the contract simple.
+        return InvocationResult(
+            status="failed",
+            exit_code=2,
+            message=f"unknown command {command_name!r} in namespace {namespace!r}",
+        )
+
+    trust_state = _trust_state_label(
+        manifest,
+        trust_record,
+        expected_source_identity=expected_source_identity,
+        expected_artifact_digest=expected_artifact_digest,
+    )
+    risks = _scope_risk_index(manifest)
+    emitted: list[dict] = []
+    runner = subprocess_runner or subprocess.run
+
+    def _emit(event: dict) -> None:
+        event_sink(event)
+        emitted.append(event)
+
+    # Coerce stdout/stderr to bytes for hashing, regardless of whether
+    # the runner returned ``bytes`` (real subprocess.run without
+    # ``text=True``) or ``str`` (test fakes that pre-decode). This also
+    # handles partial buffers attached to ``subprocess.TimeoutExpired``.
+    # ``surrogateescape`` round-trips arbitrary byte sequences through
+    # str without raising, matching how Python decodes filesystem paths.
+    def _to_bytes(value: object) -> bytes:
+        if value is None:
+            return b""
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, str):
+            return value.encode("utf-8", errors="surrogateescape")
+        # Defensive: any other type is treated as empty so we never
+        # crash on an unexpected runner return shape.
+        return b""
+
+    def _plugin_runtime_env() -> dict[str, str]:
+        env = dict(os.environ)
+        # Installed plugin homes are immutable trust subjects. Prevent Python
+        # entrypoints from creating __pycache__ in plugin_home and provide a
+        # stable workspace/output contract for runtime artifacts.
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        workdir = Path.cwd()
+        env["OUROBOROS_PLUGIN_WORKDIR"] = str(workdir)
+        env["OUROBOROS_PLUGIN_OUTPUT_DIR"] = str(
+            workdir / ".ouroboros" / "plugin-artifacts" / manifest.name
+        )
+        if plugin_home is not None:
+            env["OUROBOROS_PLUGIN_HOME"] = str(plugin_home)
+        return env
+
+    def _run_lifecycle_hooks(hook_kind: HookKind) -> tuple[bool, str]:
+        for hook in _matching_hooks(manifest, hook_kind):
+            # Defense-in-depth: terminal observability hooks (``on_error`` /
+            # ``on_cancel``) MUST be fail-open at the contract level. The
+            # manifest JSON schema and loader already reject ``fail_closed``
+            # for these kinds, but a HookSpec constructed programmatically
+            # (bypassing the loader) could still smuggle ``fail_closed``
+            # into runtime. If we ever see that here, refuse to dispatch
+            # the subprocess, emit a bounded audit record, and continue —
+            # terminal observability stays fail-open at the contract level
+            # so the original ``plugin.failed`` cause reaches the caller
+            # unchanged.
+            if (
+                hook_kind in TERMINAL_OBSERVABILITY_HOOK_KINDS
+                and hook.failure_policy == HookFailurePolicy.FAIL_CLOSED.value
+            ):
+                _emit(
+                    _event_envelope(
+                        event_type=HOOK_BLOCKED_EVENT,
+                        manifest=manifest,
+                        namespace=namespace,
+                        command_name=command_name,
+                        argv=argv,
+                        trust_state=trust_state,
+                        permissions_used=hook.permissions,
+                        result={
+                            "status": "blocked",
+                            "message": (
+                                "terminal observability hook "
+                                f"{hook.name!r} declared fail_closed; "
+                                "terminal hooks must be fail_open."
+                            ),
+                        },
+                        provenance={
+                            "correlation_id": correlation_id,
+                            "hook_name": hook.name,
+                            "hook_kind": hook_kind.value,
+                            "failure_policy": hook.failure_policy,
+                            "reason": "terminal_observability_must_be_fail_open",
+                        },
+                        schema_version=HOOK_AUDIT_SCHEMA_VERSION,
+                    )
+                )
+                continue
+
+            hook_provenance = {
+                "correlation_id": correlation_id,
+                "hook_name": hook.name,
+                "failure_policy": hook.failure_policy,
+            }
+            _emit(
+                _event_envelope(
+                    event_type=HOOK_INVOKED_EVENT,
+                    manifest=manifest,
+                    namespace=namespace,
+                    command_name=command_name,
+                    argv=argv,
+                    trust_state=trust_state,
+                    permissions_used=hook.permissions,
+                    provenance=hook_provenance,
+                    schema_version=HOOK_AUDIT_SCHEMA_VERSION,
+                )
+            )
+            try:
+                hook_argv = shlex.split(hook.entrypoint.command)
+            except ValueError as exc:
+                hook_argv = []
+                hook_error = f"hook entrypoint is not parseable: {exc}"
+            else:
+                hook_error = ""
+            if not hook_argv and not hook_error:
+                hook_error = "hook entrypoint command is empty after tokenization"
+
+            if not hook_error:
+                try:
+                    hook_completed = runner(
+                        hook_argv,
+                        capture_output=True,
+                        check=False,
+                        timeout=_hook_timeout_seconds(hook),
+                        cwd=str(plugin_home) if plugin_home is not None else None,
+                        env=_plugin_runtime_env(),
+                    )
+                    hook_stdout = _to_bytes(hook_completed.stdout)
+                    hook_stderr = _to_bytes(hook_completed.stderr)
+                    hook_provenance["returncode"] = str(hook_completed.returncode)
+                    hook_provenance["stdout_sha256"] = hashlib.sha256(hook_stdout).hexdigest()
+                    hook_provenance["stderr_sha256"] = hashlib.sha256(hook_stderr).hexdigest()
+                    if hook_completed.returncode != 0:
+                        hook_error = (
+                            f"hook {hook.name} exited with code {hook_completed.returncode}"
+                        )
+                except subprocess.TimeoutExpired as exc:
+                    hook_stdout = _to_bytes(exc.stdout)
+                    hook_stderr = _to_bytes(exc.stderr)
+                    hook_provenance["stdout_sha256"] = hashlib.sha256(hook_stdout).hexdigest()
+                    hook_provenance["stderr_sha256"] = hashlib.sha256(hook_stderr).hexdigest()
+                    hook_error = (
+                        f"hook {hook.name} timed out after {_hook_timeout_seconds(hook):g}s: "
+                        f"{type(exc).__name__}"
+                    )
+                except OSError as exc:
+                    hook_error = f"hook {hook.name} failed to start: {type(exc).__name__}: {exc}"
+
+            if hook_error:
+                blocks_invocation = hook.failure_policy == HookFailurePolicy.FAIL_CLOSED.value
+                _emit(
+                    _event_envelope(
+                        event_type=HOOK_BLOCKED_EVENT if blocks_invocation else HOOK_FAILED_EVENT,
+                        manifest=manifest,
+                        namespace=namespace,
+                        command_name=command_name,
+                        argv=argv,
+                        trust_state=trust_state,
+                        permissions_used=hook.permissions,
+                        result={
+                            "status": "blocked" if blocks_invocation else "failed",
+                            "message": hook_error,
+                        },
+                        provenance=hook_provenance,
+                        schema_version=HOOK_AUDIT_SCHEMA_VERSION,
+                    )
+                )
+                if blocks_invocation:
+                    return False, hook_error
+                continue
+
+            _emit(
+                _event_envelope(
+                    event_type=HOOK_COMPLETED_EVENT,
+                    manifest=manifest,
+                    namespace=namespace,
+                    command_name=command_name,
+                    argv=argv,
+                    trust_state=trust_state,
+                    permissions_used=hook.permissions,
+                    provenance=hook_provenance,
+                    schema_version=HOOK_AUDIT_SCHEMA_VERSION,
+                )
+            )
+        return True, ""
+
+    def _run_failed_invocation_observability_hooks() -> None:
+        """Dispatch fail-open observation hooks after a terminal failure.
+
+        Once the plugin command has reached the launched-command phase,
+        every controlled ``plugin.failed`` outcome should expose the same
+        terminal observation surface: ``after_invocation`` first, then
+        ``on_error``. The hooks are fail-open here, so their failures must
+        never replace the original launch/runtime failure returned below.
+        """
+
+        _run_lifecycle_hooks(HookKind.AFTER_INVOCATION)
+        _run_lifecycle_hooks(HookKind.ON_ERROR)
+
+    # 0. Disable check — fires before everything, including before the
+    # trust check, so a plugin with no `required: true` permissions
+    # cannot bypass `disable` by having an empty trust subject.
+    if is_disabled:
+        message = (
+            f"plugin {manifest.name!r} is disabled; run "
+            f"`ooo plugin trust {manifest.name} --scope <scope>` to re-enable."
+        )
+        _emit(
+            _event_envelope(
+                event_type="plugin.failed",
+                manifest=manifest,
+                namespace=namespace,
+                command_name=command_name,
+                argv=argv,
+                trust_state="disabled",
+                result={"status": "blocked", "message": message},
+                provenance={"correlation_id": correlation_id, "reason": "disabled"},
+            )
+        )
+        return InvocationResult(
+            status="blocked",
+            exit_code=None,
+            message=message,
+            events=tuple(emitted),
+        )
+
+    # 0b. Code-substitution check (per the RFC's per-invocation
+    # re-verification rule). Only enforced when the caller plumbs the
+    # expected digest + plugin_home; tests of the firewall's other
+    # contracts remain green without this plumbing.
+    if expected_artifact_digest is not None and plugin_home is not None:
+        try:
+            current_digest = canonical_tree_hash(plugin_home)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            # Plugin home gone or replaced with a non-directory: the
+            # firewall MUST refuse rather than crash. Treat both as the
+            # subject having changed since install (the trusted bytes
+            # are no longer hashable at the recorded path).
+            message = f"plugin home unreadable: {plugin_home} ({type(exc).__name__}: {exc})"
+            _emit(
+                _event_envelope(
+                    event_type="plugin.failed",
+                    manifest=manifest,
+                    namespace=namespace,
+                    command_name=command_name,
+                    argv=argv,
+                    trust_state="installed",
+                    result={"status": "trust_subject_changed", "message": message},
+                    provenance={
+                        "correlation_id": correlation_id,
+                        "reason": "plugin_home_missing",
+                    },
+                )
+            )
+            return InvocationResult(
+                status="blocked",
+                exit_code=None,
+                message=message,
+                events=tuple(emitted),
+            )
+        except (EscapingSymlinkError, UnsupportedFileTypeError) as exc:
+            # ``canonical_tree_hash`` rejects symlinks that escape the
+            # plugin root and unsupported file types (devices, FIFOs,
+            # sockets) — both indicate post-install tampering that the
+            # digest contract says we must refuse to invoke. Fail closed
+            # with ``trust_subject_changed`` so the audit trail records
+            # the exact reason, not a stack trace.
+            message = (
+                f"plugin home failed digest verification: {plugin_home} "
+                f"({type(exc).__name__}: {exc})"
+            )
+            _emit(
+                _event_envelope(
+                    event_type="plugin.failed",
+                    manifest=manifest,
+                    namespace=namespace,
+                    command_name=command_name,
+                    argv=argv,
+                    trust_state="installed",
+                    result={"status": "trust_subject_changed", "message": message},
+                    provenance={
+                        "correlation_id": correlation_id,
+                        "reason": "plugin_home_tampered",
+                        "exception_type": type(exc).__name__,
+                    },
+                )
+            )
+            return InvocationResult(
+                status="blocked",
+                exit_code=None,
+                message=message,
+                events=tuple(emitted),
+            )
+        except (OSError, RuntimeError) as exc:
+            # Permission errors, broken symlink loops, generic I/O on
+            # plugin_home: same fail-closed contract as above. Without
+            # this branch the exception would escape the firewall and
+            # skip the required terminal ``plugin.failed`` event.
+            message = f"plugin home unreadable: {plugin_home} ({type(exc).__name__}: {exc})"
+            _emit(
+                _event_envelope(
+                    event_type="plugin.failed",
+                    manifest=manifest,
+                    namespace=namespace,
+                    command_name=command_name,
+                    argv=argv,
+                    trust_state="installed",
+                    result={"status": "trust_subject_changed", "message": message},
+                    provenance={
+                        "correlation_id": correlation_id,
+                        "reason": "plugin_home_unreadable",
+                        "exception_type": type(exc).__name__,
+                    },
+                )
+            )
+            return InvocationResult(
+                status="blocked",
+                exit_code=None,
+                message=message,
+                events=tuple(emitted),
+            )
+        if current_digest != expected_artifact_digest:
+            message = (
+                f"plugin {manifest.name!r} bytes have changed since "
+                f"installation; refusing to invoke. Run "
+                f"`ooo plugin add ...` (or `ooo plugin install ...`) to "
+                f"re-record the trust subject and re-grant scopes."
+            )
+            _emit(
+                _event_envelope(
+                    event_type="plugin.failed",
+                    manifest=manifest,
+                    namespace=namespace,
+                    command_name=command_name,
+                    argv=argv,
+                    trust_state="installed",
+                    result={
+                        "status": "trust_subject_changed",
+                        "message": message,
+                    },
+                    provenance={
+                        "correlation_id": correlation_id,
+                        "expected_artifact_digest": expected_artifact_digest,
+                        "current_artifact_digest": current_digest,
+                    },
+                )
+            )
+            return InvocationResult(
+                status="blocked",
+                exit_code=None,
+                message=message,
+                events=tuple(emitted),
+            )
+
+    # 1. Pre-invocation trust check (locked Q1).
+    # First-party programs skip the trust check (per Q00/ouroboros-plugins#8).
+    if manifest.source.type != "first_party":
+        missing = _missing_required(
+            manifest,
+            trust_record,
+            expected_source_identity=expected_source_identity,
+            expected_artifact_digest=expected_artifact_digest,
+        )
+        if missing:
+            message = _format_blocked_message(manifest.name, missing, risks)
+            _emit(
+                _event_envelope(
+                    event_type="plugin.failed",
+                    manifest=manifest,
+                    namespace=namespace,
+                    command_name=command_name,
+                    argv=argv,
+                    trust_state=trust_state,
+                    result={"status": "blocked", "message": message},
+                    provenance={"correlation_id": correlation_id},
+                )
+            )
+            return InvocationResult(
+                status="blocked",
+                exit_code=None,
+                message=message,
+                events=tuple(emitted),
+            )
+
+    # 1a. Cancellation short-circuit — evaluated only after disable,
+    # digest/tamper verification, and required-permission trust gates
+    # have passed. It still fires before confirmation, before_invocation,
+    # plugin.invoked, permission_used emission, and command launch. The
+    # terminal ``plugin.failed`` event records the original cancel cause
+    # and observability ``on_cancel`` hooks (fail-open, observation-only)
+    # run after the terminal event so a hook failure can never mask the
+    # cancellation cause that already reached the caller.
+    if cancellation_requested:
+        message = (
+            f"plugin {manifest.name!r} invocation cancelled before launch "
+            f"(correlation_id={correlation_id!r})"
+        )
+        _emit(
+            _event_envelope(
+                event_type="plugin.failed",
+                manifest=manifest,
+                namespace=namespace,
+                command_name=command_name,
+                argv=argv,
+                trust_state=trust_state,
+                result={"status": "failed", "message": message},
+                provenance={"correlation_id": correlation_id, "reason": "cancelled"},
+            )
+        )
+        _run_lifecycle_hooks(HookKind.ON_CANCEL)
+        return InvocationResult(
+            status="failed",
+            exit_code=None,
+            message=message,
+            events=tuple(emitted),
+        )
+
+    # 2. Confirmation gate (locked Q2 — ONE prompt, command-level).
+    if command.requires_confirmation:
+        redacted_prompt_argv, _ = _redact_argv(list(argv))
+        prompt = (
+            f"This command is destructive and requires confirmation.\n"
+            f"Plugin: {manifest.name} {manifest.version}\n"
+            f"Action: {command_name} {' '.join(redacted_prompt_argv)}\n"
+            f"Continue?"
+        )
+        if not confirm(prompt):
+            message = "user declined confirmation"
+            _emit(
+                _event_envelope(
+                    event_type="plugin.failed",
+                    manifest=manifest,
+                    namespace=namespace,
+                    command_name=command_name,
+                    argv=argv,
+                    trust_state=trust_state,
+                    result={"status": "blocked", "message": message},
+                    provenance={"correlation_id": correlation_id},
+                )
+            )
+            return InvocationResult(
+                status="blocked",
+                exit_code=None,
+                message=message,
+                events=tuple(emitted),
+            )
+
+    before_ok, before_message = _run_lifecycle_hooks(HookKind.BEFORE_INVOCATION)
+    if not before_ok:
+        message = f"before_invocation hook blocked invocation: {before_message}"
+        return InvocationResult(
+            status="blocked",
+            exit_code=None,
+            message=message,
+            events=tuple(emitted),
+        )
+
+    # 3. Emit `plugin.invoked` before launch.
+    _emit(
+        _event_envelope(
+            event_type="plugin.invoked",
+            manifest=manifest,
+            namespace=namespace,
+            command_name=command_name,
+            argv=argv,
+            trust_state=trust_state,
+            provenance={"correlation_id": correlation_id},
+        )
+    )
+
+    # 4. Emit one `plugin.permission_used` per required permission.
+    for scope in _required_permissions(manifest):
+        _emit(
+            _event_envelope(
+                event_type="plugin.permission_used",
+                manifest=manifest,
+                namespace=namespace,
+                command_name=command_name,
+                argv=argv,
+                trust_state=trust_state,
+                permissions_used=[scope],
+                provenance={"correlation_id": correlation_id, "scope": scope},
+            )
+        )
+
+    # 5. Run entrypoint out-of-process. The launch cwd is set to
+    # ``plugin_home`` when the caller plumbs it (the CLI does this), so
+    # manifest entrypoints like ``python -m github_pr_ops`` resolve from
+    # the installed plugin root rather than from the user's terminal cwd.
+    # When plugin_home is None (firewall unit tests / first-party
+    # programs that ship their own absolute entrypoint), we fall back to
+    # the caller's cwd to preserve the previous test contract.
+    cmd_template = manifest.entrypoint.command
+    # The schema only enforces ``minLength: 1`` on entrypoint.command, so
+    # a manifest may carry a whitespace-only string (which tokenises to
+    # ``[]``) or a string with an unmatched quote (which raises
+    # ``ValueError`` from ``shlex``). Both shapes are installable today
+    # and will reach this point. Without explicit handling, the
+    # ``ValueError`` would escape the firewall — skipping the required
+    # terminal ``plugin.failed`` event — and an empty token list would
+    # bubble into an opaque launcher failure. Convert both to a
+    # controlled ``plugin.failed`` outcome so dispatch always closes
+    # with a terminal event.
+    try:
+        parsed_argv = shlex.split(cmd_template)
+    except ValueError as exc:
+        message = f"entrypoint command is not parseable: {exc}"
+        _emit(
+            _event_envelope(
+                event_type="plugin.failed",
+                manifest=manifest,
+                namespace=namespace,
+                command_name=command_name,
+                argv=argv,
+                trust_state=trust_state,
+                result={"status": "failed", "message": message},
+                provenance={
+                    "correlation_id": correlation_id,
+                    "exception_type": type(exc).__name__,
+                },
+            )
+        )
+        _run_failed_invocation_observability_hooks()
+        return InvocationResult(
+            status="failed",
+            exit_code=126,
+            message=message,
+            events=tuple(emitted),
+        )
+    if not parsed_argv:
+        message = "entrypoint command is empty after tokenization"
+        _emit(
+            _event_envelope(
+                event_type="plugin.failed",
+                manifest=manifest,
+                namespace=namespace,
+                command_name=command_name,
+                argv=argv,
+                trust_state=trust_state,
+                result={"status": "failed", "message": message},
+                provenance={"correlation_id": correlation_id},
+            )
+        )
+        _run_failed_invocation_observability_hooks()
+        return InvocationResult(
+            status="failed",
+            exit_code=126,
+            message=message,
+            events=tuple(emitted),
+        )
+    cmd_argv = parsed_argv + [command_name] + list(argv)
+    tool_call_invocation_id = hashlib.sha256(
+        json.dumps(
+            {
+                "correlation_id": correlation_id,
+                "namespace": namespace,
+                "command_name": command_name,
+                "argv": list(argv),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8", errors="surrogateescape")
+    ).hexdigest()
+    redacted_tool_argv, _ = _redact_argv([command_name] + list(argv))
+    tool_args_preview = shlex.join(redacted_tool_argv)
+    tool_args_digest = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps([command_name] + list(argv), separators=(",", ":")).encode(
+                "utf-8", errors="surrogateescape"
+            )
+        ).hexdigest()
+    )
+    tool_name = f"{namespace}.{command_name}" if namespace else command_name
+    command_permissions = tuple(getattr(command, "permissions", ()) or ())
+    tool_permissions = command_permissions or tuple(_required_permissions(manifest))
+    before_tool_decision = dispatch_before_tool_call(
+        manifest=manifest,
+        tool=tool_name,
+        args_digest=tool_args_digest,
+        args_preview=tool_args_preview,
+        correlation_id=correlation_id,
+        invocation_id=tool_call_invocation_id,
+        event_sink=_emit,
+        tool_permissions=tool_permissions,
+        namespace=namespace,
+        command_name=command_name,
+        trust_state=trust_state,
+        plugin_home=plugin_home,
+        subprocess_runner=runner,
+    )
+    if not before_tool_decision.allowed:
+        _emit(
+            _event_envelope(
+                event_type="plugin.failed",
+                manifest=manifest,
+                namespace=namespace,
+                command_name=command_name,
+                argv=argv,
+                trust_state=trust_state,
+                result={
+                    "status": "blocked",
+                    "message": before_tool_decision.message,
+                },
+                provenance={
+                    "correlation_id": correlation_id,
+                    "reason": "tool_call_blocked",
+                    "tool_invocation_id": tool_call_invocation_id,
+                },
+            )
+        )
+        return InvocationResult(
+            status="blocked",
+            exit_code=None,
+            message=before_tool_decision.message,
+            events=tuple(emitted),
+        )
+
+    # Capture stdout/stderr as **bytes** rather than asking subprocess
+    # to decode them. The firewall only ever stores a sha256 hash of
+    # those streams (the RFC's bounded-payload contract), so we do
+    # not need a Unicode str here. Asking for ``text=True`` would
+    # surface ``UnicodeDecodeError`` from a plugin that writes
+    # non-UTF-8 bytes — and that exception would escape the firewall,
+    # skipping the required terminal ``plugin.failed`` event.
+    run_kwargs: dict = {
+        "capture_output": True,
+        "check": False,
+        "timeout": DEFAULT_PLUGIN_INVOCATION_TIMEOUT_SECONDS,
+        "env": _plugin_runtime_env(),
+    }
+    if plugin_home is not None:
+        run_kwargs["cwd"] = str(plugin_home)
+
+    tool_call_started_at = time.perf_counter()
+
+    def _tool_call_duration_ms() -> int:
+        return max(1, int(round((time.perf_counter() - tool_call_started_at) * 1000)))
+
+    def _output_digest(stdout_bytes: bytes, stderr_bytes: bytes) -> str:
+        return "sha256:" + hashlib.sha256(stdout_bytes + stderr_bytes).hexdigest()
+
+    def _dispatch_failed_after_tool_call(
+        *,
+        output_digest: str,
+        duration_ms: int,
+        exit_code: int | None,
+    ) -> None:
+        dispatch_after_tool_call(
+            manifest=manifest,
+            tool=tool_name,
+            status="failed",
+            output_digest=output_digest,
+            duration_ms=duration_ms,
+            correlation_id=correlation_id,
+            invocation_id=tool_call_invocation_id,
+            event_sink=_emit,
+            exit_code=exit_code,
+            namespace=namespace,
+            command_name=command_name,
+            trust_state=trust_state,
+            plugin_home=plugin_home,
+            subprocess_runner=runner,
+        )
+
+    try:
+        completed = runner(cmd_argv, **run_kwargs)
+    except FileNotFoundError as exc:
+        # Entrypoint executable not on PATH. Posix shell convention is
+        # exit code 127 ("command not found").
+        message = f"entrypoint not found: {cmd_argv[0]!r} ({exc})"
+        _emit(
+            _event_envelope(
+                event_type="plugin.failed",
+                manifest=manifest,
+                namespace=namespace,
+                command_name=command_name,
+                argv=argv,
+                trust_state=trust_state,
+                result={"status": "failed", "message": message},
+                provenance={"correlation_id": correlation_id},
+            )
+        )
+        _dispatch_failed_after_tool_call(
+            output_digest=_output_digest(b"", message.encode("utf-8", errors="surrogateescape")),
+            duration_ms=_tool_call_duration_ms(),
+            exit_code=127,
+        )
+        _run_failed_invocation_observability_hooks()
+        return InvocationResult(
+            status="failed",
+            exit_code=127,
+            message=message,
+            events=tuple(emitted),
+        )
+    except subprocess.TimeoutExpired as exc:
+        # A plugin command is an external process under the firewall's
+        # control boundary. Bound its lifetime the same way the Auto and
+        # Ralph runtimes bound their agent loops, and always close the
+        # audit sequence with a terminal ``plugin.failed`` event rather
+        # than leaving the caller hung indefinitely.
+        stdout_bytes = _to_bytes(exc.stdout)
+        stderr_bytes = _to_bytes(exc.stderr)
+        stdout_hash = hashlib.sha256(stdout_bytes).hexdigest()
+        stderr_hash = hashlib.sha256(stderr_bytes).hexdigest()
+        output_digest = _output_digest(stdout_bytes, stderr_bytes)
+        message = (
+            f"entrypoint timed out after "
+            f"{DEFAULT_PLUGIN_INVOCATION_TIMEOUT_SECONDS:g}s: {cmd_argv[0]!r}"
+        )
+        _emit(
+            _event_envelope(
+                event_type="plugin.failed",
+                manifest=manifest,
+                namespace=namespace,
+                command_name=command_name,
+                argv=argv,
+                trust_state=trust_state,
+                result={"status": "failed", "message": message},
+                provenance={
+                    "correlation_id": correlation_id,
+                    "reason": "timeout",
+                    "exception_type": type(exc).__name__,
+                    "timeout_seconds": f"{DEFAULT_PLUGIN_INVOCATION_TIMEOUT_SECONDS:g}",
+                    "stdout_sha256": stdout_hash,
+                    "stderr_sha256": stderr_hash,
+                },
+            )
+        )
+        _dispatch_failed_after_tool_call(
+            output_digest=output_digest,
+            duration_ms=_tool_call_duration_ms(),
+            exit_code=124,
+        )
+        _run_failed_invocation_observability_hooks()
+        return InvocationResult(
+            status="failed",
+            exit_code=124,
+            message=message,
+            stdout_sha256=stdout_hash,
+            stderr_sha256=stderr_hash,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            events=tuple(emitted),
+        )
+    except OSError as exc:
+        # Other OS-level launch failures: PermissionError (entrypoint
+        # not executable), NotADirectoryError (bad cwd), generic IO
+        # failures. Posix shell convention is exit code 126 ("command
+        # found but not executable"). The firewall MUST always emit a
+        # terminal `plugin.failed` event; without this branch the
+        # exception would escape `invoke_plugin` and crash the caller
+        # while skipping the audit trail.
+        message = f"entrypoint failed to start: {type(exc).__name__}: {exc}"
+        _emit(
+            _event_envelope(
+                event_type="plugin.failed",
+                manifest=manifest,
+                namespace=namespace,
+                command_name=command_name,
+                argv=argv,
+                trust_state=trust_state,
+                result={"status": "failed", "message": message},
+                provenance={
+                    "correlation_id": correlation_id,
+                    "exception_type": type(exc).__name__,
+                },
+            )
+        )
+        _dispatch_failed_after_tool_call(
+            output_digest=_output_digest(b"", message.encode("utf-8", errors="surrogateescape")),
+            duration_ms=_tool_call_duration_ms(),
+            exit_code=126,
+        )
+        _run_failed_invocation_observability_hooks()
+        return InvocationResult(
+            status="failed",
+            exit_code=126,
+            message=message,
+            events=tuple(emitted),
+        )
+
+    stdout_bytes = _to_bytes(completed.stdout)
+    stderr_bytes = _to_bytes(completed.stderr)
+    stdout_hash = hashlib.sha256(stdout_bytes).hexdigest()
+    stderr_hash = hashlib.sha256(stderr_bytes).hexdigest()
+    output_digest = _output_digest(stdout_bytes, stderr_bytes)
+    duration_ms = _tool_call_duration_ms()
+
+    terminal_provenance = {
+        "correlation_id": correlation_id,
+        "stdout_sha256": stdout_hash,
+        "stderr_sha256": stderr_hash,
+    }
+
+    # 6. Terminal event: completed or failed. after_invocation hooks are
+    # fail-open observation only and run after the command terminal event,
+    # so they can never change the returned InvocationResult.
+    if completed.returncode == 0:
+        _emit(
+            _event_envelope(
+                event_type="plugin.completed",
+                manifest=manifest,
+                namespace=namespace,
+                command_name=command_name,
+                argv=argv,
+                trust_state=trust_state,
+                result={"status": "success"},
+                provenance=terminal_provenance,
+            )
+        )
+        dispatch_after_tool_call(
+            manifest=manifest,
+            tool=tool_name,
+            status="success",
+            output_digest=output_digest,
+            duration_ms=duration_ms,
+            correlation_id=correlation_id,
+            invocation_id=tool_call_invocation_id,
+            event_sink=_emit,
+            exit_code=0,
+            namespace=namespace,
+            command_name=command_name,
+            trust_state=trust_state,
+            plugin_home=plugin_home,
+            subprocess_runner=runner,
+        )
+        _run_lifecycle_hooks(HookKind.AFTER_INVOCATION)
+        return InvocationResult(
+            status="success",
+            exit_code=0,
+            stdout_sha256=stdout_hash,
+            stderr_sha256=stderr_hash,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+            events=tuple(emitted),
+        )
+
+    message = f"entrypoint exited with code {completed.returncode}"
+    _emit(
+        _event_envelope(
+            event_type="plugin.failed",
+            manifest=manifest,
+            namespace=namespace,
+            command_name=command_name,
+            argv=argv,
+            trust_state=trust_state,
+            result={"status": "failed", "message": message},
+            provenance=terminal_provenance,
+        )
+    )
+    dispatch_after_tool_call(
+        manifest=manifest,
+        tool=tool_name,
+        status="failed",
+        output_digest=output_digest,
+        duration_ms=duration_ms,
+        correlation_id=correlation_id,
+        invocation_id=tool_call_invocation_id,
+        event_sink=_emit,
+        exit_code=completed.returncode,
+        namespace=namespace,
+        command_name=command_name,
+        trust_state=trust_state,
+        plugin_home=plugin_home,
+        subprocess_runner=runner,
+    )
+    _run_lifecycle_hooks(HookKind.AFTER_INVOCATION)
+    # ``on_error`` runs strictly after the terminal ``plugin.failed`` event
+    # and after the v0.3 ``after_invocation`` hook, so a hook failure can
+    # never mask the non-zero exit cause that already reached the caller.
+    _run_lifecycle_hooks(HookKind.ON_ERROR)
+    return InvocationResult(
+        status="failed",
+        exit_code=completed.returncode,
+        message=message,
+        stdout_sha256=stdout_hash,
+        stderr_sha256=stderr_hash,
+        stdout_bytes=stdout_bytes,
+        stderr_bytes=stderr_bytes,
+        events=tuple(emitted),
+    )
+
+
+# ---------------------------------------------------------------------------
+# #939 PR F-2 — tool-call hook dispatcher helpers
+#
+# F-1 (#1277) reserved the ``before_tool_call`` / ``after_tool_call`` hook
+# kinds, the ``plugin:tool:intercept`` / ``plugin:tool:observe`` scopes, and
+# the four ``plugin.tool.*`` audit event names, but left end-to-end tool-call
+# hook firing inert. This section provides the dispatcher specified by
+# ``docs/rfc/plugin-tool-call-hook-contract.md`` (§3 payload, §4 scopes,
+# §5 failure policy, §6 audit events).
+#
+# Unlike ``invoke_plugin`` (which wraps a single plugin command subprocess),
+# tool-call hooks fire *during* a plugin-mediated tool invocation, so the
+# dispatcher is a module-level helper a tool-mediation caller must invoke per
+# tool call. The production ``invoke_plugin`` command boundary dispatches these
+# helpers around the mediated command subprocess. The helpers correlate back
+# to the parent
+# ``plugin.invoked`` run via ``correlation_id`` and pair ``before``/``after``
+# callbacks via ``invocation_id``.
+# ---------------------------------------------------------------------------
+
+TOOL_CALL_HOOK_AUDIT_SCHEMA_VERSION = "0.4"
+
+#: Max length of the ``args_preview`` field that crosses the trust boundary
+#: into a tool-call hook process (RFC § 3.1). Longer previews are truncated
+#: with a single-character ellipsis sentinel.
+TOOL_CALL_ARGS_PREVIEW_LIMIT = 256
+
+#: Environment variable used to deliver the bounded, redacted tool-call hook
+#: payload (digests + bounded preview only — never raw args/output) to the
+#: hook subprocess, mirroring the other ``OUROBOROS_PLUGIN_*`` runtime env
+#: contracts. RFC § 3: only digests and the bounded preview cross the trust
+#: boundary.
+TOOL_CALL_HOOK_PAYLOAD_ENV = "OUROBOROS_PLUGIN_TOOL_CALL_PAYLOAD"
+
+
+@dataclass(frozen=True)
+class ToolCallDecision:
+    """Outcome of dispatching tool-call hooks for one tool invocation.
+
+    ``allowed`` is ``False`` only when an ``intercept`` ``before_tool_call``
+    hook vetoes the call — an explicit non-zero return, or a ``fail_closed``
+    intercept hook that errored (RFC § 6 ``plugin.tool.intercept.blocked``).
+    ``after_tool_call`` dispatch never blocks and always reports
+    ``allowed=True``. ``events`` carries the audit events emitted (also pushed
+    to the ``event_sink``) so in-process callers can inspect the decision.
+    """
+
+    allowed: bool
+    status: Literal["allowed", "blocked"]
+    message: str = ""
+    events: tuple[dict, ...] = field(default_factory=tuple)
+
+
+def _bounded_preview(text: str, limit: int = TOOL_CALL_ARGS_PREVIEW_LIMIT) -> str:
+    """Truncate ``text`` to ``limit`` chars with a ``…`` sentinel (RFC § 3.1)."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+_SECRET_PREVIEW_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"Bearer\s+[^\"'\s,}\]]+"),
+    re.compile(r"gh[oprsu]_[A-Za-z0-9]{20,}"),
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+)
+_SECRET_PREVIEW_NAMED_VALUE_RE = re.compile(
+    r"(?i)([\"']?\b(?:api[_-]?key|token|access[_-]?token|refresh[_-]?token|password|"
+    r"passwd|secret|client[_-]?secret|authorization|bearer)\b[\"']?\s*[:=]\s*[\"']?)"
+    r"([^\"'\s,}\]]+)"
+)
+_SECRET_PREVIEW_FLAG_VALUE_RE = re.compile(
+    r"(?i)(--(?:token|password|passwd|api-key|apikey|secret|auth|authorization|"
+    r"client-secret|access-token|refresh-token|bearer|credential|credentials)"
+    r"(?:=|\s+))([^\"'\s]+)"
+)
+
+
+def _redact_tool_call_args_preview(text: str) -> str:
+    """Redact secret-shaped before-tool-call previews at the hook boundary."""
+
+    redacted = _SECRET_PREVIEW_NAMED_VALUE_RE.sub(rf"\1{_REDACTED}", text)
+    redacted = _SECRET_PREVIEW_FLAG_VALUE_RE.sub(rf"\1{_REDACTED}", redacted)
+    for pattern in _SECRET_PREVIEW_VALUE_PATTERNS:
+        redacted = pattern.sub(_REDACTED, redacted)
+    return redacted
+
+
+def _matching_tool_call_hooks(
+    manifest: PluginManifest, hook_kind: HookKind
+) -> tuple[HookSpec, ...]:
+    """Return v0.4 manifest hooks declaring ``hook_kind``.
+
+    Tool-call hooks are a v0.4 vocabulary addition; v0.1/0.2/0.3 manifests
+    never carry them, so any other schema version matches nothing.
+    """
+    if manifest.schema_version not in {"0.4", "0.6"}:
+        return ()
+    return tuple(hook for hook in manifest.hooks if hook.name == hook_kind.value)
+
+
+def _is_intercept_hook(hook: HookSpec) -> bool:
+    """True iff ``hook`` holds ``plugin:tool:intercept`` (may veto a call)."""
+    return HOOK_TOOL_INTERCEPT_SCOPE in hook.permissions
+
+
+def _unauthorized_intercept_tool_permissions(
+    manifest: PluginManifest, tool_permissions: Iterable[str]
+) -> tuple[str, ...]:
+    """Return current tool scopes not covered by the firewall trust gate.
+
+    Tool-call intercept authority is two-part: a hook must hold
+    ``plugin:tool:intercept`` and the plugin invocation must already be
+    authorized for every permission required by the current tool call. The
+    firewall trust gate authorizes required top-level manifest permissions, so
+    an intercept subprocess cannot run for scopes outside that required set.
+    """
+    required_permissions = frozenset(_required_permissions(manifest))
+    return tuple(scope for scope in tool_permissions if scope not in required_permissions)
+
+
+def _coerce_bytes(value: object) -> bytes:
+    """Normalize a runner's stdout/stderr return shape to ``bytes``."""
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="surrogateescape")
+    return b""
+
+
+def _tool_hook_runtime_env(
+    manifest: PluginManifest, plugin_home: Path | None, payload_json: str
+) -> dict[str, str]:
+    """Build the hook subprocess env, carrying only the bounded payload."""
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    workdir = Path.cwd()
+    env["OUROBOROS_PLUGIN_WORKDIR"] = str(workdir)
+    env["OUROBOROS_PLUGIN_OUTPUT_DIR"] = str(
+        workdir / ".ouroboros" / "plugin-artifacts" / manifest.name
+    )
+    if plugin_home is not None:
+        env["OUROBOROS_PLUGIN_HOME"] = str(plugin_home)
+    env[TOOL_CALL_HOOK_PAYLOAD_ENV] = payload_json
+    return env
+
+
+def _run_tool_call_hook(
+    hook: HookSpec,
+    *,
+    plugin_home: Path | None,
+    runner: Callable[..., subprocess.CompletedProcess],
+    env: dict[str, str],
+) -> tuple[str, dict[str, str]]:
+    """Run one tool-call hook subprocess.
+
+    Returns ``(hook_error, provenance)``. ``hook_error`` is empty on a clean
+    (exit 0) run; otherwise it is a bounded human-readable cause. The
+    provenance dict carries only string values (returncode + output digests)
+    so it satisfies the audit envelope's ``dict[str, str]`` contract.
+    """
+    provenance: dict[str, str] = {}
+    try:
+        hook_argv = shlex.split(hook.entrypoint.command)
+    except ValueError as exc:
+        return f"hook entrypoint is not parseable: {exc}", provenance
+    if not hook_argv:
+        return "hook entrypoint command is empty after tokenization", provenance
+    try:
+        completed = runner(
+            hook_argv,
+            capture_output=True,
+            check=False,
+            timeout=_hook_timeout_seconds(hook),
+            cwd=str(plugin_home) if plugin_home is not None else None,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        provenance["stdout_sha256"] = hashlib.sha256(_coerce_bytes(exc.stdout)).hexdigest()
+        provenance["stderr_sha256"] = hashlib.sha256(_coerce_bytes(exc.stderr)).hexdigest()
+        return (
+            f"hook {hook.name} timed out after {_hook_timeout_seconds(hook):g}s: "
+            f"{type(exc).__name__}",
+            provenance,
+        )
+    except OSError as exc:
+        return f"hook {hook.name} failed to start: {type(exc).__name__}: {exc}", provenance
+    stdout = _coerce_bytes(completed.stdout)
+    stderr = _coerce_bytes(completed.stderr)
+    provenance["returncode"] = str(completed.returncode)
+    provenance["stdout_sha256"] = hashlib.sha256(stdout).hexdigest()
+    provenance["stderr_sha256"] = hashlib.sha256(stderr).hexdigest()
+    if completed.returncode != 0:
+        return f"hook {hook.name} exited with code {completed.returncode}", provenance
+    return "", provenance
+
+
+def dispatch_before_tool_call(
+    *,
+    manifest: PluginManifest,
+    tool: str,
+    args_digest: str,
+    args_preview: str,
+    correlation_id: str,
+    invocation_id: str,
+    event_sink: EventSink,
+    tool_permissions: Iterable[str] | None = None,
+    namespace: str = "",
+    command_name: str = "",
+    trust_state: str = "trusted",
+    plugin_home: Path | None = None,
+    subprocess_runner: Callable[..., subprocess.CompletedProcess] | None = None,
+) -> ToolCallDecision:
+    """Dispatch ``before_tool_call`` hooks for one plugin-mediated tool call.
+
+    Mirrors the lifecycle-hook precedent (``_run_lifecycle_hooks``): an
+    ``intercept`` hook (holding ``plugin:tool:intercept``) may veto the call
+    when it returns non-zero, but only after the current tool permission set is
+    covered by required top-level permissions that passed the firewall trust
+    gate. A ``fail_closed`` intercept authorization or subprocess failure
+    blocks; a ``fail_open`` intercept failure is recorded as
+    ``plugin.hook.failed`` and the call proceeds. ``observe``-only hooks never
+    block. Raw arguments never reach the hook — only the digest and the bounded
+    preview cross the trust boundary (RFC § 3).
+    """
+    emitted: list[dict] = []
+    runner = subprocess_runner or subprocess.run
+    tool_permissions_were_provided = tool_permissions is not None
+    current_tool_permissions = tuple(tool_permissions or ())
+
+    def _emit(event: dict) -> None:
+        emitted.append(event)
+        event_sink(event)
+
+    payload = {
+        "tool": tool,
+        "args_digest": args_digest,
+        "args_preview": _bounded_preview(_redact_tool_call_args_preview(args_preview)),
+        "correlation_id": correlation_id,
+        "invocation_id": invocation_id,
+        "permissions": list(current_tool_permissions),
+    }
+    payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    env = _tool_hook_runtime_env(manifest, plugin_home, payload_json)
+
+    for hook in _matching_tool_call_hooks(manifest, HookKind.BEFORE_TOOL_CALL):
+        intercept = _is_intercept_hook(hook)
+        provenance: dict[str, str] = {
+            "correlation_id": correlation_id,
+            "invocation_id": invocation_id,
+            "hook_name": hook.name,
+            "tool": tool,
+            "args_digest": args_digest,
+            "args_preview": payload["args_preview"],
+            "failure_policy": hook.failure_policy,
+            "permissions": json.dumps(
+                payload["permissions"], sort_keys=True, separators=(",", ":")
+            ),
+            "scope": "intercept" if intercept else "observe",
+        }
+        if intercept:
+            _emit(
+                _event_envelope(
+                    event_type=HOOK_TOOL_INTERCEPT_REQUESTED_EVENT,
+                    manifest=manifest,
+                    namespace=namespace,
+                    command_name=command_name,
+                    argv=None,
+                    trust_state=trust_state,
+                    permissions_used=hook.permissions,
+                    provenance=provenance,
+                    schema_version=TOOL_CALL_HOOK_AUDIT_SCHEMA_VERSION,
+                )
+            )
+            if not tool_permissions_were_provided:
+                hook_error = (
+                    "intercept hook requires explicit current tool permissions; "
+                    "pass tool_permissions=... or use observe-only hooks for "
+                    "permissionless dispatch"
+                )
+                provenance["missing_tool_permissions"] = "omitted"
+                _emit(
+                    _event_envelope(
+                        event_type=HOOK_TOOL_INTERCEPT_BLOCKED_EVENT,
+                        manifest=manifest,
+                        namespace=namespace,
+                        command_name=command_name,
+                        argv=None,
+                        trust_state=trust_state,
+                        permissions_used=hook.permissions,
+                        result={"status": "blocked", "message": hook_error},
+                        provenance=provenance,
+                        schema_version=TOOL_CALL_HOOK_AUDIT_SCHEMA_VERSION,
+                    )
+                )
+                return ToolCallDecision(
+                    allowed=False,
+                    status="blocked",
+                    message=hook_error,
+                    events=tuple(emitted),
+                )
+            unauthorized_permissions = _unauthorized_intercept_tool_permissions(
+                manifest, current_tool_permissions
+            )
+            if unauthorized_permissions:
+                hook_error = (
+                    "intercept hook is not authorized for current tool permissions: "
+                    + ", ".join(unauthorized_permissions)
+                )
+                provenance["missing_tool_permissions"] = json.dumps(
+                    list(unauthorized_permissions), sort_keys=True, separators=(",", ":")
+                )
+                if hook.failure_policy == HookFailurePolicy.FAIL_CLOSED.value:
+                    _emit(
+                        _event_envelope(
+                            event_type=HOOK_TOOL_INTERCEPT_BLOCKED_EVENT,
+                            manifest=manifest,
+                            namespace=namespace,
+                            command_name=command_name,
+                            argv=None,
+                            trust_state=trust_state,
+                            permissions_used=hook.permissions,
+                            result={"status": "blocked", "message": hook_error},
+                            provenance=provenance,
+                            schema_version=TOOL_CALL_HOOK_AUDIT_SCHEMA_VERSION,
+                        )
+                    )
+                    return ToolCallDecision(
+                        allowed=False,
+                        status="blocked",
+                        message=hook_error,
+                        events=tuple(emitted),
+                    )
+                _emit(
+                    _event_envelope(
+                        event_type=HOOK_FAILED_EVENT,
+                        manifest=manifest,
+                        namespace=namespace,
+                        command_name=command_name,
+                        argv=None,
+                        trust_state=trust_state,
+                        permissions_used=hook.permissions,
+                        result={"status": "failed", "message": hook_error},
+                        provenance=provenance,
+                        schema_version=TOOL_CALL_HOOK_AUDIT_SCHEMA_VERSION,
+                    )
+                )
+                continue
+        hook_error, run_provenance = _run_tool_call_hook(
+            hook, plugin_home=plugin_home, runner=runner, env=env
+        )
+        provenance.update(run_provenance)
+
+        if hook_error:
+            blocks_call = intercept and hook.failure_policy == HookFailurePolicy.FAIL_CLOSED.value
+            if blocks_call:
+                _emit(
+                    _event_envelope(
+                        event_type=HOOK_TOOL_INTERCEPT_BLOCKED_EVENT,
+                        manifest=manifest,
+                        namespace=namespace,
+                        command_name=command_name,
+                        argv=None,
+                        trust_state=trust_state,
+                        permissions_used=hook.permissions,
+                        result={"status": "blocked", "message": hook_error},
+                        provenance=provenance,
+                        schema_version=TOOL_CALL_HOOK_AUDIT_SCHEMA_VERSION,
+                    )
+                )
+                return ToolCallDecision(
+                    allowed=False,
+                    status="blocked",
+                    message=hook_error,
+                    events=tuple(emitted),
+                )
+            # fail_open intercept failure, or any observe-class failure: the
+            # tool call is not masked. Reuse the existing plugin.hook.failed
+            # event rather than a parallel tool-specific one (RFC § 6).
+            _emit(
+                _event_envelope(
+                    event_type=HOOK_FAILED_EVENT,
+                    manifest=manifest,
+                    namespace=namespace,
+                    command_name=command_name,
+                    argv=None,
+                    trust_state=trust_state,
+                    permissions_used=hook.permissions,
+                    result={"status": "failed", "message": hook_error},
+                    provenance=provenance,
+                    schema_version=TOOL_CALL_HOOK_AUDIT_SCHEMA_VERSION,
+                )
+            )
+            continue
+
+        _emit(
+            _event_envelope(
+                event_type=(
+                    HOOK_TOOL_INTERCEPT_COMPLETED_EVENT
+                    if intercept
+                    else HOOK_TOOL_OBSERVE_RECORDED_EVENT
+                ),
+                manifest=manifest,
+                namespace=namespace,
+                command_name=command_name,
+                argv=None,
+                trust_state=trust_state,
+                permissions_used=hook.permissions,
+                provenance=provenance,
+                schema_version=TOOL_CALL_HOOK_AUDIT_SCHEMA_VERSION,
+            )
+        )
+
+    return ToolCallDecision(allowed=True, status="allowed", events=tuple(emitted))
+
+
+def dispatch_after_tool_call(
+    *,
+    manifest: PluginManifest,
+    tool: str,
+    status: str,
+    output_digest: str,
+    duration_ms: int,
+    correlation_id: str,
+    invocation_id: str,
+    event_sink: EventSink,
+    exit_code: int | None = None,
+    namespace: str = "",
+    command_name: str = "",
+    trust_state: str = "trusted",
+    plugin_home: Path | None = None,
+    subprocess_runner: Callable[..., subprocess.CompletedProcess] | None = None,
+) -> ToolCallDecision:
+    """Dispatch ``after_tool_call`` observation hooks for one tool call.
+
+    ``after_tool_call`` is observation-only (RFC § 5): it is always
+    ``fail_open`` and never blocks. A clean hook records
+    ``plugin.tool.observe.recorded``; a failed hook records the shared
+    ``plugin.hook.failed`` event and the outcome is left untouched. Raw
+    output never reaches the hook — only ``output_digest`` crosses the
+    boundary.
+    """
+    emitted: list[dict] = []
+    runner = subprocess_runner or subprocess.run
+
+    def _emit(event: dict) -> None:
+        emitted.append(event)
+        event_sink(event)
+
+    payload = {
+        "tool": tool,
+        "status": status,
+        "exit_code": exit_code,
+        "output_digest": output_digest,
+        "duration_ms": duration_ms,
+        "correlation_id": correlation_id,
+        "invocation_id": invocation_id,
+    }
+    payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    env = _tool_hook_runtime_env(manifest, plugin_home, payload_json)
+
+    for hook in _matching_tool_call_hooks(manifest, HookKind.AFTER_TOOL_CALL):
+        provenance: dict[str, str] = {
+            "correlation_id": correlation_id,
+            "invocation_id": invocation_id,
+            "hook_name": hook.name,
+            "tool": tool,
+            "tool_status": status,
+            "failure_policy": hook.failure_policy,
+            "scope": "observe",
+        }
+        hook_error, run_provenance = _run_tool_call_hook(
+            hook, plugin_home=plugin_home, runner=runner, env=env
+        )
+        provenance.update(run_provenance)
+        if hook_error:
+            _emit(
+                _event_envelope(
+                    event_type=HOOK_FAILED_EVENT,
+                    manifest=manifest,
+                    namespace=namespace,
+                    command_name=command_name,
+                    argv=None,
+                    trust_state=trust_state,
+                    permissions_used=hook.permissions,
+                    result={"status": "failed", "message": hook_error},
+                    provenance=provenance,
+                    schema_version=TOOL_CALL_HOOK_AUDIT_SCHEMA_VERSION,
+                )
+            )
+            continue
+        _emit(
+            _event_envelope(
+                event_type=HOOK_TOOL_OBSERVE_RECORDED_EVENT,
+                manifest=manifest,
+                namespace=namespace,
+                command_name=command_name,
+                argv=None,
+                trust_state=trust_state,
+                permissions_used=hook.permissions,
+                provenance=provenance,
+                schema_version=TOOL_CALL_HOOK_AUDIT_SCHEMA_VERSION,
+            )
+        )
+
+    return ToolCallDecision(allowed=True, status="allowed", events=tuple(emitted))
+
+
+__all__ = [
+    "ConfirmFn",
+    "EventSink",
+    "InvocationResult",
+    "RewindHookDispatchResult",
+    "SCHEMA_VERSION",
+    "ToolCallDecision",
+    "dispatch_after_tool_call",
+    "dispatch_before_tool_call",
+    "dispatch_rewind_hook",
+    "emit_rewind_budget_exhausted",
+    "invoke_plugin",
+]

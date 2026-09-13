@@ -1,0 +1,1802 @@
+"""Claude Code adapter for LLM completion, over the SDK or the CLI.
+
+This adapter makes completion requests against the user's Claude Code Max Plan
+authentication instead of requiring separate API keys.
+
+It has two transports and prefers the Claude Agent SDK. When the SDK cannot be
+imported it falls back to the ``claude`` CLI in print mode, because the SDK
+requires ``mcp<2.0.0`` while the MCP protocol server requires ``mcp==2.0.0`` --
+so in a server process built from the ``[mcp]`` extra there is no SDK to import
+and the backend could previously generate nothing at all (Q00/ouroboros#1839).
+Policy is shared rather than duplicated: model normalization, turn budget,
+permission vocabulary, retry behavior and empty-response validation are decided
+once and read by both. What differs is the streaming surface -- print mode
+reports once at the end, with no per-turn callbacks or incremental events.
+
+Usage:
+    adapter = ClaudeCodeAdapter()
+    result = await adapter.complete(
+        messages=[Message(role=MessageRole.USER, content="Hello!")],
+        config=CompletionConfig(model="claude-sonnet-4-6"),
+    )
+
+Custom CLI Path:
+    You can specify a custom Claude CLI binary path to use instead of
+    the SDK's bundled CLI. This is useful for:
+    - Using an instrumented CLI wrapper (e.g., for OTEL tracing)
+    - Testing with a specific CLI version
+    - Using a locally built CLI
+
+    Set via constructor parameter or environment variable:
+        adapter = ClaudeCodeAdapter(cli_path="/path/to/claude")
+        # or
+        export OUROBOROS_CLI_PATH=/path/to/claude
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable
+from copy import deepcopy
+from dataclasses import replace
+from functools import lru_cache, partial
+import inspect
+import json
+import os
+from pathlib import Path
+import shutil
+import traceback
+
+import structlog
+
+from ouroboros.core.errors import ProviderError
+from ouroboros.core.json_utils import extract_json_payload
+from ouroboros.core.retry import BASE_TRANSIENT_PATTERNS, is_transient_error
+from ouroboros.core.types import Result
+from ouroboros.providers.base import (
+    CompletionConfig,
+    CompletionResponse,
+    Message,
+    MessageRole,
+    UsageInfo,
+)
+from ouroboros.providers.claude_cli_output import (
+    ClaudeCliOutputError,
+    normalize_claude_cli_output,
+)
+from ouroboros.providers.profiles import resolve_completion_profile_result
+from ouroboros.providers.tool_use_diagnostics import diagnose_tool_use_turn
+from ouroboros.runtime.child_env import DEFAULT_OUROBOROS_STRIP_KEYS, build_child_env
+
+log = structlog.get_logger(__name__)
+
+# Retry configuration for transient API errors
+_MAX_RETRIES = 5
+_MAX_JSON_RETRIES = 3  # Extra retries when response_format requires JSON but LLM returns prose
+# Recovery cue for phantom tool calls under the sealed no-tools envelope
+# (#1537/#1530): some models — notably non-Claude models behind an
+# Anthropic-format proxy — emit tool_use blocks even when the visible tool
+# catalog is emptied via ``--tools ""``. No CLI flag can prevent that, so the
+# one retry the adapter grants gets this hard instruction appended.
+_NO_TOOLS_RECOVERY_CUE = (
+    "CRITICAL: You have NO tools in this session. Tool calls are impossible "
+    "and will be discarded unexecuted. Do NOT emit any tool call or "
+    "function-call markup. Respond with plain text only."
+)
+_INITIAL_BACKOFF_SECONDS = (
+    0.5  # Keep low for interactive loops; exponential backoff handles sustained failures
+)
+# Shared transient core (rate/429/5xx/timeout/overloaded/connection/…) plus the
+# Claude-CLI-specific bootstrap signals that only this adapter can safely match.
+# Composed from the single source of truth in ``core.retry`` so the common
+# terms can never drift from the Codex / execution adapters again.
+_CLAUDE_CLI_BOOTSTRAP_PATTERNS = (
+    "empty response",  # custom CLI startup delay
+    "need retry",  # explicit retry request
+    "startup",
+)
+_RETRYABLE_ERROR_PATTERNS = (
+    *BASE_TRANSIENT_PATTERNS,
+    *_CLAUDE_CLI_BOOTSTRAP_PATTERNS,
+)
+# One completion attempt, as a callable. ``complete()`` binds this once so that
+# retries downstream reach the transport that is actually available.
+_Transport = Callable[
+    [str, CompletionConfig, "str | None"],
+    Awaitable["Result[CompletionResponse, ProviderError]"],
+]
+# ``timeout=None`` means "no adapter-level deadline" on the SDK path, where the
+# SDK still owns the child process and a cancelled task tears it down. A bare
+# subprocess has no such owner, so the CLI path substitutes a finite ceiling
+# rather than waiting forever on a process nothing will reap.
+_CLI_DEFAULT_TIMEOUT_SECONDS = 600.0
+# How long a killed child gets to actually die before we stop waiting on it.
+# Bounded so cleanup can never become the new hang.
+_CLI_REAP_TIMEOUT_SECONDS = 5.0
+
+
+async def _terminate_process(proc: asyncio.subprocess.Process | None) -> None:
+    """Kill a subprocess and wait for it, without ever raising.
+
+    ``Process.kill()`` only delivers the signal; without the ``wait()`` the child
+    stays a zombie and its pipes stay open. Called from timeout and cancellation
+    paths, so it must not raise a second error over the one being reported.
+    """
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):  # already gone
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=_CLI_REAP_TIMEOUT_SECONDS)
+    except (TimeoutError, asyncio.CancelledError, OSError):
+        log.warning("claude_code_adapter.cli_process_not_reaped", pid=proc.pid)
+
+
+@lru_cache(maxsize=1)
+def _claude_options_field_names() -> frozenset[str]:
+    """Return parameter names accepted by ``ClaudeAgentOptions``.
+
+    Used to gate optional kwargs that may not exist across published
+    ``claude-agent-sdk`` releases.  ``strict-mcp-config`` is only available
+    via ``extra_args`` (CLI passthrough) on current SDK versions; older
+    releases may also lack ``extra_args`` itself, so we detect support before
+    forwarding instead of assuming a typed kwarg.
+    """
+    try:
+        from claude_agent_sdk import ClaudeAgentOptions  # noqa: PLC0415
+    except ImportError:
+        return frozenset()
+    try:
+        return frozenset(inspect.signature(ClaudeAgentOptions).parameters)
+    except (TypeError, ValueError):
+        return frozenset()
+
+
+class ClaudeCodeAdapter:
+    """LLM adapter for Claude Code Max Plan, over the SDK or the CLI.
+
+    This adapter provides the same interface as LiteLLMAdapter but uses the
+    user's Claude Code subscription under the hood, so no separate API key is
+    needed. It prefers the Claude Agent SDK and falls back to the ``claude`` CLI
+    when the SDK is not importable -- see the module docstring for why that
+    happens and what the fallback does and does not carry.
+
+    Attributes:
+        cli_path: Path to the Claude CLI binary. If not set, the SDK will
+            use its bundled CLI. Set this to use a custom/instrumented CLI.
+            Also the binary the fallback transport runs; with no SDK and no
+            configured path, completion fails naming both.
+
+    Example:
+        adapter = ClaudeCodeAdapter()
+        result = await adapter.complete(
+            messages=[Message(role=MessageRole.USER, content="Hello!")],
+            config=CompletionConfig(model="claude-sonnet-4-6"),
+        )
+        if result.is_ok:
+            print(result.value.content)
+
+    Example with custom CLI:
+        adapter = ClaudeCodeAdapter(cli_path="/usr/local/bin/claude")
+    """
+
+    def __init__(
+        self,
+        permission_mode: str = "default",
+        cli_path: str | Path | None = None,
+        cwd: str | Path | None = None,
+        allowed_tools: list[str] | None = None,
+        max_turns: int = 1,
+        on_message: Callable[[str, str], None] | None = None,
+        timeout: float | None = None,
+        strict_mcp_config: bool = False,
+    ) -> None:
+        """Initialize Claude Code adapter.
+
+        Args:
+            permission_mode: Permission mode for SDK operations.
+                - "default": Standard permissions
+                - "acceptEdits": Auto-approve edits (not needed for interview)
+            cli_path: Path to the Claude CLI binary. If not provided,
+                checks OUROBOROS_CLI_PATH env var, then falls back to
+                SDK's bundled CLI.
+            cwd: Working directory passed to the Claude Agent SDK.
+            allowed_tools: Explicit allow-list for Claude tools. ``None`` keeps
+                the default permissive mode while still blocking dangerous tools.
+                Use ``[]`` to forbid all Claude tools.
+            max_turns: Maximum turns for the conversation. Default 1 for
+                single-response completions (most MCP use cases).
+            on_message: Callback for streaming messages. Called with (type, content):
+                - ("thinking", "content") for agent reasoning
+                - ("tool", "tool_name") for tool usage
+            timeout: Optional application-level timeout in seconds for a
+                single completion request. When set, aborts before outer
+                transport timeouts and returns a ProviderError.
+            strict_mcp_config: When ``True``, forwards ``strict_mcp_config=True``
+                to the SDK so the spawned subprocess ignores plugin-provided
+                MCP servers and inherited project ``.mcp.json`` entries. Used
+                exclusively by callers that must avoid recursion into the
+                ouroboros MCP server (notably the interview policy path);
+                generic ``allowed_tools`` envelopes keep MCP-tool access intact.
+        """
+        self._permission_mode: str = permission_mode
+        self._cli_path: Path | None = self._resolve_cli_path(cli_path)
+        self._cwd: str = str(Path(cwd).expanduser()) if cwd is not None else os.getcwd()
+        self._allowed_tools: list[str] | None = (
+            list(allowed_tools) if allowed_tools is not None else None
+        )
+        self._max_turns: int = max_turns
+        self._on_message: Callable[[str, str], None] | None = on_message
+        self._timeout: float | None = timeout if timeout and timeout > 0 else None
+        self._strict_mcp_config: bool = bool(strict_mcp_config)
+        log.info(
+            "claude_code_adapter.initialized",
+            permission_mode=permission_mode,
+            cli_path=str(self._cli_path) if self._cli_path else None,
+            cwd=self._cwd,
+            timeout_seconds=self._timeout,
+        )
+
+    def with_strict_mcp_config(self) -> ClaudeCodeAdapter:
+        """Return an adapter clone with ``strict_mcp_config=True``.
+
+        Nested MCP question-generation paths must prevent the spawned
+        ``claude`` subprocess from booting plugin-provided MCP servers,
+        including ouroboros's own ``.mcp.json``.
+
+        Returns ``self`` when already strict (idempotent).
+        """
+        if self._strict_mcp_config:
+            return self
+        return ClaudeCodeAdapter(
+            permission_mode=self._permission_mode,
+            cli_path=self._cli_path,
+            cwd=self._cwd,
+            allowed_tools=self._allowed_tools,
+            max_turns=self._max_turns,
+            on_message=self._on_message,
+            timeout=self._timeout,
+            strict_mcp_config=True,
+        )
+
+    def _resolve_cli_path(self, cli_path: str | Path | None) -> Path | None:
+        """Resolve the CLI path from parameter, config, or environment variable.
+
+        Priority:
+            1. Explicit cli_path parameter
+            2. OUROBOROS_CLI_PATH environment variable
+            3. config.yaml orchestrator.cli_path
+            4. None (SDK default)
+
+        Args:
+            cli_path: Explicit CLI path from constructor.
+
+        Returns:
+            Resolved Path if set and exists, None otherwise (falls back to SDK default).
+        """
+        # Priority: explicit parameter > env var / config > SDK default
+        if cli_path:
+            path_str = str(cli_path)
+        else:
+            # Use config helper (checks env var then config.yaml)
+            from ouroboros.config import get_cli_path
+
+            path_str = get_cli_path() or ""
+        path_str = path_str.strip()
+
+        if not path_str:
+            return None
+
+        # The untrusted-`.env` trust boundary is enforced upstream in
+        # config.loader (OUROBOROS_CLI_PATH and aliases are stripped from a
+        # cloned repo's .env), so any path that reaches here came from a
+        # trusted source — an explicit caller, the real environment, or
+        # ~/.ouroboros config. No source-blind path rejection here: that
+        # would break legitimate relative wrapper overrides.
+        resolved = Path(path_str).expanduser().resolve()
+
+        if not resolved.exists():
+            log.warning(
+                "claude_code_adapter.cli_path_not_found",
+                cli_path=str(resolved),
+                fallback="using SDK bundled CLI",
+            )
+            return None
+
+        if not resolved.is_file():
+            log.warning(
+                "claude_code_adapter.cli_path_not_file",
+                cli_path=str(resolved),
+                fallback="using SDK bundled CLI",
+            )
+            return None
+
+        if not os.access(resolved, os.X_OK):
+            log.warning(
+                "claude_code_adapter.cli_not_executable",
+                cli_path=str(resolved),
+                fallback="using SDK bundled CLI",
+            )
+            return None
+
+        log.debug(
+            "claude_code_adapter.using_custom_cli",
+            cli_path=str(resolved),
+        )
+        return resolved
+
+    def _is_retryable_error(self, error_msg: str) -> bool:
+        """Check if an error message indicates a transient/retryable error.
+
+        Args:
+            error_msg: The error message to check.
+
+        Returns:
+            True if the error is likely transient and worth retrying.
+        """
+        return is_transient_error(
+            error_msg,
+            extra_patterns=_CLAUDE_CLI_BOOTSTRAP_PATTERNS,
+        )
+
+    def _is_retryable_provider_error(self, error: ProviderError) -> bool:
+        """Check if a provider error is transient enough to retry.
+
+        Claude Code's SDK sometimes reports CLI bootstrap failures as a generic
+        subprocess exit with no stderr, especially when launched through custom
+        wrapper paths such as the macOS ``cmux.app`` Claude binary.  Retrying the
+        shared adapter keeps seed generation from failing permanently on the
+        first extraction attempt while still avoiding retries for actionable
+        stderr-bearing failures such as auth or configuration errors.
+        """
+        raw_status = error.status_code
+        api_error_status = (
+            raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) else None
+        )
+        if api_error_status is None:
+            raw_detail_status = error.details.get("api_error_status")
+            if isinstance(raw_detail_status, int) and not isinstance(raw_detail_status, bool):
+                api_error_status = raw_detail_status
+        if api_error_status is not None:
+            return api_error_status in {408, 409, 425, 429} or 500 <= api_error_status <= 599
+
+        if self._is_retryable_error(error.message):
+            return True
+
+        error_type = str(error.details.get("error_type", ""))
+        stderr = str(error.details.get("stderr", "") or "").strip()
+        if stderr and self._is_retryable_error(stderr):
+            return True
+        if stderr:
+            return False
+
+        if error.details.get("retryable") is True:
+            return True
+
+        message = error.message.lower()
+        is_cli_process_exit = error_type in {"ProcessError", "CalledProcessError"}
+        return is_cli_process_exit and "command failed with exit code" in message
+
+    def _is_phantom_tool_use_error(self, error: ProviderError) -> bool:
+        """Whether a failure is a phantom tool call under the sealed envelope.
+
+        With ``allowed_tools=[]`` the visible tool catalog is emptied
+        (``tools=[]`` → ``--tools ""``), so a tool-use turn cannot be an
+        execution leak — only model noise that consumed the turn budget
+        (#1537/#1530). That noise surfaces as either the spy's explicit
+        ``ToolUseBlockViolation``, or as the max-turns failures the CLI/SDK
+        raise when the phantom call exhausts ``max_turns`` before any text
+        streams (``subtype=error_max_turns`` from the result stream, or the
+        SDK's bare ``Reached maximum number of turns`` / ``returned an error
+        result`` exceptions).
+        """
+        if self._allowed_tools is None or self._allowed_tools:
+            return False
+        details = error.details or {}
+        if details.get("error_type") == "ToolUseBlockViolation":
+            return True
+        if details.get("subtype") == "error_max_turns":
+            return True
+        message = error.message or ""
+        return "Reached maximum number of turns" in message or "returned an error result" in message
+
+    async def complete(
+        self,
+        messages: list[Message],
+        config: CompletionConfig,
+    ) -> Result[CompletionResponse, ProviderError]:
+        """Make a completion request over whichever transport is available.
+
+        Prefers the Claude Agent SDK and falls back to the ``claude`` CLI when
+        it cannot be imported. The choice is made once, here, and everything
+        below it -- profile resolution, system-message extraction, JSON
+        enforcement and its retries -- is the same either way.
+
+        Implements exponential backoff for transient errors like API concurrency
+        conflicts that can occur when running inside an active Claude Code session.
+
+        Args:
+            messages: The conversation messages to send.
+            config: Configuration for the completion request.
+
+        Returns:
+            Result containing either the completion response or a ProviderError.
+        """
+        try:
+            # Lazy import to avoid loading SDK at module import time
+            from claude_agent_sdk import ClaudeAgentOptions, query  # noqa: F401
+
+            sdk_available = True
+        except ImportError as e:
+            # Not fatal on its own: the CLI carries the same subscription and
+            # runs out of process, which is the only transport that survives an
+            # environment the SDK cannot enter. See ``_complete_via_cli``.
+            sdk_available = False
+            if self._cli_path is None:
+                discovered = shutil.which("claude")
+                if discovered:
+                    self._cli_path = Path(discovered).expanduser().resolve()
+            if self._cli_path is None:
+                log.error("claude_code_adapter.sdk_and_cli_unavailable", error=str(e))
+                return Result.err(
+                    ProviderError(
+                        message=(
+                            "Neither the Claude Agent SDK nor the claude CLI is available. "
+                            "Install the CLI, or add the SDK with: pip install claude-agent-sdk"
+                        ),
+                        details={"import_error": str(e), "cli_path": None},
+                    )
+                )
+            log.info("claude_code_adapter.sdk_absent_using_cli", cli_path=str(self._cli_path))
+
+        profile_result = resolve_completion_profile_result(config, backend="claude_code")
+        if profile_result.is_err:
+            return Result.err(profile_result.error)
+        config = profile_result.value.config
+
+        # Extract system messages and pass as system_prompt (not embedded in user prompt)
+        system_msgs = [m for m in messages if m.role == MessageRole.SYSTEM]
+        non_system_msgs = [m for m in messages if m.role != MessageRole.SYSTEM]
+        system_prompt = system_msgs[0].content if system_msgs else None
+
+        # Claude Code's CLI path does not reliably honor json_schema structured
+        # output. When callers request a schema, reinforce the requirement in the
+        # prompt text and let downstream parsers extract JSON from the plain-text
+        # response rather than depending on SDK-level structured_output.
+        requires_json = bool(
+            config.response_format
+            and config.response_format.get("type") in ("json_schema", "json_object")
+        )
+        if requires_json:
+            fmt_type = config.response_format.get("type")
+            if fmt_type == "json_schema":
+                schema = config.response_format.get("json_schema", {})
+                # Derive the expected top-level type from the schema so the
+                # prompt instruction matches the schema contract (object, array, etc.)
+                top_type = schema.get("type", "object")
+                if top_type == "array":
+                    type_noun = "JSON array"
+                elif top_type == "object":
+                    type_noun = "JSON object"
+                else:
+                    # Primitive schemas (string, number, boolean, null)
+                    type_noun = "JSON value"
+                schema_instruction = (
+                    f"Respond with ONLY a valid {type_noun} that matches this schema. "
+                    "Do not use markdown fences, headers, or explanatory text.\n\n"
+                    f"JSON schema:\n{json.dumps(schema, indent=2, sort_keys=True)}"
+                )
+            else:
+                # json_object — no schema, but still steer toward JSON
+                schema_instruction = (
+                    "Respond with ONLY a valid JSON object. "
+                    "Do not use markdown fences, headers, or explanatory text."
+                )
+            if system_prompt:
+                system_prompt = f"{system_prompt}\n\n{schema_instruction}"
+            else:
+                non_system_msgs = [
+                    Message(role=MessageRole.USER, content=schema_instruction),
+                    *non_system_msgs,
+                ]
+
+        # Build prompt from non-system messages only
+        prompt = self._build_prompt(non_system_msgs)
+
+        log.debug(
+            "claude_code_adapter.request_started",
+            prompt_preview=prompt[:100],
+            message_count=len(messages),
+            has_system_prompt=system_prompt is not None,
+            max_turns=self._effective_max_turns(config),
+            model=config.model,
+            cwd=str(self._cwd) if self._cwd else None,
+            cli_path=str(self._cli_path) if self._cli_path else None,
+            claudecode_present=bool(os.environ.get("CLAUDECODE")),
+            claude_code_entrypoint=os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
+        )
+
+        # Bind the transport once. Everything downstream that re-issues the
+        # request -- notably the JSON-enforcement retries -- has to reach the
+        # same one: routing a retry back through the SDK in a process that has
+        # no SDK turns a recoverable prose response into an ImportError.
+        #
+        # Both transports sit under the same transient-retry loop, so which one
+        # is available decides how the request travels, never how many transient
+        # failures it survives.
+        transport: _Transport = (
+            self._complete_with_transient_retry
+            if sdk_available
+            else partial(self._complete_with_transient_retry, single_attempt=self._complete_via_cli)
+        )
+        result = await transport(prompt, config, system_prompt)
+
+        # JSON enforcement layer: if response_format requires JSON,
+        # normalize or retry until we get valid JSON.
+        if requires_json and result.is_ok:
+            result = await self._enforce_json(result, prompt, config, system_prompt, transport)
+
+        return result
+
+    #: Values the `claude` CLI accepts for --permission-mode (its documented
+    #: choices list, verified on 2.1.220). The adapter's own mode vocabulary is
+    #: wider -- it includes "default", which the CLI expresses by omitting the
+    #: flag -- so a mode outside this set is dropped rather than forwarded into
+    #: an argument the CLI would reject.
+    _CLI_PERMISSION_MODES = frozenset(
+        {"acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"}
+    )
+
+    @staticmethod
+    def _build_cli_child_env() -> dict[str, str]:
+        """Isolate the direct CLI child and enforce the shared recursion limit."""
+        return build_child_env(
+            strip_keys=(*DEFAULT_OUROBOROS_STRIP_KEYS, "CLAUDECODE"),
+            depth_error_factory=lambda depth, max_depth: ProviderError(
+                message=(
+                    f"Maximum ouroboros nesting depth ({max_depth}) exceeded "
+                    f"while starting claude CLI (depth={depth})"
+                ),
+                details={"depth": depth, "max_depth": max_depth},
+            ),
+        )
+
+    def _empty_content_error(
+        self,
+        content: str,
+        *,
+        session_id: str | None,
+        stderr_tail: str,
+    ) -> ProviderError | None:
+        """The adapter's contract for an empty body: infrastructure, not an answer.
+
+        A transport that returned ``content=""`` as a success would hand an
+        interview or QA caller a false answer, and would do it past the retry
+        loop -- the loop returns on the first `is_ok`, so nothing downstream gets
+        a second chance. Both transports read this one copy so a body that came
+        back empty means the same thing however it travelled.
+
+        Returns ``None`` when the content is fine, so the caller can treat it as
+        "no objection" rather than having to catch anything.
+        """
+        if content:
+            return None
+        log.warning(
+            "claude_code_adapter.empty_response",
+            content_length=0,
+            session_id=session_id,
+            hint=(
+                "CLI started but produced no content"
+                if session_id
+                else "CLI may still be starting (custom CLI sync, etc.)"
+            ),
+        )
+        message = (
+            "Empty response from CLI - session started but no content produced"
+            if session_id
+            # Phrased to match ``_CLAUDE_CLI_BOOTSTRAP_PATTERNS`` so the retry
+            # loop treats a bootstrap stumble as transient rather than final.
+            else "Empty response from CLI - may need retry (timeout/startup)"
+        )
+        return ProviderError(
+            message=message,
+            details={
+                "session_id": session_id,
+                "content_length": 0,
+                "stderr": stderr_tail,
+                "configured_cli_path": (str(self._cli_path) if self._cli_path else None),
+                "cwd": self._cwd,
+            },
+        )
+
+    def _effective_max_turns(self, config: CompletionConfig) -> int:
+        """The turn budget this request runs under, per-request override first.
+
+        Both transports have to read one copy: semantic evaluation asks for 20
+        turns with tools enabled, so a transport that silently dropped the limit
+        would let an SDK-absent run past the configured turn and cost boundary.
+        """
+        return config.max_turns if config.max_turns is not None else self._max_turns
+
+    @staticmethod
+    def _normalize_model(model: str | None) -> str | None:
+        """Map a configured model id onto one Claude accepts, or ``None``.
+
+        Both transports resolve the same Anthropic model, so they have to agree
+        on this: an operator override like ``anthropic/claude-sonnet-4-5`` is
+        valid config that the SDK strips to a bare id, and forwarding it raw to
+        ``claude --model`` fails the request outright.
+
+        Returns ``None`` when the caller expressed no usable preference, which
+        both transports render as "omit the model and take the default".
+        """
+        # "default" is not a valid model id — treat it as None
+        if not model or model == "default":
+            return None
+        # Strip provider prefixes — both transports reach Anthropic directly
+        if model.startswith("openrouter/anthropic/"):
+            return model[len("openrouter/anthropic/") :]
+        if model.startswith("anthropic/"):
+            return model[len("anthropic/") :]
+        if model.startswith("openrouter/"):
+            # Non-Anthropic model (e.g., openrouter/openai/gpt-4o) — Claude
+            # only supports Claude, so skip it and use the default
+            return None
+        return model
+
+    async def _complete_via_cli(
+        self,
+        prompt: str,
+        config: CompletionConfig,
+        system_prompt: str | None,
+    ) -> Result[CompletionResponse, ProviderError]:
+        """Run one completion through the ``claude`` CLI in print mode.
+
+        The Python SDK is not always installable beside the caller. It requires
+        ``mcp<2.0.0``, and the MCP protocol server requires ``mcp==2.0.0``, so a
+        server process built from the ``[mcp]`` extra has no SDK to import — and
+        a user whose backend is ``claude`` then cannot generate anything at all
+        (Q00/ouroboros#1839).
+
+        The CLI has no such conflict: it is a separate process carrying the same
+        subscription, so it is the transport that survives that boundary. This
+        path is entered only when the SDK is absent, so an environment that has
+        the SDK behaves exactly as before -- streaming, tool use and structured
+        turns are the SDK's, and nothing here changes them.
+
+        What it gives up is the streaming surface: no per-turn callbacks and no
+        incremental message events, because print mode reports once at the end.
+        Multi-turn tool execution itself still happens -- ``--allowedTools`` and
+        ``--max-turns`` are forwarded, which is what the 20-turn read-only
+        envelope in semantic evaluation needs. Single-response callers observe
+        only the final result, which is why this is a usable fallback rather
+        than a replacement for the SDK's event stream.
+
+        The isolation the caller asked for is carried through natively. The
+        interview/PM/QA callers build this adapter with ``allowed_tools=[]`` and
+        ``strict_mcp_config=True`` specifically so the spawned CLI cannot run
+        tools or rediscover ouroboros' own MCP server and recurse; a transport
+        that dropped those would be more dangerous than the failure it replaces.
+        ``--max-turns`` is absent from ``claude --help`` but is a real flag (the
+        CLI rejects genuinely unknown options), so the turn budget is forwarded
+        rather than assumed moot.
+        """
+        import asyncio
+
+        cli_path = self._cli_path
+        if cli_path is None:  # pragma: no cover - guarded by the caller
+            return Result.err(ProviderError(message="claude CLI path is unavailable"))
+
+        argv = [str(cli_path), "-p", "--output-format", "json"]
+        model = self._normalize_model(config.model)
+        if model:
+            argv += ["--model", model]
+        if system_prompt:
+            argv += ["--append-system-prompt", system_prompt]
+        if self._permission_mode in self._CLI_PERMISSION_MODES:
+            argv += ["--permission-mode", self._permission_mode]
+        if self._allowed_tools is not None:
+            # ``--tools`` defines the available catalog; ``--allowedTools`` only
+            # suppresses permission prompts for names that are already available.
+            # Both are required for SDK parity, especially ``--tools ""`` for the
+            # no-tools interview/PM/QA envelope.
+            tool_names = " ".join(self._allowed_tools)
+            argv += ["--tools", tool_names, "--allowedTools", tool_names]
+        argv += ["--max-turns", str(self._effective_max_turns(config))]
+        if self._strict_mcp_config:
+            # ``--strict-mcp-config`` blocks MCP discovery and nothing else, but
+            # the isolation this flag stands for is wider: the SDK path also
+            # empties setting_sources/skills/agents/plugins/hooks so a nested
+            # interview cannot inherit the parent's project instructions. On the
+            # CLI those all arrive through setting sources (``--agents`` and
+            # ``--plugin-dir`` are opt-in and never passed), so declining the
+            # sources closes them at the root rather than one flag at a time.
+            argv += ["--strict-mcp-config", "--setting-sources", ""]
+
+        # Everything caller-controlled is encoded before a child exists. A lone
+        # surrogate arriving through an MCP payload is unencodable, and doing
+        # this after the spawn meant the failure landed on a process already
+        # waiting on a stdin that would never be written. Done here it fails
+        # with nothing to leak.
+        try:
+            stdin_bytes = prompt.encode("utf-8")
+            for arg in argv:
+                arg.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            return Result.err(
+                ProviderError(
+                    message=f"claude CLI request contains text that cannot be encoded: {exc}",
+                    details={"cli_path": str(cli_path), "reason": exc.reason},
+                )
+            )
+
+        timeout = self._timeout or _CLI_DEFAULT_TIMEOUT_SECONDS
+        try:
+            child_env = self._build_cli_child_env()
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self._cwd or None,
+                env=child_env,
+            )
+        except ProviderError as exc:
+            return Result.err(exc)
+        except OSError as exc:
+            return Result.err(
+                ProviderError(
+                    message=f"claude CLI could not be executed: {exc}",
+                    details={"cli_path": str(cli_path)},
+                )
+            )
+
+        # From here the child exists and nothing else holds a handle to it, so
+        # this scope owns it. Reaping is unconditional rather than a list of
+        # exception types to remember: `_terminate_process` no-ops once the
+        # process has exited, so covering every path costs nothing and leaves
+        # no path to forget.
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(stdin_bytes), timeout=timeout)
+        except TimeoutError:
+            await _terminate_process(proc)
+            return Result.err(
+                ProviderError(
+                    message=f"claude CLI timed out after {timeout}s",
+                    details={"timeout_seconds": timeout},
+                )
+            )
+        except BaseException:  # noqa: BLE001 - ownership, re-raised immediately
+            await _terminate_process(proc)
+            raise
+
+        stderr_text = stderr.decode("utf-8", "replace").strip()
+        try:
+            normalized = normalize_claude_cli_output(stdout.decode("utf-8", "replace"))
+        except ClaudeCliOutputError as exc:
+            # A non-JSON body means the CLI failed before it produced a result
+            # envelope -- an auth prompt, a usage limit, a bad flag. The stderr
+            # text is the only diagnosis available, and it is what the user
+            # needs to see.
+            return Result.err(
+                ProviderError(
+                    message=(
+                        f"claude CLI request failed: no valid JSON result (exit {proc.returncode})"
+                    ),
+                    details={
+                        "stderr": stderr_text[:2000],
+                        "returncode": proc.returncode,
+                        "parse_error": str(exc),
+                    },
+                )
+            )
+
+        payload = normalized.raw_payload
+        process_failed = proc.returncode not in (0, None)
+        if process_failed:
+            # The process status is the outer authority.  A stale success
+            # envelope can remain on stdout after the CLI/service fails; using
+            # its result text would hide overload/rate-limit diagnostics and
+            # suppress the shared transient retry loop.
+            process_diagnostic = stderr_text or (normalized.result if normalized.is_error else "")
+            return Result.err(
+                ProviderError(
+                    message=(
+                        process_diagnostic
+                        or f"claude CLI command failed with exit code {proc.returncode}"
+                    ),
+                    details={
+                        "error_type": "ProcessError",
+                        "subtype": normalized.subtype,
+                        "returncode": proc.returncode,
+                        "session_id": normalized.session_id,
+                        "usage": normalized.usage,
+                        "stop_reason": normalized.stop_reason,
+                        "stderr": stderr_text[:2000],
+                        "envelope_is_error": normalized.is_error,
+                    },
+                )
+            )
+        if normalized.is_error:
+            return Result.err(
+                ProviderError(
+                    message=normalized.result or "claude CLI reported an error",
+                    details={
+                        "subtype": normalized.subtype,
+                        "returncode": proc.returncode,
+                        "session_id": normalized.session_id,
+                        "usage": normalized.usage,
+                        "stop_reason": normalized.stop_reason,
+                        "stderr": stderr_text[:2000],
+                    },
+                )
+            )
+
+        session_id = normalized.session_id
+        content = normalized.result
+        empty = self._empty_content_error(
+            content, session_id=session_id, stderr_tail=stderr_text[:2000]
+        )
+        if empty is not None:
+            return Result.err(empty)
+
+        usage = normalized.usage or {}
+        prompt_tokens = int(usage.get("input_tokens") or 0)
+        completion_tokens = int(usage.get("output_tokens") or 0)
+        allocated_tokens = prompt_tokens + completion_tokens
+        authoritative_tokens = int(usage.get("total_tokens") or 0)
+        log.info(
+            "claude_code_adapter.cli_request_completed",
+            content_length=len(content),
+            session_id=session_id,
+            stop_reason=normalized.stop_reason,
+        )
+        return Result.ok(
+            CompletionResponse(
+                content=content,
+                model=config.model,
+                usage=UsageInfo(
+                    # Preserve UsageInfo's additive invariant.  The normalizer
+                    # guarantees that the authoritative total is at least the
+                    # known prompt/completion sum; cache or total-only spend is
+                    # explicit rather than silently split between components.
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=allocated_tokens,
+                    unallocated_tokens=authoritative_tokens - allocated_tokens,
+                ),
+                finish_reason=normalized.stop_reason or "stop",
+                raw_response=payload,
+            )
+        )
+
+    def _normalize_json_content(
+        self, result: Result[CompletionResponse, ProviderError]
+    ) -> Result[CompletionResponse, ProviderError] | None:
+        """Try to extract and normalize JSON from a successful result.
+
+        Returns:
+            Normalized result if JSON found, None if no valid JSON in content.
+        """
+        if result.is_err:
+            return result
+        extracted = extract_json_payload(result.value.content)
+        if extracted:
+            response = result.value
+            normalized_response = replace(
+                response,
+                content=extracted,
+                raw_response=deepcopy(response.raw_response),
+            )
+            return Result.ok(normalized_response)
+        return None
+
+    async def _enforce_json(
+        self,
+        result: Result[CompletionResponse, ProviderError],
+        prompt: str,
+        config: CompletionConfig,
+        system_prompt: str | None,
+        transport: _Transport | None = None,
+    ) -> Result[CompletionResponse, ProviderError]:
+        """Normalize JSON content or retry until valid JSON is obtained.
+
+        If the response contains valid JSON (even wrapped in prose/fences),
+        extract and return just the JSON. If no valid JSON, retry up to
+        _MAX_JSON_RETRIES times. If all retries fail, return an error.
+
+        ``transport`` is the callable that produced ``result``; retries must go
+        back through it rather than assuming the SDK, which may not be
+        importable in this process at all (Q00/ouroboros#1839).
+        """
+        retry = transport or self._complete_with_transient_retry
+        # Try to normalize the initial result
+        normalized = self._normalize_json_content(result)
+        if normalized is not None:
+            return normalized
+
+        log.warning(
+            "claude_code_adapter.json_not_found",
+            max_json_retries=_MAX_JSON_RETRIES,
+            response_preview=result.value.content[:120],
+        )
+
+        for json_attempt in range(1, _MAX_JSON_RETRIES + 1):
+            log.info(
+                "claude_code_adapter.json_retry",
+                attempt=json_attempt,
+                max_json_retries=_MAX_JSON_RETRIES,
+            )
+            result = await retry(prompt, config, system_prompt)
+            if result.is_err:
+                return result
+            normalized = self._normalize_json_content(result)
+            if normalized is not None:
+                return normalized
+
+        # All retries exhausted — return error instead of prose
+        log.error(
+            "claude_code_adapter.json_retries_exhausted",
+            max_json_retries=_MAX_JSON_RETRIES,
+            response_preview=result.value.content[:120] if result.is_ok else "N/A",
+        )
+        return Result.err(
+            ProviderError(
+                message=(
+                    f"JSON format required but LLM returned prose after {_MAX_JSON_RETRIES} retries"
+                ),
+                details={
+                    "last_response_preview": (
+                        result.value.content[:200] if result.is_ok else "N/A"
+                    ),
+                },
+            )
+        )
+
+    async def _complete_with_transient_retry(
+        self,
+        prompt: str,
+        config: CompletionConfig,
+        system_prompt: str | None,
+        single_attempt: _Transport | None = None,
+    ) -> Result[CompletionResponse, ProviderError]:
+        """Inner retry loop for transient API errors (rate limits, timeouts, etc.).
+
+        This handles infrastructure-level failures only. JSON format
+        enforcement is handled by the caller.
+
+        ``single_attempt`` is the one-shot transport to retry around, defaulting
+        to the SDK request. Rate limits, overloads and CLI bootstrap stumbles are
+        properties of the service, not of how we reached it, so the fallback
+        transport is retried on the same terms rather than failing permanently
+        the first time one of them appears.
+        """
+        run_once = single_attempt or self._execute_single_request_positional
+        # Name the transport that actually failed. Reporting an SDK failure from
+        # a process that has no SDK sends the reader to the wrong diagnosis --
+        # and that misdirection is the exact shape of the bug this PR fixes.
+        transport_name = "Claude Agent SDK" if single_attempt is None else "claude CLI"
+        last_error: ProviderError | None = None
+        effective_system_prompt = system_prompt
+        phantom_recovery_used = False
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                if self._timeout is None:
+                    result = await run_once(prompt, config, effective_system_prompt)
+                else:
+                    async with asyncio.timeout(self._timeout):
+                        result = await run_once(prompt, config, effective_system_prompt)
+
+                if result.is_ok:
+                    if attempt > 0:
+                        log.info(
+                            "claude_code_adapter.retry_succeeded",
+                            attempts=attempt + 1,
+                        )
+                    return result
+
+                # Phantom tool call under the sealed no-tools envelope: the
+                # catalog is empty so nothing executed — grant exactly one
+                # recovery attempt with a hard plain-text instruction before
+                # failing loud (#1537/#1530).
+                if (
+                    not phantom_recovery_used
+                    and attempt < _MAX_RETRIES - 1
+                    and self._is_phantom_tool_use_error(result.error)
+                ):
+                    phantom_recovery_used = True
+                    effective_system_prompt = (
+                        f"{system_prompt}\n\n{_NO_TOOLS_RECOVERY_CUE}"
+                        if system_prompt
+                        else _NO_TOOLS_RECOVERY_CUE
+                    )
+                    log.warning(
+                        "claude_code_adapter.phantom_tool_use_recovery",
+                        error_type=result.error.details.get("error_type"),
+                        subtype=result.error.details.get("subtype"),
+                        attempt=attempt + 1,
+                    )
+                    last_error = result.error
+                    continue
+
+                # Check if error is retryable
+                error_msg = result.error.message
+                if self._is_retryable_provider_error(result.error) and attempt < _MAX_RETRIES - 1:
+                    backoff = _INITIAL_BACKOFF_SECONDS * (2**attempt)
+                    log.warning(
+                        "claude_code_adapter.retryable_error",
+                        error=error_msg,
+                        error_type=result.error.details.get("error_type"),
+                        attempt=attempt + 1,
+                        max_retries=_MAX_RETRIES,
+                        backoff_seconds=backoff,
+                    )
+                    last_error = result.error
+                    await asyncio.sleep(backoff)
+                    continue
+
+                # Non-retryable error
+                return result
+
+            except TimeoutError:
+                log.warning(
+                    "claude_code_adapter.request_timed_out",
+                    timeout_seconds=self._timeout,
+                    attempt=attempt + 1,
+                )
+                return Result.err(
+                    ProviderError(
+                        message=f"Claude Code request timed out after {self._timeout:.1f}s",
+                        details={
+                            "timed_out": True,
+                            "timeout_seconds": self._timeout,
+                            "attempt": attempt + 1,
+                        },
+                    )
+                )
+            except Exception as e:
+                error_str = str(e)
+                error_type = type(e).__name__
+
+                # Handle unknown message types from SDK (e.g., rate_limit_event)
+                # These are transient SDK issues that should be retried
+                is_unknown_message = (
+                    "Unknown message type" in error_str or error_type == "MessageParseError"
+                )
+
+                if (
+                    self._is_retryable_error(error_str) or is_unknown_message
+                ) and attempt < _MAX_RETRIES - 1:
+                    backoff = _INITIAL_BACKOFF_SECONDS * (2**attempt)
+                    log.warning(
+                        "claude_code_adapter.retryable_exception",
+                        error=error_str,
+                        error_type=error_type,
+                        attempt=attempt + 1,
+                        max_retries=_MAX_RETRIES,
+                        backoff_seconds=backoff,
+                    )
+                    last_error = ProviderError(
+                        message=f"{transport_name} request failed: {e}",
+                        details={"error_type": error_type, "attempt": attempt + 1},
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+
+                log.exception(
+                    "claude_code_adapter.request_failed",
+                    error=error_str,
+                    error_type=error_type,
+                )
+                return Result.err(
+                    ProviderError(
+                        message=f"{transport_name} request failed: {e}",
+                        details={"error_type": error_type},
+                    )
+                )
+
+        # All retries exhausted
+        log.error(
+            "claude_code_adapter.max_retries_exceeded",
+            max_retries=_MAX_RETRIES,
+        )
+        return Result.err(last_error or ProviderError(message="Max retries exceeded"))
+
+    async def _execute_single_request_positional(
+        self,
+        prompt: str,
+        config: CompletionConfig,
+        system_prompt: str | None,
+    ) -> Result[CompletionResponse, ProviderError]:
+        """``_execute_single_request`` shaped like every other one-shot transport.
+
+        Exists only so the retry loop can hold either transport in one variable.
+        """
+        return await self._execute_single_request(prompt, config, system_prompt=system_prompt)
+
+    async def _execute_single_request(
+        self,
+        prompt: str,
+        config: CompletionConfig,
+        *,
+        system_prompt: str | None = None,
+    ) -> Result[CompletionResponse, ProviderError]:
+        """Execute a single SDK request without retry logic.
+
+        Separated to avoid break statements in async generator loops,
+        which can cause anyio cancel scope issues.
+
+        Args:
+            prompt: The formatted prompt string.
+            config: Configuration for the completion request.
+            system_prompt: Optional system prompt to pass as an authoritative
+                system instruction (not embedded in the user prompt).
+
+        Returns:
+            Result containing either the completion response or a ProviderError.
+        """
+        from claude_agent_sdk import ClaudeAgentOptions, query
+
+        # Build options based on configured tool permissions
+        # Type ignore needed because SDK uses Literal type but we store as str
+        #
+        # Strategy: Block dangerous tools explicitly, allow everything else
+        # This enables MCP tools (mcp__*) and read-only built-in tools
+        dangerous_tools = ["Write", "Edit", "Bash", "Task", "NotebookEdit"]
+
+        # If allowed_tools is explicitly set (even empty []), compute disallowed
+        # from it (strict mode). None = permissive (only block dangerous).
+        #
+        # NOTE — this static enumerate is a defense-in-depth layer that pairs
+        # with the ``extra_args["allowedTools"] = ""`` override below.  It
+        # does NOT, on its own, give a tight envelope: every name the CLI
+        # exposes but ouroboros does not list here would slip through as
+        # "not in allowed, not in disallowed" → CLI default-allowed.  The
+        # real closure lives in the ``extra_args`` override; this list is
+        # kept so a stale SDK that ignores the extra_args path still has
+        # the dangerous built-ins blocked.  See follow-up to
+        # https://github.com/Q00/ouroboros/issues/869.
+        if self._allowed_tools is not None:
+            all_tools = [
+                # Built-ins enumerated in claude-agent-sdk (subprocess_cli.py)
+                # and observed in Claude Code 2.x deferred-tool catalogs.
+                "Read",
+                "Write",
+                "Edit",
+                "Bash",
+                "WebFetch",
+                "WebSearch",
+                "Glob",
+                "Grep",
+                "Task",
+                "NotebookEdit",
+                "TodoRead",
+                "TodoWrite",
+                "LS",
+                # The names below were missing from the original enumerate
+                # and made up the leak surface that consumed ``max_turns=1``
+                # in the nested interview envelope.  ``Skill`` is referenced
+                # by name inside the SDK itself (subprocess_cli.py
+                # ``_apply_skills_defaults``).  The rest are documented
+                # built-ins surfaced by the Claude Code CLI.
+                "Skill",
+                "AskUserQuestion",
+                "ExitPlanMode",
+                "EnterPlanMode",
+                "BashOutput",
+                "KillShell",
+                "SlashCommand",
+                "ToolSearch",
+            ]
+            disallowed = [t for t in all_tools if t not in self._allowed_tools]
+        else:
+            disallowed = dangerous_tools
+
+        # The bundled CLI refuses to start when CLAUDECODE is set (nested
+        # session check).  The Agent SDK sets CLAUDE_CODE_ENTRYPOINT=sdk-py
+        # to signal it's an SDK call, but the older check on CLAUDECODE fires
+        # first, causing silent empty responses.  Strip it via env override.
+        claudecode_present = bool(os.environ.get("CLAUDECODE"))
+        env_overrides: dict[str, str] = {
+            # Skip the per-call `claude -v` subprocess that the Agent SDK runs
+            # to verify version compatibility.  This is advisory-only — version
+            # mismatches surface naturally as API errors — and saves ~0.3-0.8 s
+            # latency on every LLM call.
+            # Honour OUROBOROS_SKIP_VERSION_CHECK if the user/operator sets it
+            # (e.g. "0" to re-enable the check for debugging).
+            "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK": os.environ.get(
+                "OUROBOROS_SKIP_VERSION_CHECK", "1"
+            ),
+        }
+        if claudecode_present:
+            env_overrides["CLAUDECODE"] = ""
+
+        stderr_lines: list[str] = []
+
+        def _stderr_callback(line: str) -> None:
+            stderr_lines.append(line[:500])
+            log.debug("claude_code_adapter.stderr", line=line[:200])
+
+        options_kwargs: dict = {
+            "disallowed_tools": disallowed,
+            "max_turns": self._effective_max_turns(config),
+            # Allow MCP and other ~/.claude/ settings to be inherited
+            "permission_mode": self._permission_mode,
+            "cwd": self._cwd,
+            "cli_path": self._cli_path,
+            "stderr": _stderr_callback,
+            "env": env_overrides,
+        }
+        if self._allowed_tools is not None:
+            # The SDK distinguishes the visible tool catalog (tools) from
+            # permission filtering (allowed_tools). Passing both keeps explicit
+            # envelopes, such as the interview read-only tool set, from exposing
+            # default built-ins like AskUserQuestion/ToolSearch.
+            options_kwargs["allowed_tools"] = list(self._allowed_tools)
+            options_kwargs["tools"] = list(self._allowed_tools)
+
+            # ---------------------------------------------------------------
+            # KNOWN STRUCTURAL DEBT — read before editing.
+            #
+            # ``claude-agent-sdk`` collapses ``allowed_tools=[]`` to a falsy
+            # check before forwarding it as a CLI flag (subprocess_cli.py
+            # ``if effective_allowed_tools: cmd.extend(["--allowedTools", ...])``).
+            # An empty list therefore *omits* ``--allowedTools`` entirely
+            # instead of forwarding ``--allowedTools ""``, which causes the
+            # spawned CLI to fall back to its default allow-list (every
+            # built-in tool).  Combined with the static disallowed_tools
+            # enumerate above — which inevitably rots as the CLI grows new
+            # built-ins (``Skill``, ``AskUserQuestion``, ``ExitPlanMode``,
+            # MCP tools, …) — even a strict envelope leaks tool descriptors
+            # into the sub-CLI's system prompt and tempts the model into a
+            # ``ToolUseBlock`` on its only ``max_turns=1`` turn.  That was
+            # the residual leak left over after #869 closed the
+            # skills/agents/plugins/hooks/setting_sources paths.
+            #
+            # The closure below is intentionally a *workaround*, not a fix.
+            # It depends on the SDK's ``extra_args`` passthrough surface
+            # (verified present at every supported pin) to send the literal
+            # ``--allowedTools ""`` flag the SDK refuses to emit on our
+            # behalf, regardless of how its own falsy short-circuit
+            # evolves.  An ``[]`` envelope at this layer means "no tools,
+            # period"; we honor that contract here instead of relying on
+            # SDK semantics that have already proven brittle.
+            #
+            # The fragility of this code is structural, not local: ouroboros
+            # routes a *pure question-generation* workload through an
+            # *agentic CLI subprocess* and then turns every agent surface
+            # off one by one.  That mismatch is the underlying cause; this
+            # override is the cheapest patch that keeps it from biting
+            # production while the CLI/SDK pin is in motion.  If a future
+            # SDK release honors ``allowed_tools=[]`` natively, drop this
+            # override and the static enumerate above can shrink back to
+            # the dangerous-only safety net.
+            #
+            # Follow-up to: https://github.com/Q00/ouroboros/issues/869
+            # ---------------------------------------------------------------
+            if not self._allowed_tools:
+                extra_args = dict(options_kwargs.get("extra_args") or {})
+                extra_args.setdefault("allowedTools", "")
+                options_kwargs["extra_args"] = extra_args
+
+        if self._strict_mcp_config:
+            # Opt-in MCP isolation: prevents the spawned subprocess from
+            # discovering plugin-provided servers (notably ouroboros itself,
+            # which would recurse on ouroboros_interview when invoked from
+            # inside Claude Code's MCP context).  Scoped to callers that
+            # explicitly request the policy — generic explicit envelopes
+            # keep MCP-tool access intact.
+            #
+            # ``ClaudeAgentOptions`` does not expose ``strict_mcp_config``
+            # as a typed field on published ``claude-agent-sdk`` releases;
+            # current releases accept the flag only via ``extra_args``
+            # (CLI passthrough).
+            #
+            # Compatibility invariant (verified against the published
+            # PyPI history): ``extra_args`` has been a field on
+            # ``ClaudeAgentOptions`` since the earliest published release
+            # (``claude-agent-sdk==0.0.23``) and is present on the pinned
+            # release, so the ``extra_args`` branch below is the path
+            # actually taken on any pip-installed SDK.  The fail-fast branch
+            # is defense-in-depth against vendored, partial, or
+            # monkey-patched SDK builds where the field has been removed:
+            # we MUST honor the caller's isolation request rather than
+            # silently re-open the recursion path.  ``test_factory.py``
+            # and ``test_claude_code_adapter.py`` lock the live-SDK
+            # invariant so any future pin bump that drops ``extra_args``
+            # fails CI before reaching production.
+            field_names = _claude_options_field_names()
+            if "strict_mcp_config" in field_names:
+                options_kwargs["strict_mcp_config"] = True
+            elif "extra_args" in field_names:
+                extra_args = dict(options_kwargs.get("extra_args") or {})
+                extra_args.setdefault("strict-mcp-config", None)
+                options_kwargs["extra_args"] = extra_args
+            else:
+                msg = (
+                    "Nested-MCP isolation was requested but the installed "
+                    "claude-agent-sdk exposes neither ``strict_mcp_config`` "
+                    "nor ``extra_args``. Upgrade claude-agent-sdk to a "
+                    "release that supports CLI-flag passthrough (any "
+                    "version with the ``extra_args`` field on "
+                    "``ClaudeAgentOptions``) so ``--strict-mcp-config`` "
+                    "can be applied."
+                )
+                log.error(
+                    "claude_code_adapter.strict_mcp_config_unsupported",
+                    hint=msg,
+                )
+                raise ProviderError(
+                    message=msg,
+                    details={
+                        "error_type": "ConfigurationError",
+                        "supported_options_fields": sorted(field_names),
+                        "required_options_field": "extra_args or strict_mcp_config",
+                    },
+                )
+
+            # Pure-interviewer envelope: close every parent-context leak path
+            # the SDK exposes.  ``strict_mcp_config`` only blocks MCP-server
+            # discovery; skills / sub-agents / plugins / settings / hooks
+            # still inherit from the parent Claude Code session, so the
+            # spawned sub-CLI's system prompt grows tool descriptors that
+            # tempt the model into emitting a ``ToolUseBlock`` on the only
+            # allowed turn.  When ``max_turns=1`` that consumes the budget
+            # before any text streams and the CLI emits a ``{"type":
+            # "error"}`` control message which the SDK re-raises as a bare
+            # ``Exception`` before any ``ResultMessage`` reaches the
+            # adapter (see ``claude_agent_sdk/_internal/query.py``).  Each
+            # override is gated by SDK field presence so older releases
+            # that have not yet introduced the field stay no-op.  See
+            # https://github.com/Q00/ouroboros/issues/869.
+            _ISOLATION_OVERRIDES: tuple[tuple[str, object], ...] = (
+                ("setting_sources", []),
+                ("skills", []),
+                ("agents", {}),
+                ("plugins", []),
+                ("hooks", {}),
+                ("include_hook_events", False),
+            )
+            applied_isolation: list[str] = []
+            for option_name, isolated_value in _ISOLATION_OVERRIDES:
+                if option_name in field_names:
+                    options_kwargs[option_name] = isolated_value
+                    applied_isolation.append(option_name)
+            log.debug(
+                "claude_code_adapter.strict_mcp_isolation_applied",
+                applied=applied_isolation,
+                skipped=sorted(name for name, _ in _ISOLATION_OVERRIDES if name not in field_names),
+            )
+
+        # Pass model from CompletionConfig if specified
+        model = self._normalize_model(config.model)
+        if model:
+            options_kwargs["model"] = model
+
+        # Pass system prompt as authoritative instruction (matches adapter.py:281-282 pattern)
+        if system_prompt:
+            options_kwargs["system_prompt"] = system_prompt
+
+        # Do not pass output_format here. The Claude CLI path used by the Agent
+        # SDK currently ignores json_schema structured output constraints and may
+        # return plain text, so we enforce schema compliance via prompt text in
+        # complete() and parse the JSON from the response body.
+
+        options = ClaudeAgentOptions(**options_kwargs)
+
+        log.debug(
+            "claude_code_adapter.sdk_request_configured",
+            max_turns=options_kwargs["max_turns"],
+            model=options_kwargs.get("model"),
+            cwd=str(self._cwd) if self._cwd else None,
+            cli_path=str(self._cli_path) if self._cli_path else None,
+            permission_mode=self._permission_mode,
+            allowed_tools=self._allowed_tools,
+            disallowed_tools=disallowed,
+            claudecode_present=claudecode_present,
+            claude_code_entrypoint=os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
+            env_override_keys=sorted(env_overrides.keys()),
+        )
+
+        # Collect the response - let the generator run to completion
+        content = ""
+        session_id = None
+        error_result: ProviderError | None = None
+        finish_reason = "stop"
+        raw_response: dict[str, object] = {"session_id": None}
+
+        def _has_malformed_tool_use_error() -> bool:
+            return (
+                error_result is not None
+                and error_result.details.get("error_type") == "MalformedToolUseTurn"
+            )
+
+        # Wrap query() to skip unknown message types (e.g., rate_limit_event)
+        # that the SDK doesn't recognize yet. Without this, a single
+        # MessageParseError inside the generator kills the entire request.
+        async def _safe_query():
+            from claude_agent_sdk._errors import MessageParseError as _MPE
+
+            gen = query(prompt=prompt, options=options).__aiter__()
+            while True:
+                try:
+                    yield await gen.__anext__()
+                except _MPE as parse_err:
+                    log.debug("claude_code_adapter.skipping_unknown_message", error=str(parse_err))
+                    continue
+                except StopAsyncIteration:
+                    break
+
+        try:
+            async for sdk_message in _safe_query():
+                class_name = type(sdk_message).__name__
+
+                if class_name == "SystemMessage":
+                    # Capture session ID from init
+                    msg_data = getattr(sdk_message, "data", {})
+                    session_id = msg_data.get("session_id")
+
+                elif class_name == "AssistantMessage":
+                    diagnostic = diagnose_tool_use_turn(sdk_message, provider="claude_code")
+                    if diagnostic.is_malformed:
+                        error_result = ProviderError(
+                            message=diagnostic.reason,
+                            details={
+                                **diagnostic.to_dict(),
+                                "session_id": session_id,
+                                "error_type": "MalformedToolUseTurn",
+                                "max_turns": options_kwargs["max_turns"],
+                                "cwd": self._cwd,
+                            },
+                        )
+                        log.warning(
+                            "claude_code_adapter.malformed_tool_use_turn",
+                            session_id=session_id,
+                            retryable=diagnostic.retryable,
+                            stop_reason=diagnostic.stop_reason,
+                            tool_use_count=diagnostic.tool_use_count,
+                        )
+                        continue
+                    # Extract text content and tool use
+                    content_blocks = getattr(sdk_message, "content", [])
+                    for block in content_blocks:
+                        block_type = type(block).__name__
+                        if block_type == "TextBlock":
+                            text = getattr(block, "text", "")
+                            content += text
+                            if text and _has_malformed_tool_use_error():
+                                error_result = None
+                            # Callback for thinking/reasoning
+                            if self._on_message and text.strip():
+                                self._on_message("thinking", text.strip())
+                        elif block_type == "ToolUseBlock":
+                            tool_name = getattr(block, "name", "unknown")
+                            tool_input = getattr(block, "input", {})
+                            # Format tool info with key details
+                            tool_info = self._format_tool_info(tool_name, tool_input)
+                            # Callback for tool usage
+                            if self._on_message:
+                                self._on_message("tool", tool_info)
+                            if self._allowed_tools is not None and not self._allowed_tools:
+                                error_result = ProviderError(
+                                    message=(
+                                        "Claude Agent SDK emitted a ToolUseBlock despite "
+                                        "allowed_tools=[]"
+                                    ),
+                                    details={
+                                        "session_id": session_id,
+                                        "error_type": "ToolUseBlockViolation",
+                                        "tool_name": tool_name,
+                                        "tool_input": tool_input,
+                                        "allowed_tools": [],
+                                        "max_turns": options_kwargs["max_turns"],
+                                        "cwd": self._cwd,
+                                    },
+                                )
+
+                elif class_name == "ResultMessage":
+                    # Check for structured output first (from json_schema output_format)
+                    structured = getattr(sdk_message, "structured_output", None)
+                    if structured is not None:
+                        content = (
+                            json.dumps(structured)
+                            if not isinstance(structured, str)
+                            else structured
+                        )
+
+                    # Final result - use result content if we don't have content yet
+                    elif not content:
+                        content = getattr(sdk_message, "result", "") or ""
+
+                    # Check for errors - don't break, just record.
+                    is_error = getattr(sdk_message, "is_error", False)
+                    if not is_error and _has_malformed_tool_use_error():
+                        error_result = None
+                    if is_error:
+                        subtype = getattr(sdk_message, "subtype", None)
+                        stop_reason = getattr(sdk_message, "stop_reason", None)
+                        errors = getattr(sdk_message, "errors", None)
+                        raw_api_error_status = getattr(sdk_message, "api_error_status", None)
+                        api_error_status = (
+                            raw_api_error_status
+                            if isinstance(raw_api_error_status, int)
+                            and not isinstance(raw_api_error_status, bool)
+                            else None
+                        )
+                        if subtype == "error_max_turns" and self._is_usable_max_turns_partial(
+                            content,
+                            stop_reason=stop_reason,
+                        ):
+                            # Claude Code can emit a useful AssistantMessage and then
+                            # finish with ResultMessage(error_max_turns) after trying
+                            # to continue with tools. Surface the already-streamed
+                            # text as a truncated partial result instead of crashing
+                            # the interview loop or pretending completion was clean.
+                            finish_reason = "length"
+                            raw_response.update(
+                                {
+                                    "subtype": subtype,
+                                    "stop_reason": stop_reason,
+                                    "errors": errors,
+                                    "partial_result": True,
+                                }
+                            )
+                            log.warning(
+                                "claude_code_adapter.max_turns_partial_result",
+                                session_id=session_id,
+                                content_length=len(content),
+                                max_turns=self._max_turns,
+                                stop_reason=stop_reason,
+                            )
+                            if _has_malformed_tool_use_error():
+                                error_result = None
+                            continue
+
+                        error_items = errors if isinstance(errors, list) else []
+                        joined_errors = "; ".join(
+                            str(item).strip() for item in error_items if str(item).strip()
+                        )
+                        result_text = str(getattr(sdk_message, "result", "") or "").strip()
+                        error_msg = result_text or joined_errors
+                        if not error_msg:
+                            error_msg = (
+                                f"Claude Code API request failed with HTTP {api_error_status}"
+                                if api_error_status is not None
+                                else "Unknown error from Claude Agent SDK"
+                            )
+                        partial_content = content.strip() if subtype == "error_max_turns" else ""
+                        if subtype == "error_max_turns" and partial_content:
+                            error_msg = (
+                                "Claude Agent SDK reached max turns before producing "
+                                "a usable final response"
+                            )
+                        log.warning(
+                            "claude_code_adapter.sdk_error",
+                            error=error_msg,
+                            session_id=session_id,
+                            stderr_lines=len(stderr_lines),
+                            subtype=subtype,
+                            partial_rejected=bool(partial_content),
+                        )
+                        if _has_malformed_tool_use_error() and subtype == "error_max_turns":
+                            continue
+                        error_result = ProviderError(
+                            message=error_msg,
+                            provider="claude_code",
+                            status_code=api_error_status,
+                            details={
+                                "error_type": "ClaudeResultError",
+                                "session_id": session_id,
+                                "stderr": "\n".join(stderr_lines[-20:]) if stderr_lines else "",
+                                "claudecode_present": claudecode_present,
+                                "claude_code_entrypoint": os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
+                                "subtype": subtype,
+                                "stop_reason": stop_reason,
+                                "errors": errors,
+                                "api_error_status": api_error_status,
+                                "partial_content": partial_content or None,
+                                "partial_rejected": bool(partial_content),
+                                "configured_cli_path": (
+                                    str(self._cli_path) if self._cli_path else None
+                                ),
+                                "cwd": self._cwd,
+                            },
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if error_result is not None and str(exc).startswith(
+                "Claude Code returned an error result:"
+            ):
+                log.warning(
+                    "claude_code_adapter.structured_error_preserved",
+                    error=error_result.message,
+                    error_type=error_result.details.get("error_type"),
+                    subtype=error_result.details.get("subtype"),
+                    api_error_status=error_result.status_code,
+                    trailing_error_type=type(exc).__name__,
+                )
+                return Result.err(error_result)
+
+            stderr_tail = "\n".join(stderr_lines[-20:]) if stderr_lines else ""
+            traceback_text = traceback.format_exc()
+            error_message = f"Claude Agent SDK request failed: {exc}"
+            if stderr_tail and "Check stderr output for details" in str(exc):
+                error_message = f"{error_message}\nstderr tail:\n{stderr_tail}"
+            log.exception(
+                "claude_code_adapter.sdk_request_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+                session_id=session_id,
+                stderr_lines=len(stderr_lines),
+                claudecode_present=claudecode_present,
+                claude_code_entrypoint=os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
+            )
+            return Result.err(
+                ProviderError(
+                    message=error_message,
+                    provider="claude_code",
+                    details={
+                        "error_type": type(exc).__name__,
+                        "session_id": session_id,
+                        "stderr": stderr_tail,
+                        "traceback": traceback_text,
+                        "claudecode_present": claudecode_present,
+                        "claude_code_entrypoint": os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
+                        "configured_cli_path": str(self._cli_path) if self._cli_path else None,
+                        "cwd": self._cwd,
+                        "env_override_keys": sorted(env_overrides.keys()),
+                    },
+                )
+            )
+
+        # After generator completes naturally, check for errors
+        if (
+            error_result is not None
+            and error_result.details.get("error_type") == "ToolUseBlockViolation"
+            and content.strip()
+        ):
+            # Sealed no-tools envelope: the visible catalog is emptied via
+            # ``tools=[]`` (forwarded as ``--tools ""``), so the emitted tool
+            # call never executed — it is model noise, not an envelope leak.
+            # When a usable final text still streamed, surface it instead of
+            # discarding a good response; the incident stays observable via
+            # the structured warning and ``raw_response`` marker (#1537).
+            log.warning(
+                "claude_code_adapter.phantom_tool_use_salvaged",
+                session_id=session_id,
+                tool_name=error_result.details.get("tool_name"),
+                content_length=len(content),
+            )
+            raw_response.update(
+                {
+                    "phantom_tool_use": True,
+                    "phantom_tool_name": error_result.details.get("tool_name"),
+                }
+            )
+            error_result = None
+
+        if error_result:
+            return Result.err(error_result)
+
+        # Check for empty response — always an error regardless of session_id
+        empty = self._empty_content_error(
+            content,
+            session_id=session_id,
+            # Include captured stderr for diagnostics — helps identify
+            # why the CLI produced no output (rate limits, auth, etc.)
+            stderr_tail="\n".join(stderr_lines[-20:]) if stderr_lines else "",
+        )
+        if empty is not None:
+            return Result.err(empty)
+
+        log.info(
+            "claude_code_adapter.request_completed",
+            content_length=len(content),
+            session_id=session_id,
+            finish_reason=finish_reason,
+        )
+
+        # Build response
+        raw_response["session_id"] = session_id
+        response = CompletionResponse(
+            content=content,
+            model=config.model,
+            usage=UsageInfo(
+                prompt_tokens=0,  # SDK doesn't expose token counts
+                completion_tokens=0,
+                total_tokens=0,
+            ),
+            finish_reason=finish_reason,
+            raw_response=raw_response,
+        )
+
+        return Result.ok(response)
+
+    @staticmethod
+    def _is_usable_max_turns_partial(content: str, *, stop_reason: object) -> bool:
+        """Return whether max-turn partial text is safe to surface as a completion.
+
+        Claude Code may stream natural-language preambles before attempting a tool
+        call and then finish with ``error_max_turns``. Those preambles are not a
+        final answer, and this provider layer cannot reliably distinguish them by
+        inspecting text shape. Keep tool-use-stopped max-turns on the error path
+        and only surface non-tool-use partials as length-limited completions.
+        """
+        text = content.strip()
+        if not text:
+            return False
+        return stop_reason != "tool_use"
+
+    def _format_tool_info(self, tool_name: str, tool_input: dict) -> str:
+        """Format tool name and input for display.
+
+        Args:
+            tool_name: Name of the tool being used.
+            tool_input: Input parameters for the tool.
+
+        Returns:
+            Formatted string like "Read: /path/to/file" or "Glob: **/*.py"
+        """
+        # Extract key info based on tool type
+        detail = ""
+        if tool_name == "Read":
+            detail = tool_input.get("file_path", "")
+        elif tool_name == "Glob" or tool_name == "Grep":
+            detail = tool_input.get("pattern", "")
+        elif tool_name == "WebFetch":
+            detail = tool_input.get("url", "")
+        elif tool_name == "WebSearch":
+            detail = tool_input.get("query", "")
+        elif tool_name.startswith("mcp__"):
+            # MCP tools - show first non-empty input value
+            for v in tool_input.values():
+                if v:
+                    detail = str(v)[:50]
+                    break
+
+        if detail:
+            # Truncate long details
+            if len(detail) > 60:
+                detail = detail[:57] + "..."
+            return f"{tool_name}: {detail}"
+        return tool_name
+
+    def _build_prompt(self, messages: list[Message]) -> str:
+        """Build a single prompt string from messages.
+
+        The Claude Agent SDK expects a single prompt string, so we combine
+        the conversation history into a formatted prompt.
+
+        Args:
+            messages: List of conversation messages.
+
+        Returns:
+            Formatted prompt string.
+        """
+        parts: list[str] = []
+
+        for msg in messages:
+            if msg.role == MessageRole.SYSTEM:
+                # System messages should be extracted before _build_prompt() is called
+                # and passed via system_prompt parameter. Log a warning if one leaks through.
+                log.warning(
+                    "claude_code_adapter.system_message_in_build_prompt",
+                    hint="System messages should be extracted before calling _build_prompt()",
+                )
+                parts.append(f"<system>\n{msg.content}\n</system>\n")
+            elif msg.role == MessageRole.USER:
+                parts.append(f"User: {msg.content}\n")
+            elif msg.role == MessageRole.ASSISTANT:
+                parts.append(f"Assistant: {msg.content}\n")
+
+        # Add instruction to respond
+        parts.append("\nPlease respond to the above conversation.")
+
+        return "\n".join(parts)
+
+
+__all__ = ["ClaudeCodeAdapter"]

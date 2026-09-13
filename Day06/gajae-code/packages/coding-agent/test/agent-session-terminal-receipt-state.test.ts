@@ -1,0 +1,163 @@
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as path from "node:path";
+import { Agent } from "@gajae-code/agent-core";
+import { getBundledModel } from "@gajae-code/ai";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import * as sidecar from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
+import {
+	GJC_COORDINATOR_SESSION_ID_ENV,
+	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+} from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
+import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { logger, TempDir } from "@gajae-code/utils";
+
+const originalStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+const originalSessionId = process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+let session: AgentSession | undefined;
+let authStorage: AuthStorage | undefined;
+let tempDir: TempDir | undefined;
+
+afterEach(async () => {
+	vi.restoreAllMocks();
+	await session?.dispose();
+	session = undefined;
+	authStorage?.close();
+	authStorage = undefined;
+	tempDir?.removeSync();
+	tempDir = undefined;
+	if (originalStateFile === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+	else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = originalStateFile;
+	if (originalSessionId === undefined) delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+	else process.env[GJC_COORDINATOR_SESSION_ID_ENV] = originalSessionId;
+});
+
+async function runResponse(content: string) {
+	tempDir = TempDir.createSync("@gjc-terminal-receipt-");
+	const stateFile = path.join(tempDir.path(), "runtime-state.json");
+	process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+	process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "terminal-receipt-session";
+	authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+	authStorage.setRuntimeApiKey("anthropic", "test-key");
+	const modelRegistry = new ModelRegistry(authStorage);
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("Expected bundled model");
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+		streamFn: createMockModel({ responses: [{ content: [content] }] }).stream,
+	});
+	session = new AgentSession({
+		agent,
+		sessionManager: SessionManager.inMemory(),
+		settings: Settings.isolated({ "compaction.enabled": false }),
+		modelRegistry,
+	});
+	const terminal = Promise.withResolvers<void>();
+	session.subscribe(event => {
+		if (event.type === "agent_end") terminal.resolve();
+	});
+	await session.prompt("respond");
+	await terminal.promise;
+	for (let attempt = 0; attempt < 100; attempt++) {
+		if (await Bun.file(stateFile).exists()) {
+			const payload = JSON.parse(await Bun.file(stateFile).text()) as Record<string, unknown>;
+			if (payload.state === "completed" || payload.state === "errored") return payload;
+		}
+		await Bun.sleep(10);
+	}
+	throw new Error("Timed out waiting for terminal runtime state");
+}
+
+describe("AgentSession terminal receipt state", () => {
+	it("publishes agent_end when terminal sidecar persistence fails", async () => {
+		tempDir = TempDir.createSync("@gjc-terminal-persistence-failure-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model");
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: createMockModel({ responses: [{ content: ["done"] }] }).stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+		const terminal = Promise.withResolvers<void>();
+		const persist = vi
+			.spyOn(sidecar, "persistCoordinatorRuntimeStateFromEvent")
+			.mockRejectedValue(new Error("simulated persistence failure"));
+		const persistWarnings: Array<Record<string, unknown> | undefined> = [];
+		vi.spyOn(logger, "warn").mockImplementation((message, context) => {
+			if (message === "Failed to persist coordinator runtime state") persistWarnings.push(context);
+		});
+
+		session.subscribe(event => {
+			if (event.type === "agent_end") terminal.resolve();
+		});
+
+		await session.prompt("respond");
+		await terminal.promise;
+		expect(persist).toHaveBeenCalled();
+		expect(persistWarnings).toHaveLength(1);
+		expect(persistWarnings[0]).toMatchObject({ error: "Error: simulated persistence failure" });
+	});
+
+	it("publishes agent_end while terminal sidecar persistence remains pending", async () => {
+		tempDir = TempDir.createSync("@gjc-terminal-persistence-pending-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model");
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: createMockModel({ responses: [{ content: ["done"] }] }).stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+		const pending = Promise.withResolvers<void>();
+		vi.spyOn(sidecar, "persistCoordinatorRuntimeStateFromEvent").mockReturnValue(pending.promise);
+		const terminal = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "agent_end") terminal.resolve();
+		});
+
+		await session.prompt("respond");
+		await Promise.race([terminal.promise, Bun.sleep(250).then(() => "timed_out" as const)]).then(result => {
+			expect(result).not.toBe("timed_out");
+		});
+		pending.resolve();
+	});
+
+	it("writes present receipt truth through the real AgentSession event consumer", async () => {
+		expect(await runResponse("done")).toMatchObject({
+			state: "completed",
+			execution_state: "terminal_ok",
+			receipt_state: "present",
+			final_response: { text: "done" },
+		});
+	});
+
+	it("writes receipt_missing through the real AgentSession event consumer", async () => {
+		expect(await runResponse("   ")).toMatchObject({
+			state: "completed",
+			execution_state: "terminal_ok",
+			receipt_state: "missing",
+			error: { code: "receipt_missing" },
+		});
+	});
+});

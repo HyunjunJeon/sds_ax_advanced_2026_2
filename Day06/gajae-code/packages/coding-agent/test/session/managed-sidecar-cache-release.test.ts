@@ -1,0 +1,174 @@
+import { describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { getSidecarCacheRootDir, logger, TempDir } from "@gajae-code/utils";
+import { EphemeralBlobStore, ResidentCacheTrustError } from "../../src/session/blob-store";
+import { SessionManager } from "../../src/session/session-manager";
+import { FileSessionStorage } from "../../src/session/session-storage";
+
+const itPosix = it.skipIf(process.platform === "win32");
+
+interface ManagedSidecarFixture {
+	readonly manager: SessionManager;
+	readonly sidecarCacheDirs: string[];
+	readonly cleanup: () => void;
+}
+
+/**
+ * A managed session keeps its cold-history sidecar in a verified instance
+ * directory under the dedicated sidecar-cache root, so `close()` disposes that
+ * directory during teardown.
+ */
+function createManagedSidecarSession(prefix: string): ManagedSidecarFixture {
+	const tempDir = TempDir.createSync(prefix);
+	const cwd = path.join(tempDir.path(), "project");
+	const agentDir = path.join(tempDir.path(), "agent");
+	fs.mkdirSync(cwd, { recursive: true });
+	const storage = new FileSessionStorage();
+	const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+	const manager = SessionManager.create(cwd, destination, storage);
+	manager.setSessionMemoryMode("enabled");
+	manager.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: "published" }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "claude-sonnet-4-5",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	});
+	let firstKeptEntryId = "";
+	for (let index = 0; index < 400; index++) {
+		firstKeptEntryId = manager.appendMessage({
+			role: "user",
+			content: `managed-${index}-${"x".repeat(256)}`,
+			timestamp: Date.now(),
+		});
+	}
+	manager.appendCompaction("summary", undefined, firstKeptEntryId, 20_000);
+	expect(manager.getSessionMemoryStats()).toMatchObject({ coldRetirementActive: true, sidecarIneligible: false });
+
+	if (destination.kind !== "managed") throw new Error("Expected a managed destination");
+	const cacheRoot = getSidecarCacheRootDir(destination.securityContext.profileAgentDir);
+	const sidecarCacheDirs = fs
+		.readdirSync(cacheRoot)
+		.map(name => path.join(cacheRoot, name))
+		.filter(candidate => path.basename(candidate).startsWith("s-"));
+
+	return { manager, sidecarCacheDirs, cleanup: () => tempDir.removeSync() };
+}
+
+describe("managed sidecar resident-cache release", () => {
+	itPosix(
+		"closes the session when the sidecar cache directory is already gone",
+		async () => {
+			const fixture = createManagedSidecarSession("@pi-managed-sidecar-missing-");
+			try {
+				expect(fixture.sidecarCacheDirs).not.toHaveLength(0);
+				for (const directory of fixture.sidecarCacheDirs) fs.rmSync(directory, { recursive: true, force: true });
+
+				await fixture.manager.close();
+
+				for (const directory of fixture.sidecarCacheDirs) expect(fs.existsSync(directory)).toBe(false);
+			} finally {
+				fixture.cleanup();
+			}
+		},
+		60_000,
+	);
+
+	itPosix(
+		"retries failed sidecar disposal without disclosing its cache path",
+		async () => {
+			const fixture = createManagedSidecarSession("@pi-managed-sidecar-untrusted-");
+			const originalDispose = EphemeralBlobStore.prototype.dispose;
+			const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			let rejectDisposal = true;
+			const dispose = vi.spyOn(EphemeralBlobStore.prototype, "dispose").mockImplementation(function (
+				this: EphemeralBlobStore,
+			) {
+				if (rejectDisposal) throw new ResidentCacheTrustError("directory_untrusted", this.dir);
+				return originalDispose.call(this);
+			});
+			try {
+				expect(fixture.sidecarCacheDirs).not.toHaveLength(0);
+
+				await fixture.manager.close();
+
+				const firstCloseAttempts = dispose.mock.calls.length;
+				expect(firstCloseAttempts).toBeGreaterThan(0);
+				const warnings = warn.mock.calls.filter(([message]) =>
+					String(message).includes("managed sidecar resident cache"),
+				);
+				expect(warnings.length).toBeGreaterThan(0);
+				for (const warning of warnings) expect(warning[1]).toEqual({ reason: "directory_untrusted" });
+				const warningPayload = JSON.stringify(warnings);
+				for (const directory of fixture.sidecarCacheDirs) expect(warningPayload).not.toContain(directory);
+				for (const directory of fixture.sidecarCacheDirs) expect(fs.existsSync(directory)).toBe(true);
+
+				rejectDisposal = false;
+				await fixture.manager.close();
+
+				expect(dispose.mock.calls.length).toBeGreaterThan(firstCloseAttempts);
+				for (const directory of fixture.sidecarCacheDirs) expect(fs.existsSync(directory)).toBe(false);
+			} finally {
+				dispose.mockRestore();
+				warn.mockRestore();
+				for (const directory of fixture.sidecarCacheDirs) fs.rmSync(directory, { recursive: true, force: true });
+				fixture.cleanup();
+			}
+		},
+		60_000,
+	);
+
+	itPosix(
+		"reports the disposal errno alongside the reason while still withholding the cache path",
+		async () => {
+			const fixture = createManagedSidecarSession("@pi-managed-sidecar-errno-");
+			const originalDispose = EphemeralBlobStore.prototype.dispose;
+			const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+			let rejectDisposal = true;
+			const dispose = vi.spyOn(EphemeralBlobStore.prototype, "dispose").mockImplementation(function (
+				this: EphemeralBlobStore,
+			) {
+				if (!rejectDisposal) return originalDispose.call(this);
+				throw new ResidentCacheTrustError("blob_close_failed", this.dir, {
+					cause: Object.assign(new Error(`EBUSY: resource busy or locked, rmdir '${this.dir}'`), {
+						code: "EBUSY",
+					}),
+				});
+			});
+			try {
+				expect(fixture.sidecarCacheDirs).not.toHaveLength(0);
+
+				await fixture.manager.close();
+
+				const warnings = warn.mock.calls.filter(([message]) =>
+					String(message).includes("managed sidecar resident cache"),
+				);
+				expect(warnings.length).toBeGreaterThan(0);
+				for (const warning of warnings)
+					expect(warning[1]).toEqual({ reason: "blob_close_failed", causeCode: "EBUSY" });
+				const warningPayload = JSON.stringify(warnings);
+				for (const directory of fixture.sidecarCacheDirs) expect(warningPayload).not.toContain(directory);
+
+				rejectDisposal = false;
+				await fixture.manager.close();
+			} finally {
+				dispose.mockRestore();
+				warn.mockRestore();
+				for (const directory of fixture.sidecarCacheDirs) fs.rmSync(directory, { recursive: true, force: true });
+				fixture.cleanup();
+			}
+		},
+		60_000,
+	);
+});

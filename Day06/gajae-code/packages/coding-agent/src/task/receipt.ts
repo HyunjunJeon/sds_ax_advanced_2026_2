@@ -1,0 +1,409 @@
+import { AUTOROUTING_SELECTOR_MAX_LENGTH } from "../config/autorouting-contract";
+import {
+	assertRoutingEvidenceInvariant,
+	hasCompleteUsageCostBreakdown,
+	type ReviewFindingsArtifactRef,
+	type SingleResult,
+	type TaskRoutingEvidence,
+	type TaskToolDetails,
+} from "./types";
+export interface TaskRoi {
+	tokens: number;
+	contextTokens?: number;
+	clonedTokens?: number;
+	costTotal?: number;
+	outputBytes?: number;
+	outputLines?: number;
+	producedChanges: boolean;
+	materialContribution: boolean;
+	lowRoi: boolean;
+}
+export interface TaskResultReceipt {
+	index: number;
+	id: string;
+	agent: string;
+	agentSource: SingleResult["agentSource"];
+	task: string;
+	assignment?: string;
+	description?: string;
+	status: "completed" | "failed" | "aborted" | "merge_failed" | "paused";
+	exitCode: number;
+	aborted?: boolean;
+	paused?: boolean;
+	truncated: boolean;
+	durationMs: number;
+	tokens: number;
+	contextTokens?: number;
+	contextWindow?: number;
+	modelOverride?: string | string[];
+	routing?: TaskRoutingEvidence;
+	modelSubstitutionWarning?: SingleResult["modelSubstitutionWarning"];
+	fastMode?: boolean;
+	usage?: SingleResult["usage"];
+	cost?: number;
+	usageCostBreakdownComplete?: true;
+	branchName?: string;
+	persistence?: SingleResult["persistence"];
+	retryFailure?: { attempt: number; errorSummary: string };
+	setupFailure?: { summary: string };
+	localErrorSummary?: SingleResult["localErrorSummary"];
+	errorSummary?: string;
+	duplicateDisposition?: SingleResult["duplicateDisposition"];
+	abortSummary?: string;
+	preview: string;
+	previewTruncated: boolean;
+	outputRef?: {
+		uri: string;
+		sizeBytes: number;
+		lineCount: number;
+		sha256?: string;
+		/** Output remains readable for the parent session lifetime (and same-session descendants). */
+		durability?: "session";
+	};
+	outputUnavailable?: boolean;
+	review?: {
+		overallCorrectness?: string;
+		findingCount: number;
+		findings?: Array<{ severity?: string; summary: string }>;
+		/** Canonical full-fidelity findings; inline summaries are display-only. */
+		findingsRef?: ReviewFindingsArtifactRef;
+	};
+	extractedToolCounts?: Record<string, number>;
+	forkContext?: SingleResult["forkContext"];
+	forkContextAdvisory?: SingleResult["forkContextAdvisory"];
+	/** Resolved repository identity for this delegated lane (#2901). */
+	repositoryBinding?: SingleResult["repositoryBinding"];
+	roi?: TaskRoi;
+}
+
+const BANNED_RAW_TASK_KEYS = new Set([
+	"output",
+	"stderr",
+	"extractedToolData",
+	"resultText",
+	"errorText",
+	"artifactPayload",
+	"rawResult",
+	"rawResults",
+	"rawNestedResults",
+	"fullOutput",
+	"full_result",
+	"toolOutput",
+	"toolResultRaw",
+	"stdout",
+	"rawOutput",
+	"recentOutput",
+	"currentToolArgs",
+	"inflightTaskDetails",
+]);
+
+function truncateText(value: string | undefined, maxChars: number): string | undefined {
+	if (!value) return undefined;
+	return value.length > maxChars ? value.slice(0, maxChars) : value;
+}
+
+const SAFE_REVIEW_SEVERITIES = new Set(["blocker", "critical", "error", "high", "medium", "warning", "low", "info"]);
+const SAFE_REVIEW_PRIORITIES = new Set(["P0", "P1", "P2", "P3"]);
+
+function normalizeReviewFindingSeverity(severity: unknown, priority: unknown): string | undefined {
+	if (typeof severity === "string") {
+		const normalizedPriority = severity.toUpperCase();
+		if (SAFE_REVIEW_PRIORITIES.has(normalizedPriority)) return normalizedPriority;
+		const normalizedSeverity = severity.toLowerCase();
+		if (SAFE_REVIEW_SEVERITIES.has(normalizedSeverity)) return normalizedSeverity;
+	}
+	if (typeof priority === "string") {
+		const normalizedPriority = priority.toUpperCase();
+		if (SAFE_REVIEW_PRIORITIES.has(normalizedPriority)) return normalizedPriority;
+		const normalizedSeverity = priority.toLowerCase();
+		if (SAFE_REVIEW_SEVERITIES.has(normalizedSeverity)) return normalizedSeverity;
+	}
+	if (typeof priority === "number" && Number.isInteger(priority) && priority >= 0 && priority <= 3) {
+		return `P${priority}`;
+	}
+	return undefined;
+}
+
+function buildSafeSynopsis(raw: SingleResult, outputRef: TaskResultReceipt["outputRef"]): string {
+	const status = getStatus(raw);
+	if (raw.setupFailure) {
+		return `Task ${status} during setup: ${raw.setupFailure.summary}`;
+	}
+	if (raw.modelSubstitutionWarning) {
+		return `Task ${status}; requested model substituted from ${raw.modelSubstitutionWarning.requested} to ${raw.modelSubstitutionWarning.effective}.`;
+	}
+	if (raw.retryFailure) {
+		return `Task ${status}; retry stopped after attempt ${raw.retryFailure.attempt}.`;
+	}
+	if (raw.persistence?.outcome === "recovery_available") {
+		const recovery = raw.persistence.recoveryRef
+			? ` Recovery patch: ${raw.persistence.recoveryRef.uri} (${raw.persistence.recoveryRef.sizeBytes} bytes).`
+			: "";
+		return `Task ${status}; changes were not persisted to the owner worktree.${recovery}`;
+	}
+	if (raw.persistence?.outcome === "applied") {
+		return `Task ${status}; changes persisted to the owner worktree.`;
+	}
+	if (raw.persistence?.outcome === "no_changes") {
+		return `Task ${status}; no changes to persist.`;
+	}
+	if (raw.abortReason) {
+		return `Task ${status}; abort reason recorded.`;
+	}
+	if (raw.localErrorSummary) {
+		return `Task ${status}; local failure (${raw.localErrorSummary.kind}): ${raw.localErrorSummary.summary}`;
+	}
+	if (raw.error) {
+		return `Task ${status}; error recorded.`;
+	}
+	if (outputRef) {
+		return `Task ${status}; output stored in ${outputRef.uri} (${outputRef.lineCount} lines, ${outputRef.sizeBytes} bytes).`;
+	}
+	return `Task ${status}; output artifact unavailable.`;
+}
+
+function getStatus(raw: SingleResult): TaskResultReceipt["status"] {
+	if (raw.paused) return "paused";
+	if (raw.aborted) return "aborted";
+	if (raw.exitCode === 0 && (raw.error || raw.persistence?.outcome === "recovery_available")) return "merge_failed";
+	if (raw.exitCode !== 0 || raw.error) return "failed";
+	return "completed";
+}
+
+function buildReview(raw: SingleResult): TaskResultReceipt["review"] | undefined {
+	const data = raw.extractedToolData;
+	const findingsRef = raw.reviewFindingsRef;
+	const yields = Array.isArray(data?.yield) ? data.yield : [];
+	const reviewYield = yields
+		.map(item => (item && typeof item === "object" ? (item as { data?: unknown }).data : undefined))
+		.findLast(item => item && typeof item === "object" && "overall_correctness" in item) as
+		| { overall_correctness?: unknown }
+		| undefined;
+	const rawFindings = Array.isArray(data?.report_finding) ? data.report_finding : [];
+	const findings = rawFindings.slice(0, 20).map(item => {
+		const value = item && typeof item === "object" ? (item as Record<string, unknown>) : {};
+		const severity = normalizeReviewFindingSeverity(value.severity, value.priority);
+		const summaryValue = value.summary ?? value.title ?? value.message ?? value.body ?? "finding";
+		return { severity, summary: truncateText(String(summaryValue), 200) ?? "finding" };
+	});
+	if (!reviewYield && findings.length === 0 && !findingsRef) return undefined;
+	return {
+		overallCorrectness: truncateText(
+			typeof reviewYield?.overall_correctness === "string" ? reviewYield.overall_correctness : undefined,
+			200,
+		),
+		findingCount: findingsRef?.findingCount ?? rawFindings.length,
+		findings: findings.length > 0 ? findings : undefined,
+		findingsRef,
+	};
+}
+
+function hasReviewFindings(raw: SingleResult): boolean {
+	if (raw.reviewFindingsRef) return true;
+	const findings = raw.extractedToolData?.report_finding;
+	return Array.isArray(findings) && findings.length > 0;
+}
+
+function hasNonEmptyPreview(raw: SingleResult): boolean {
+	return Boolean((raw.output.trim() || raw.stderr.trim()).trim());
+}
+
+/**
+ * Heuristic task ROI signal built only from receipt-safe accounting fields.
+ * Advisory only: these flags never change task success/failure semantics.
+ */
+export function buildTaskRoi(raw: SingleResult): TaskRoi {
+	const outputBytes = raw.outputMeta?.byteSize ?? (raw.outputMeta ? Buffer.byteLength(raw.output, "utf8") : undefined);
+	const outputLines = raw.outputMeta?.lineCount;
+	const producedChanges =
+		raw.producedChanges ??
+		Boolean(raw.branchName || (Array.isArray(raw.nestedPatches) && raw.nestedPatches.length > 0));
+	const status = getStatus(raw);
+	const terminal = status !== "paused" && !raw.aborted;
+	const materialContribution = Boolean(
+		producedChanges ||
+			(outputBytes !== undefined && outputBytes > 0) ||
+			hasReviewFindings(raw) ||
+			(status === "completed" && raw.tokens > 0 && hasNonEmptyPreview(raw)),
+	);
+	const lowRoi = terminal && raw.tokens > 0 && !materialContribution;
+	return {
+		tokens: raw.tokens,
+		contextTokens: raw.contextTokens,
+		clonedTokens: raw.forkContext?.clonedTokens,
+		costTotal: raw.usage?.cost.total,
+		outputBytes,
+		outputLines,
+		producedChanges,
+		materialContribution,
+		lowRoi,
+	};
+}
+
+export function buildTaskRoiSummary(receipts: readonly TaskResultReceipt[]): TaskToolDetails["roiSummary"] {
+	const totalCostTotal = receipts.reduce((total, receipt) => total + (receipt.roi?.costTotal ?? 0), 0);
+	const totalClonedTokens = receipts.reduce((total, receipt) => total + (receipt.roi?.clonedTokens ?? 0), 0);
+	return {
+		childCount: receipts.length,
+		totalTokens: receipts.reduce((total, receipt) => total + (receipt.roi?.tokens ?? receipt.tokens), 0),
+		totalCostTotal: totalCostTotal > 0 ? totalCostTotal : undefined,
+		totalClonedTokens: totalClonedTokens > 0 ? totalClonedTokens : undefined,
+		lowRoiChildIds: receipts.filter(receipt => receipt.roi?.lowRoi).map(receipt => receipt.id),
+	};
+}
+function validatedRoutingEvidence(value: TaskRoutingEvidence | undefined): TaskRoutingEvidence | undefined {
+	if (!value) return undefined;
+	try {
+		const bounded: TaskRoutingEvidence = {
+			...value,
+			requestedSelector: value.requestedSelector.slice(0, AUTOROUTING_SELECTOR_MAX_LENGTH),
+			skips: value.skips
+				?.slice(0, 16)
+				.map(skip => ({ ...skip, selector: skip.selector.slice(0, AUTOROUTING_SELECTOR_MAX_LENGTH) })),
+			attempts: value.attempts
+				?.slice(0, 6)
+				.map(attempt => ({ ...attempt, selector: attempt.selector.slice(0, AUTOROUTING_SELECTOR_MAX_LENGTH) })),
+		};
+		assertRoutingEvidenceInvariant(bounded);
+		return bounded;
+	} catch {
+		return undefined;
+	}
+}
+
+export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
+	// Receipts only include outputRef when production code kept outputMeta after a
+	// durable write (file-backed session dir or session-lifetime durable root).
+	const outputRef = raw.outputMeta
+		? {
+				uri: `agent://${raw.id}`,
+				sizeBytes: raw.outputMeta.byteSize ?? Buffer.byteLength(raw.output, "utf8"),
+				lineCount: raw.outputMeta.lineCount,
+				sha256: raw.outputMeta.sha256,
+				durability: "session" as const,
+			}
+		: undefined;
+	const preview = buildSafeSynopsis(raw, outputRef);
+	const extractedToolCounts = raw.extractedToolData
+		? Object.fromEntries(
+				Object.entries(raw.extractedToolData).map(([tool, values]) => [
+					tool,
+					Array.isArray(values) ? values.length : 0,
+				]),
+			)
+		: undefined;
+	return {
+		index: raw.index,
+		id: raw.id,
+		agent: raw.agent,
+		agentSource: raw.agentSource,
+		task: raw.task,
+		assignment: raw.assignment,
+		description: raw.description,
+		status: getStatus(raw),
+		exitCode: raw.exitCode,
+		aborted: raw.aborted,
+		paused: raw.paused,
+		truncated: raw.truncated,
+		durationMs: raw.durationMs,
+		tokens: raw.tokens,
+		contextTokens: raw.contextTokens,
+		contextWindow: raw.contextWindow,
+		modelOverride: raw.modelOverride,
+		modelSubstitutionWarning: raw.modelSubstitutionWarning,
+		routing: validatedRoutingEvidence(raw.routing),
+		usage: raw.usage,
+		cost: raw.usage?.cost.total,
+		usageCostBreakdownComplete:
+			raw.usageCostBreakdownComplete === true && hasCompleteUsageCostBreakdown(raw.usage) ? true : undefined,
+		branchName: raw.branchName,
+		persistence: raw.persistence,
+		fastMode: raw.fastMode,
+		retryFailure: raw.retryFailure
+			? { attempt: raw.retryFailure.attempt, errorSummary: "Retry failure recorded." }
+			: undefined,
+		duplicateDisposition: raw.duplicateDisposition,
+		localErrorSummary: raw.localErrorSummary,
+		errorSummary:
+			raw.setupFailure?.summary ??
+			raw.localErrorSummary?.summary ??
+			(raw.error
+				? "Error recorded."
+				: raw.persistence?.outcome === "recovery_available"
+					? "Changes were not persisted to the owner worktree."
+					: undefined),
+		setupFailure: raw.setupFailure ? { summary: raw.setupFailure.summary } : undefined,
+		abortSummary: raw.abortReason ? "Abort reason recorded." : undefined,
+		preview,
+		previewTruncated: false,
+		outputRef,
+		outputUnavailable: outputRef ? undefined : true,
+		review: buildReview(raw),
+		extractedToolCounts,
+		forkContext: raw.forkContext,
+		forkContextAdvisory: raw.forkContextAdvisory,
+		repositoryBinding: raw.repositoryBinding,
+		roi: buildTaskRoi(raw),
+	};
+}
+
+/**
+ * Raw, pre-sanitization task details: the internal shape produced during task
+ * execution, where `results` are full `SingleResult` objects. The public
+ * `TaskToolDetails` exposes only receipts.
+ */
+export interface RawTaskToolDetails {
+	projectAgentsDir: string | null;
+	results: SingleResult[];
+	totalDurationMs: number;
+	usage?: TaskToolDetails["usage"];
+	usageCostBreakdownComplete?: TaskToolDetails["usageCostBreakdownComplete"];
+	async?: TaskToolDetails["async"];
+	forkContextClonedTokens?: number;
+	roiSummary?: TaskToolDetails["roiSummary"];
+}
+
+/** Central converter from raw task details to receipt-only public details. */
+export function sanitizeTaskToolDetails(raw: RawTaskToolDetails): TaskToolDetails {
+	return {
+		projectAgentsDir: raw.projectAgentsDir,
+		results: raw.results.map(buildTaskReceipt),
+		totalDurationMs: raw.totalDurationMs,
+		usage: raw.usage,
+		usageCostBreakdownComplete:
+			raw.usageCostBreakdownComplete === true && hasCompleteUsageCostBreakdown(raw.usage) ? true : undefined,
+		forkContextClonedTokens: raw.forkContextClonedTokens,
+		roiSummary: raw.roiSummary ?? buildTaskRoiSummary(raw.results.map(buildTaskReceipt)),
+		async: raw.async,
+	};
+}
+
+export function findRawTaskLeakKeys(value: unknown): string[] {
+	const found = new Set<string>();
+	const seen = new WeakSet<object>();
+	const visit = (current: unknown) => {
+		if (!current || typeof current !== "object") return;
+		if (seen.has(current)) return;
+		seen.add(current);
+		if (Array.isArray(current)) {
+			for (const item of current) visit(item);
+			return;
+		}
+		for (const [key, child] of Object.entries(current)) {
+			// Banned keys only leak when they carry text or structure. A numeric
+			// value (e.g. the `output` token count on a canonical `Usage` record,
+			// whose shape is `input/output/cacheRead/cacheWrite/totalTokens`) is safe.
+			if (BANNED_RAW_TASK_KEYS.has(key) && typeof child !== "number") found.add(key);
+			visit(child);
+		}
+	};
+	visit(value);
+	return [...found].sort();
+}
+
+export function assertNoRawTaskFields(value: unknown, surface: string): void {
+	const keys = findRawTaskLeakKeys(value);
+	if (keys.length > 0) {
+		throw new Error(`${surface} contains raw task fields: ${keys.join(", ")}`);
+	}
+}

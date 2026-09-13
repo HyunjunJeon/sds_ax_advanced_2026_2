@@ -1,0 +1,144 @@
+import { describe, expect, it, vi } from "bun:test";
+import type { CommandPaletteComponent } from "@gajae-code/coding-agent/modes/components/command-palette";
+import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
+import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
+import type { SlashCommand } from "@gajae-code/tui";
+
+describe("SelectorController command palette", () => {
+	it("surfaces rejected handlers without an unhandled rejection", async () => {
+		const component = { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() };
+		const errorShown = Promise.withResolvers<void>();
+		const showError = vi.fn(() => errorShown.resolve());
+		const ctx = {
+			editorContainer: component,
+			editor: {},
+			restoreComposer: vi.fn(),
+			keybindings: { getKeys: () => [] },
+			ui: { setFocus: vi.fn(), requestRender: vi.fn() },
+			showError,
+		} as unknown as InteractiveModeContext;
+		const controller = new SelectorController(ctx);
+		const unhandled = vi.fn();
+		process.on("unhandledRejection", unhandled);
+
+		try {
+			controller.showCommandPalette([{ name: "broken", description: "Rejects" }] as SlashCommand[], [], async () => {
+				throw new Error("palette command failed");
+			});
+			const palette = component.addChild.mock.calls[0]?.[0] as CommandPaletteComponent;
+			palette.handleInput("\r");
+			await errorShown.promise;
+			await new Promise<void>(resolve => setImmediate(resolve));
+
+			expect(showError).toHaveBeenCalledWith("palette command failed");
+			expect(unhandled).not.toHaveBeenCalled();
+		} finally {
+			process.off("unhandledRejection", unhandled);
+		}
+	});
+	it("surfaces rejected action handlers", async () => {
+		const component = { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() };
+		const errorShown = Promise.withResolvers<void>();
+		const showError = vi.fn(() => errorShown.resolve());
+		const ctx = {
+			editorContainer: component,
+			editor: {},
+			restoreComposer: vi.fn(),
+			keybindings: { getDisplayString: () => "" },
+			ui: { setFocus: vi.fn(), requestRender: vi.fn() },
+			showError,
+		} as unknown as InteractiveModeContext;
+		const controller = new SelectorController(ctx);
+
+		controller.showCommandPalette(
+			[],
+			[
+				{
+					id: "app.editor.external",
+					label: "External editor",
+					handler: async () => {
+						throw new Error("external editor failed");
+					},
+				},
+			],
+			async () => {},
+		);
+		const palette = component.addChild.mock.calls[0]?.[0] as CommandPaletteComponent;
+		palette.handleInput("\r");
+		await errorShown.promise;
+
+		expect(showError).toHaveBeenCalledWith("external editor failed");
+	});
+	it("restores composer before executing and reporting a throwing action", async () => {
+		const order: string[] = [];
+		const component = { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() };
+		const ctx = {
+			editorContainer: component,
+			editor: {},
+			restoreComposer: vi.fn(() => order.push("focus")),
+			keybindings: { getDisplayString: () => "" },
+			ui: { setFocus: vi.fn(), requestRender: vi.fn() },
+			showError: vi.fn(() => order.push("error")),
+		} as unknown as InteractiveModeContext;
+		const controller = new SelectorController(ctx);
+
+		controller.showCommandPalette(
+			[],
+			[
+				{
+					id: "app.editor.external",
+					label: "External editor",
+					handler: async () => {
+						order.push("execute");
+						throw new Error("external editor failed");
+					},
+				},
+			],
+			async () => {},
+		);
+		const palette = component.addChild.mock.calls[0]?.[0] as CommandPaletteComponent;
+		palette.handleInput("\r");
+		await new Promise<void>(resolve => setImmediate(resolve));
+		expect(order).toEqual(["focus", "execute", "error"]);
+	});
+	it("uses effective display strings and omits unbound action shortcuts", () => {
+		const component = { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() };
+		const keybindings = {
+			getDisplayString(action: string) {
+				return (
+					{
+						"app.darwin": "⌥↑",
+						"app.textual": "Alt+Up",
+						"app.unbound": "",
+					}[action] ?? ""
+				);
+			},
+		};
+		const ctx = {
+			editorContainer: component,
+			editor: {},
+			restoreComposer: vi.fn(),
+			keybindings,
+			ui: { setFocus: vi.fn(), requestRender: vi.fn() },
+			showError: vi.fn(),
+		} as unknown as InteractiveModeContext;
+		const controller = new SelectorController(ctx);
+
+		controller.showCommandPalette(
+			[],
+			[
+				{ id: "app.darwin", label: "Darwin", handler: () => {} },
+				{ id: "app.textual", label: "Textual", handler: () => {} },
+				{ id: "app.unbound", label: "Unbound", handler: () => {} },
+			],
+			async () => {},
+		);
+
+		const palette = component.addChild.mock.calls[0]?.[0] as CommandPaletteComponent;
+		expect(palette.getEntries().map(entry => [entry.label, entry.keybinding])).toEqual([
+			["Darwin", "⌥↑"],
+			["Textual", "Alt+Up"],
+			["Unbound", undefined],
+		]);
+	});
+});

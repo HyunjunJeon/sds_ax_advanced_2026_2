@@ -1,0 +1,119 @@
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { stripVTControlCharacters } from "node:util";
+import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
+import { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
+import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
+
+beforeAll(async () => {
+	await initTheme();
+});
+
+beforeEach(async () => {
+	resetSettingsForTest();
+	await Settings.init({ inMemory: true });
+});
+
+afterEach(() => {
+	resetSettingsForTest();
+});
+
+function makeComponent(
+	petAvailable: boolean,
+	callbacks: Record<string, unknown>,
+	terminalEnv?: NodeJS.ProcessEnv,
+): SettingsSelectorComponent {
+	return new SettingsSelectorComponent(
+		{
+			availableThinkingLevels: [],
+			thinkingLevel: undefined,
+			availableThemes: ["dark"],
+			availableModelProfiles: [],
+			cwd: process.cwd(),
+			petAvailable,
+			terminalEnv,
+		},
+		{ onChange: () => {}, onCancel: () => {}, ...callbacks },
+	);
+}
+
+function openPetSetting(component: SettingsSelectorComponent): void {
+	for (let attempt = 0; attempt < 100; attempt++) {
+		const rendered = stripVTControlCharacters(component.render(160).join("\n"));
+		if (rendered.includes("Animated pet beside the composer")) {
+			component.handleInput("\n");
+			return;
+		}
+		component.handleInput("\x1b[B");
+	}
+	throw new Error("Gajae Pet setting was not reachable");
+}
+
+describe("SettingsSelectorComponent pet capability", () => {
+	it("keeps saved pets reachable through the text fallback and routes the commit through the shared policy", () => {
+		settings.set("pet.mode", "red");
+		const onChange = vi.fn();
+		const onPetPreview = vi.fn();
+		const onPetCommit = vi.fn((mode: string) => {
+			// Simulate the InteractiveMode policy: accept and persist on acceptance.
+			settings.set("pet.mode", mode as never);
+			return true;
+		});
+		const component = makeComponent(true, { onChange, onPetPreview, onPetCommit });
+
+		openPetSetting(component);
+		const submenu = stripVTControlCharacters(component.render(80).join("\n"));
+		expect(submenu).toContain("RedGajae");
+		expect(submenu).toContain("BlueGajae");
+		expect(submenu).toContain("Ouroboros");
+		expect(stripVTControlCharacters(component.render(40).join("\n"))).toContain("RedGajae");
+
+		component.handleInput("\x1b[B");
+		expect(onPetPreview).toHaveBeenCalledWith("blue");
+		component.handleInput("\n");
+
+		// The settings surface never persists pet.mode itself and never routes
+		// it through the generic onChange path; the shared policy owns both.
+		expect(onPetCommit).toHaveBeenCalledWith("blue");
+		expect(onChange).not.toHaveBeenCalled();
+		expect(settings.get("pet.mode")).toBe("blue");
+	});
+
+	it("does not persist pet.mode when the commit policy rejects at select time", () => {
+		settings.set("pet.mode", "off");
+		const onChange = vi.fn();
+		// The submenu was built while the capability looked available, but the
+		// policy rechecks at commit time and rejects (TOCTOU race).
+		const onPetCommit = vi.fn(() => false);
+		const component = makeComponent(true, { onChange, onPetCommit });
+
+		openPetSetting(component);
+		component.handleInput("\x1b[B"); // move to an enabled skin choice
+		component.handleInput("\n");
+
+		expect(onPetCommit).toHaveBeenCalledTimes(1);
+		expect(onChange).not.toHaveBeenCalled();
+		expect(settings.get("pet.mode")).toBe("off");
+	});
+	it("rejects read-only pet commits before the shared policy can mutate widget state", () => {
+		const canWrite = vi.spyOn(Settings.instance, "canWriteDurableConfig").mockReturnValue(false);
+		const onChange = vi.fn();
+		const onError = vi.fn();
+		const onPetCommit = vi.fn(() => true);
+		try {
+			const component = makeComponent(true, { onChange, onError, onPetCommit });
+
+			openPetSetting(component);
+			component.handleInput("\x1b[B");
+			component.handleInput("\n");
+
+			expect(onError).toHaveBeenCalledWith(
+				"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+			);
+			expect(onPetCommit).not.toHaveBeenCalled();
+			expect(onChange).not.toHaveBeenCalled();
+			expect(settings.get("pet.mode")).toBe("off");
+		} finally {
+			canWrite.mockRestore();
+		}
+	});
+});

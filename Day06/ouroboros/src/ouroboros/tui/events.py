@@ -1,0 +1,1205 @@
+"""TUI event handlers and message types.
+
+This module defines Textual messages for TUI event communication
+and handlers for subscribing to EventStore updates.
+
+Message Types:
+- ExecutionUpdated: Execution state changed
+- PhaseChanged: Phase transition occurred
+- DriftUpdated: Drift metrics updated
+- CostUpdated: Cost metrics updated
+- LogMessage: New log entry received
+- ACUpdated: AC tree node status changed
+- WorkflowProgressUpdated: Workflow progress with AC list
+- PauseRequested: User requested pause
+- ResumeRequested: User requested resume
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
+
+from textual.message import Message
+
+from ouroboros.observability.frugality_retrospective import (
+    project_frugality_retrospective,
+)
+
+if TYPE_CHECKING:
+    from ouroboros.events.base import BaseEvent
+
+
+# =============================================================================
+# Textual Messages for TUI Communication
+# =============================================================================
+
+
+class ExecutionUpdated(Message):
+    """Message indicating execution state has changed.
+
+    Attributes:
+        execution_id: The execution that was updated.
+        session_id: Associated session ID.
+        status: Current execution status.
+        data: Additional execution data.
+    """
+
+    def __init__(
+        self,
+        execution_id: str,
+        session_id: str,
+        status: str,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        """Initialize ExecutionUpdated message.
+
+        Args:
+            execution_id: The execution that was updated.
+            session_id: Associated session ID.
+            status: Current execution status.
+            data: Additional execution data.
+        """
+        super().__init__()
+        self.execution_id = execution_id
+        self.session_id = session_id
+        self.status = status
+        self.data = data or {}
+
+
+class PhaseChanged(Message):
+    """Message indicating a phase transition occurred.
+
+    Attributes:
+        execution_id: The execution that changed phase.
+        previous_phase: The phase that completed.
+        current_phase: The new current phase.
+        iteration: Current iteration number.
+    """
+
+    def __init__(
+        self,
+        execution_id: str,
+        previous_phase: str | None,
+        current_phase: str,
+        iteration: int,
+    ) -> None:
+        """Initialize PhaseChanged message.
+
+        Args:
+            execution_id: The execution that changed phase.
+            previous_phase: The phase that completed.
+            current_phase: The new current phase.
+            iteration: Current iteration number.
+        """
+        super().__init__()
+        self.execution_id = execution_id
+        self.previous_phase = previous_phase
+        self.current_phase = current_phase
+        self.iteration = iteration
+
+
+class DriftUpdated(Message):
+    """Message indicating drift metrics were updated.
+
+    Attributes:
+        execution_id: The execution with updated drift.
+        goal_drift: Goal drift score (0.0-1.0).
+        constraint_drift: Constraint drift score (0.0-1.0).
+        ontology_drift: Ontology drift score (0.0-1.0).
+        combined_drift: Combined drift score (0.0-1.0).
+        is_acceptable: Whether drift is within threshold.
+    """
+
+    def __init__(
+        self,
+        execution_id: str,
+        goal_drift: float,
+        constraint_drift: float,
+        ontology_drift: float,
+        combined_drift: float,
+        is_acceptable: bool,
+    ) -> None:
+        """Initialize DriftUpdated message.
+
+        Args:
+            execution_id: The execution with updated drift.
+            goal_drift: Goal drift score.
+            constraint_drift: Constraint drift score.
+            ontology_drift: Ontology drift score.
+            combined_drift: Combined drift score.
+            is_acceptable: Whether drift is acceptable.
+        """
+        super().__init__()
+        self.execution_id = execution_id
+        self.goal_drift = goal_drift
+        self.constraint_drift = constraint_drift
+        self.ontology_drift = ontology_drift
+        self.combined_drift = combined_drift
+        self.is_acceptable = is_acceptable
+
+
+class CostUpdated(Message):
+    """Message indicating cost metrics were updated.
+
+    Attributes:
+        execution_id: The execution with updated cost.
+        total_tokens: Total tokens consumed.
+        total_cost_usd: Estimated cost in USD.
+        tokens_this_phase: Tokens used in current phase.
+    """
+
+    def __init__(
+        self,
+        execution_id: str,
+        total_tokens: int,
+        total_cost_usd: float,
+        tokens_this_phase: int,
+    ) -> None:
+        """Initialize CostUpdated message.
+
+        Args:
+            execution_id: The execution with updated cost.
+            total_tokens: Total tokens consumed.
+            total_cost_usd: Estimated cost in USD.
+            tokens_this_phase: Tokens used in current phase.
+        """
+        super().__init__()
+        self.execution_id = execution_id
+        self.total_tokens = total_tokens
+        self.total_cost_usd = total_cost_usd
+        self.tokens_this_phase = tokens_this_phase
+
+
+class LogMessage(Message):
+    """Message for new log entries.
+
+    Attributes:
+        timestamp: When the log was created.
+        level: Log level (debug, info, warning, error).
+        source: Source module/component.
+        message: Log message content.
+        data: Additional structured data.
+    """
+
+    def __init__(
+        self,
+        timestamp: datetime,
+        level: str,
+        source: str,
+        message: str,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        """Initialize LogMessage.
+
+        Args:
+            timestamp: When the log was created.
+            level: Log level.
+            source: Source module/component.
+            message: Log message content.
+            data: Additional structured data.
+        """
+        super().__init__()
+        self.timestamp = timestamp
+        self.level = level
+        self.source = source
+        self.message = message
+        self.data = data or {}
+
+
+class ACUpdated(Message):
+    """Message indicating AC tree was updated.
+
+    Attributes:
+        execution_id: The execution with updated AC tree.
+        ac_id: The AC that was updated.
+        status: New AC status.
+        depth: Depth in the AC tree.
+        is_atomic: Whether AC is atomic.
+        parallel_level: Execution level for parallel execution (None if not parallel).
+    """
+
+    def __init__(
+        self,
+        execution_id: str,
+        ac_id: str,
+        status: str,
+        depth: int,
+        is_atomic: bool,
+        parallel_level: int | None = None,
+    ) -> None:
+        """Initialize ACUpdated message.
+
+        Args:
+            execution_id: The execution with updated AC tree.
+            ac_id: The AC that was updated.
+            status: New AC status.
+            depth: Depth in the AC tree.
+            is_atomic: Whether AC is atomic.
+            parallel_level: Execution level for parallel execution.
+        """
+        super().__init__()
+        self.execution_id = execution_id
+        self.ac_id = ac_id
+        self.status = status
+        self.depth = depth
+        self.is_atomic = is_atomic
+        self.parallel_level = parallel_level
+
+
+class ParallelBatchStarted(Message):
+    """Message indicating a parallel batch execution started.
+
+    Attributes:
+        execution_id: The parent execution ID.
+        batch_index: Index of the batch (0-based).
+        ac_ids: List of AC IDs in this batch.
+        total_batches: Total number of batches.
+    """
+
+    def __init__(
+        self,
+        execution_id: str,
+        batch_index: int,
+        ac_ids: list[str],
+        total_batches: int,
+    ) -> None:
+        """Initialize ParallelBatchStarted message.
+
+        Args:
+            execution_id: The parent execution ID.
+            batch_index: Index of the batch.
+            ac_ids: List of AC IDs in this batch.
+            total_batches: Total number of batches.
+        """
+        super().__init__()
+        self.execution_id = execution_id
+        self.batch_index = batch_index
+        self.ac_ids = ac_ids
+        self.total_batches = total_batches
+
+
+class ParallelBatchCompleted(Message):
+    """Message indicating a parallel batch execution completed.
+
+    Attributes:
+        execution_id: The parent execution ID.
+        batch_index: Index of the batch (0-based).
+        successful_count: Number of successful ACs in batch.
+        failed_count: Number of failed ACs in batch.
+        total_in_batch: Total ACs in this batch.
+    """
+
+    def __init__(
+        self,
+        execution_id: str,
+        batch_index: int,
+        successful_count: int,
+        failed_count: int,
+        total_in_batch: int,
+    ) -> None:
+        """Initialize ParallelBatchCompleted message.
+
+        Args:
+            execution_id: The parent execution ID.
+            batch_index: Index of the batch.
+            successful_count: Number of successful ACs.
+            failed_count: Number of failed ACs.
+            total_in_batch: Total ACs in batch.
+        """
+        super().__init__()
+        self.execution_id = execution_id
+        self.batch_index = batch_index
+        self.successful_count = successful_count
+        self.failed_count = failed_count
+        self.total_in_batch = total_in_batch
+
+
+class WorkflowProgressUpdated(Message):
+    """Message indicating workflow progress was updated.
+
+    Carries AC progress list with status and timing info,
+    matching the WorkflowState from the orchestrator.
+
+    Attributes:
+        execution_id: The execution with updated progress.
+        acceptance_criteria: List of AC dicts with index, content, status, elapsed.
+        completed_count: Number of completed ACs.
+        total_count: Total number of ACs.
+        current_ac_index: Index of current AC being worked on.
+        current_phase: Current Double Diamond phase.
+        activity: Current activity type.
+        activity_detail: Activity detail string.
+        estimated_remaining: Estimated remaining time display.
+        elapsed_display: Total elapsed time display.
+        messages_count: Total messages processed.
+        tool_calls_count: Total tool calls made.
+        estimated_tokens: Estimated token usage.
+        estimated_cost_usd: Estimated cost in USD.
+        last_update: Normalized artifact snapshot from the latest runtime message.
+    """
+
+    def __init__(
+        self,
+        execution_id: str,
+        acceptance_criteria: list[dict[str, Any]],
+        completed_count: int,
+        total_count: int,
+        current_ac_index: int | None = None,
+        current_phase: str = "Discover",
+        activity: str = "idle",
+        activity_detail: str = "",
+        estimated_remaining: str = "",
+        elapsed_display: str = "",
+        messages_count: int = 0,
+        tool_calls_count: int = 0,
+        estimated_tokens: int = 0,
+        estimated_cost_usd: float = 0.0,
+        last_update: dict[str, Any] | None = None,
+    ) -> None:
+        """Initialize WorkflowProgressUpdated message."""
+        super().__init__()
+        self.execution_id = execution_id
+        self.acceptance_criteria = acceptance_criteria
+        self.completed_count = completed_count
+        self.total_count = total_count
+        self.current_ac_index = current_ac_index
+        self.current_phase = current_phase
+        self.activity = activity
+        self.activity_detail = activity_detail
+        self.estimated_remaining = estimated_remaining
+        self.elapsed_display = elapsed_display
+        self.messages_count = messages_count
+        self.tool_calls_count = tool_calls_count
+        self.estimated_tokens = estimated_tokens
+        self.estimated_cost_usd = estimated_cost_usd
+        self.last_update = last_update or {}
+
+
+class SubtaskUpdated(Message):
+    """Message indicating a sub-task was updated.
+
+    Used to show hierarchical AC execution in the tree.
+
+    Attributes:
+        execution_id: The execution with updated sub-task.
+        ac_index: Parent AC index.
+        sub_task_index: Sub-task index within the AC.
+        sub_task_id: Unique sub-task ID.
+        content: Sub-task description.
+        status: Sub-task status (executing, completed, failed).
+        current_tool_activity: Latest normalized tool-activity payload for the Sub-AC.
+        last_update: Latest runtime artifact snapshot associated with the Sub-AC.
+    """
+
+    def __init__(
+        self,
+        execution_id: str,
+        ac_index: int,
+        sub_task_index: int,
+        sub_task_id: str,
+        content: str,
+        status: str,
+        current_tool_activity: dict[str, Any] | None = None,
+        last_update: dict[str, Any] | None = None,
+        node_id: str | None = None,
+        parent_node_id: str | None = None,
+        path: list[int] | None = None,
+        display_path: str | None = None,
+        depth: int | None = None,
+        ordinal: int | None = None,
+        root_ac_index: int | None = None,
+        root_ac_number: int | None = None,
+        identity_model: str | None = None,
+        legacy_parent_node_id: str | None = None,
+        legacy_parent_node_aliases: list[str] | None = None,
+    ) -> None:
+        """Initialize SubtaskUpdated message."""
+        super().__init__()
+        self.execution_id = execution_id
+        self.ac_index = ac_index
+        self.sub_task_index = sub_task_index
+        self.sub_task_id = sub_task_id
+        self.content = content
+        self.status = status
+        self.current_tool_activity = (
+            dict(current_tool_activity) if isinstance(current_tool_activity, dict) else {}
+        )
+        self.last_update = dict(last_update) if isinstance(last_update, dict) else {}
+        self.node_id = node_id
+        self.parent_node_id = parent_node_id
+        self.path = list(path) if isinstance(path, list) else []
+        self.display_path = display_path
+        self.node_depth = depth
+        self.ordinal = ordinal
+        self.root_ac_index = root_ac_index
+        self.root_ac_number = root_ac_number
+        self.identity_model = identity_model
+        self.legacy_parent_node_id = legacy_parent_node_id
+        self.legacy_parent_node_aliases = (
+            [alias for alias in legacy_parent_node_aliases if isinstance(alias, str)]
+            if isinstance(legacy_parent_node_aliases, list)
+            else []
+        )
+
+
+class LineageSelected(Message):
+    """Message indicating a lineage was selected from the selector screen.
+
+    Attributes:
+        lineage_id: The selected lineage ID.
+    """
+
+    def __init__(self, lineage_id: str) -> None:
+        super().__init__()
+        self.lineage_id = lineage_id
+
+
+class GenerationSelected(Message):
+    """Message indicating a generation was selected in the lineage detail view.
+
+    Attributes:
+        lineage_id: The lineage this generation belongs to.
+        generation_number: The selected generation number.
+    """
+
+    def __init__(self, lineage_id: str, generation_number: int) -> None:
+        super().__init__()
+        self.lineage_id = lineage_id
+        self.generation_number = generation_number
+
+
+class PauseRequested(Message):
+    """Message indicating user requested execution pause.
+
+    Attributes:
+        execution_id: The execution to pause.
+        reason: Reason for pause request.
+    """
+
+    def __init__(self, execution_id: str, reason: str = "user_request") -> None:
+        """Initialize PauseRequested message.
+
+        Args:
+            execution_id: The execution to pause.
+            reason: Reason for pause request.
+        """
+        super().__init__()
+        self.execution_id = execution_id
+        self.reason = reason
+
+
+class ResumeRequested(Message):
+    """Message indicating user requested execution resume.
+
+    Attributes:
+        execution_id: The execution to resume.
+    """
+
+    def __init__(self, execution_id: str) -> None:
+        """Initialize ResumeRequested message.
+
+        Args:
+            execution_id: The execution to resume.
+        """
+        super().__init__()
+        self.execution_id = execution_id
+
+
+class ToolCallStarted(Message):
+    """Tool call started during AC execution."""
+
+    def __init__(
+        self,
+        execution_id: str,
+        ac_id: str,
+        tool_name: str,
+        tool_detail: str,
+        tool_input: dict[str, Any] | None = None,
+        call_index: int = 0,
+    ) -> None:
+        super().__init__()
+        self.execution_id = execution_id
+        self.ac_id = ac_id
+        self.tool_name = tool_name
+        self.tool_detail = tool_detail
+        self.tool_input = tool_input or {}
+        self.call_index = call_index
+
+
+class ToolCallCompleted(Message):
+    """Tool call completed during AC execution."""
+
+    def __init__(
+        self,
+        execution_id: str,
+        ac_id: str,
+        tool_name: str,
+        tool_detail: str,
+        call_index: int = 0,
+        duration_seconds: float = 0.0,
+        success: bool = True,
+    ) -> None:
+        super().__init__()
+        self.execution_id = execution_id
+        self.ac_id = ac_id
+        self.tool_name = tool_name
+        self.tool_detail = tool_detail
+        self.call_index = call_index
+        self.duration_seconds = duration_seconds
+        self.success = success
+
+
+class AgentThinkingUpdated(Message):
+    """Agent thinking/reasoning text updated."""
+
+    def __init__(
+        self,
+        execution_id: str,
+        ac_id: str,
+        thinking_text: str,
+    ) -> None:
+        super().__init__()
+        self.execution_id = execution_id
+        self.ac_id = ac_id
+        self.thinking_text = thinking_text
+
+
+class ACModelRouted(Message):
+    """Per-AC model-tier routing telemetry (frugality proof's routing axis).
+
+    Emitted from ``execution.ac.model_routed``: records which model tier ran a
+    unit of work so the dashboard can show a per-AC tier badge. ``node_id`` is the
+    stable per-worker identity when present; ``ac_index`` is the fallback join key.
+    """
+
+    def __init__(
+        self,
+        node_id: str | None,
+        ac_index: int,
+        model_tier: str | None,
+        model: str | None,
+        model_mode: str,
+        retry_attempt: int,
+    ) -> None:
+        super().__init__()
+        self.node_id = node_id
+        self.ac_index = ac_index
+        self.model_tier = model_tier
+        self.model = model
+        self.model_mode = model_mode
+        self.retry_attempt = retry_attempt
+
+
+class ACTokenAttribution(Message):
+    """Per-AC runtime-measured token spend (frugality proof's token axis).
+
+    Emitted from ``execution.ac.token_attribution.reported``. ``token_spend`` is a
+    real runtime-usage measurement (never a character proxy); the dashboard folds
+    it per node and into the run total.
+    """
+
+    def __init__(
+        self,
+        node_id: str | None,
+        ac_index: int,
+        token_spend: float,
+        model_tier: str | None,
+    ) -> None:
+        super().__init__()
+        self.node_id = node_id
+        self.ac_index = ac_index
+        self.token_spend = token_spend
+        self.model_tier = model_tier
+
+
+class FrugalityProofEvaluated(Message):
+    """Run-end deterministic frugality-proof verdict.
+
+    Emitted once from ``execution.frugality_proof.evaluated``: a PASS/FAIL verdict
+    computed over a same-seed cohort with no model in the loop.
+    """
+
+    def __init__(
+        self,
+        status: str,
+        token_reduction_pct: float | None,
+        reason: str,
+    ) -> None:
+        super().__init__()
+        self.status = status
+        self.token_reduction_pct = token_reduction_pct
+        self.reason = reason
+
+
+class FrugalityRetrospectiveReported(Message):
+    """Neutral execution-finalized frugality evidence summary."""
+
+    def __init__(self, execution_id: str, summary: dict[str, Any]) -> None:
+        super().__init__()
+        self.execution_id = execution_id
+        self.summary = dict(summary)
+
+
+# =============================================================================
+# Event Subscription State
+# =============================================================================
+
+
+@dataclass
+class TUIState:
+    """Mutable state for TUI display.
+
+    Tracks current execution state for UI rendering.
+
+    Attributes:
+        execution_id: Current execution being monitored.
+        session_id: Current session ID.
+        status: Current execution status.
+        current_phase: Current Double Diamond phase.
+        iteration: Current iteration number.
+        goal_drift: Current goal drift score.
+        constraint_drift: Current constraint drift score.
+        ontology_drift: Current ontology drift score.
+        combined_drift: Current combined drift score.
+        total_tokens: Total tokens consumed.
+        total_cost_usd: Total cost in USD.
+        is_paused: Whether execution is paused.
+        ac_tree: Serialized AC tree data.
+        logs: Recent log messages.
+    """
+
+    execution_id: str = ""
+    session_id: str = ""
+    status: str = "idle"
+    current_phase: str = ""
+    iteration: int = 0
+    goal_drift: float = 0.0
+    constraint_drift: float = 0.0
+    ontology_drift: float = 0.0
+    combined_drift: float = 0.0
+    total_tokens: int = 0
+    total_cost_usd: float = 0.0
+    is_paused: bool = False
+    ac_tree: dict[str, Any] = field(default_factory=dict)
+    logs: list[dict[str, Any]] = field(default_factory=list)
+    max_logs: int = 100
+
+    # Provider identity, folded incrementally through the SHARED board derivation
+    # (``ouroboros.dashboard.board.fold_provider_event`` — the exact rules
+    # ``reduce_board`` applies for the web Kanban). ``provider_by_node`` maps
+    # node_id -> runtime_backend (codex_cli / claude / …) for per-worker sessions;
+    # the app's ``ProviderLedger`` wraps this dict and adds the run-level fallback
+    # when stamping tree nodes. ``board_providers`` is the run's provider legend.
+    provider_by_node: dict[str, str] = field(default_factory=dict)
+    board_providers: list[str] = field(default_factory=list)
+
+    # Frugality telemetry, folded from the per-AC routing/token events and the
+    # run-end proof. ``tier_by_node`` / ``model_by_node`` are latest-wins per node
+    # (node_id when present, else ``ac_<index>``); ``tokens_by_node`` accumulates
+    # per node and ``run_total_tokens`` sums the whole run. ``frugality_summary`` is
+    # the one-line run-end verdict, set once. Stamped onto tree nodes the same
+    # order-safe way providers are (``_apply_provider_tags``).
+    tier_by_node: dict[str, str] = field(default_factory=dict)
+    model_by_node: dict[str, str] = field(default_factory=dict)
+    tokens_by_node: dict[str, float] = field(default_factory=dict)
+    run_total_tokens: float = 0.0
+    frugality_summary: str | None = None
+    frugality_retrospective: dict[str, Any] | None = None
+    frugality_retrospective_summary: str | None = None
+
+    # P1: Tool/thinking tracking for dashboard
+    active_tools: dict[str, dict[str, str]] = field(default_factory=dict)
+    tool_history: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    thinking: dict[str, str] = field(default_factory=dict)
+
+    def add_log(
+        self,
+        level: str,
+        source: str,
+        message: str,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        """Add a log entry, maintaining max size.
+
+        Args:
+            level: Log level.
+            source: Source module.
+            message: Log message.
+            data: Additional data.
+        """
+        from datetime import UTC, datetime
+
+        entry = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "level": level,
+            "source": source,
+            "message": message,
+            "data": data or {},
+        }
+        self.logs.append(entry)
+
+        # Trim to max size
+        if len(self.logs) > self.max_logs:
+            self.logs = self.logs[-self.max_logs :]
+
+
+# =============================================================================
+# Event Store Subscription Handler
+# =============================================================================
+
+
+def _coerce_event_int(value: object) -> int | None:
+    """Return event integer metadata while rejecting bools."""
+    return value if type(value) is int else None
+
+
+def _coerce_finite_spend(value: object, *, reject_negative: bool = False) -> float | None:
+    """A finite, non-bool numeric value, else None (omit — never render NaN).
+
+    Mirrors ``dashboard.board._coerce_spend`` so a malformed telemetry payload
+    (non-numeric, NaN, ±Inf, or an int too large to convert to float) is dropped
+    the same way in the TUI as in the shared web board. ``reject_negative`` is
+    used for ``token_spend`` (a cumulative counter) but not for
+    ``token_reduction_pct`` (a signed delta where negative legitimately means
+    spend increased).
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        spend = float(value)
+    except (OverflowError, ValueError):  # e.g. int too large to convert to float
+        return None
+    if spend != spend or spend in (float("inf"), float("-inf")):  # NaN / inf guard
+        return None
+    if reject_negative and spend < 0:
+        return None
+    return spend
+
+
+def _subtask_root_ac_index(data: dict[str, Any]) -> int:
+    """Return the 1-based top-level AC index for subtask dashboard grouping."""
+    root_ac_number = _coerce_event_int(data.get("root_ac_number"))
+    if root_ac_number is not None and root_ac_number > 0:
+        return root_ac_number
+
+    root_ac_index = _coerce_event_int(data.get("root_ac_index"))
+    if root_ac_index is not None and root_ac_index >= 0:
+        return root_ac_index + 1
+
+    legacy_ac_index = _coerce_event_int(data.get("legacy_ac_index"))
+    ac_index = _coerce_event_int(data.get("ac_index"))
+    return ac_index if ac_index is not None else legacy_ac_index or 0
+
+
+def _resolve_tool_completion_success(data: dict[str, Any]) -> bool:
+    """Resolve tool-completion success without laundering a reported failure.
+
+    No producer sets ``success`` on ``execution.tool.completed``:
+    ``ExecutionEventEmitter.emit_atomic_tool_completed`` builds its payload from
+    the runtime identity plus ``serialize_runtime_message_metadata`` output, and
+    neither contributes that key. A plain ``data.get("success", True)`` therefore
+    rendered every failed tool as succeeded — a Codex command exiting 1 arrives
+    carrying ``is_error=True`` and was still displayed as a success.
+
+    ``is_error`` is the authoritative verdict channel, and a malformed claim is
+    treated as failure rather than silently ignored, matching the fail-closed
+    contract the runtime adapters use.
+
+    Both the top-level and the nested envelopes are supported. ``is_error`` is
+    lifted to the top level only when the message itself carries that key, while
+    ``project_runtime_message`` separately persists the normalized ``tool_result``
+    payload — so an adapter that reports failure only inside ``tool_result``
+    (OpenCode does) has no top-level verdict and would otherwise render green.
+
+    A completion carrying no verdict in either envelope stays optimistic: there
+    is no signal to fail closed on, and flipping every signal-less runtime to a
+    failed display would be a louder wrong answer than the one being fixed.
+    """
+    raw_success = data.get("success")
+    if isinstance(raw_success, bool):
+        return raw_success
+
+    tool_result = data.get("tool_result")
+    envelopes: list[dict[str, Any]] = [data]
+    if isinstance(tool_result, dict):
+        envelopes.append(tool_result)
+
+    for envelope in envelopes:
+        if envelope.get("is_error_invalid") is True:
+            return False
+
+        if "is_error" not in envelope:
+            continue
+
+        is_error = envelope.get("is_error")
+        if isinstance(is_error, bool):
+            return not is_error
+
+        # A malformed verdict is a claim that could not be validated, so it is
+        # failure rather than an absent signal.
+        return False
+
+    return True
+
+
+def create_message_from_event(event: BaseEvent) -> Message | None:
+    """Convert an EventStore event to a TUI message.
+
+    Args:
+        event: The BaseEvent from EventStore.
+
+    Returns:
+        Corresponding TUI Message, or None if event type not handled.
+    """
+    event_type = event.type
+    data = event.data
+
+    if event_type == "orchestrator.session.started":
+        return ExecutionUpdated(
+            execution_id=data.get("execution_id", ""),
+            session_id=event.aggregate_id,
+            status="running",
+            data=data,
+        )
+
+    elif event_type == "orchestrator.session.completed":
+        return ExecutionUpdated(
+            execution_id=data.get("execution_id", event.aggregate_id),
+            session_id=event.aggregate_id,
+            status="completed",
+            data=data,
+        )
+
+    elif event_type == "orchestrator.session.failed":
+        return ExecutionUpdated(
+            execution_id=data.get("execution_id", event.aggregate_id),
+            session_id=event.aggregate_id,
+            status="failed",
+            data=data,
+        )
+
+    elif event_type == "orchestrator.session.paused":
+        return ExecutionUpdated(
+            execution_id=data.get("execution_id", event.aggregate_id),
+            session_id=event.aggregate_id,
+            status="paused",
+            data=data,
+        )
+
+    elif event_type == "orchestrator.session.cancelled":
+        return ExecutionUpdated(
+            execution_id=data.get("execution_id", event.aggregate_id),
+            session_id=event.aggregate_id,
+            status="cancelled",
+            data=data,
+        )
+
+    elif event_type == "execution.terminal":
+        return ExecutionUpdated(
+            execution_id=event.aggregate_id,
+            session_id=data.get("session_id", ""),
+            status=data.get("status", "completed"),
+            data=data,
+        )
+
+    elif event_type == "execution.phase.completed":
+        return PhaseChanged(
+            execution_id=event.aggregate_id,
+            previous_phase=data.get("previous_phase"),
+            current_phase=data.get("phase", ""),
+            iteration=data.get("iteration", 0),
+        )
+
+    elif event_type == "observability.drift.measured":
+        return DriftUpdated(
+            execution_id=event.aggregate_id,
+            goal_drift=data.get("goal_drift", 0.0),
+            constraint_drift=data.get("constraint_drift", 0.0),
+            ontology_drift=data.get("ontology_drift", 0.0),
+            combined_drift=data.get("combined_drift", 0.0),
+            is_acceptable=data.get("is_acceptable", True),
+        )
+
+    elif event_type == "observability.cost.updated":
+        return CostUpdated(
+            execution_id=event.aggregate_id,
+            total_tokens=data.get("total_tokens", 0),
+            total_cost_usd=data.get("total_cost_usd", 0.0),
+            tokens_this_phase=data.get("tokens_this_phase", 0),
+        )
+
+    elif event_type.startswith("decomposition.ac.") or event_type in {
+        "ac.decomposition.completed",
+        "ac.marked_atomic",
+    }:
+        status = "pending"
+        if event_type in {"ac.decomposition.completed", "decomposition.ac.completed"}:
+            status = "decomposed"
+        elif "started" in event_type:
+            status = "executing"
+        elif event_type in {"ac.marked_atomic", "decomposition.ac.marked_atomic"}:
+            status = "atomic"
+
+        return ACUpdated(
+            execution_id=data.get("execution_id", event.aggregate_id),
+            ac_id=data.get("ac_id", event.aggregate_id),
+            status=status,
+            depth=data.get("depth", 0),
+            is_atomic=data.get("is_atomic", False),
+            parallel_level=data.get("parallel_level"),
+        )
+
+    elif event_type == "execution.decomposition.level_started":
+        # Parallel batch started
+        return ParallelBatchStarted(
+            execution_id=event.aggregate_id,
+            batch_index=data.get("level", 0),
+            ac_ids=data.get("child_indices", []),
+            total_batches=data.get("total_levels", 1),
+        )
+
+    elif event_type == "execution.decomposition.level_completed":
+        # Parallel batch completed
+        return ParallelBatchCompleted(
+            execution_id=event.aggregate_id,
+            batch_index=data.get("level", 0),
+            successful_count=data.get("successful", 0),
+            failed_count=data.get("total", 0) - data.get("successful", 0),
+            total_in_batch=data.get("total", 0),
+        )
+
+    elif event_type == "workflow.progress.updated":
+        return WorkflowProgressUpdated(
+            execution_id=data.get("execution_id", event.aggregate_id),
+            acceptance_criteria=data.get("acceptance_criteria", []),
+            completed_count=data.get("completed_count", 0),
+            total_count=data.get("total_count", 0),
+            current_ac_index=data.get("current_ac_index"),
+            current_phase=data.get("current_phase", "Discover"),
+            activity=data.get("activity", "idle"),
+            activity_detail=data.get("activity_detail", ""),
+            estimated_remaining=data.get("estimated_remaining", ""),
+            elapsed_display=data.get("elapsed_display", ""),
+            messages_count=data.get("messages_count", 0),
+            tool_calls_count=data.get("tool_calls_count", 0),
+            estimated_tokens=data.get("estimated_tokens", 0),
+            estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
+            last_update=data.get("last_update"),
+        )
+
+    elif event_type in {
+        "execution.subtask.updated",
+        "execution.node.created",
+        "execution.node.updated",
+    }:
+        return SubtaskUpdated(
+            execution_id=event.aggregate_id,
+            ac_index=_subtask_root_ac_index(data),
+            sub_task_index=data.get("sub_task_index", data.get("legacy_sub_task_index", 0)),
+            sub_task_id=data.get("sub_task_id", data.get("legacy_sub_task_id", "")),
+            content=data.get("content") or data.get("label", ""),
+            status=data.get("status", "pending"),
+            current_tool_activity=data.get("current_tool_activity"),
+            last_update=data.get("last_update"),
+            node_id=data.get("node_id") if isinstance(data.get("node_id"), str) else None,
+            parent_node_id=data.get("parent_node_id")
+            if isinstance(data.get("parent_node_id"), str)
+            else None,
+            path=data.get("path") if isinstance(data.get("path"), list) else None,
+            display_path=data.get("display_path")
+            if isinstance(data.get("display_path"), str)
+            else None,
+            depth=data.get("depth") if isinstance(data.get("depth"), int) else None,
+            ordinal=data.get("ordinal") if isinstance(data.get("ordinal"), int) else None,
+            root_ac_index=data.get("root_ac_index")
+            if isinstance(data.get("root_ac_index"), int)
+            else None,
+            root_ac_number=data.get("root_ac_number")
+            if isinstance(data.get("root_ac_number"), int)
+            else None,
+            identity_model=data.get("identity_model")
+            if isinstance(data.get("identity_model"), str)
+            else None,
+            legacy_parent_node_id=data.get("legacy_parent_node_id")
+            if isinstance(data.get("legacy_parent_node_id"), str)
+            else None,
+            legacy_parent_node_aliases=data.get("legacy_parent_node_aliases")
+            if isinstance(data.get("legacy_parent_node_aliases"), list)
+            else None,
+        )
+
+    elif event_type == "execution.tool.started":
+        return ToolCallStarted(
+            execution_id=event.aggregate_id,
+            ac_id=data.get("ac_id", ""),
+            tool_name=data.get("tool_name", ""),
+            tool_detail=data.get("tool_detail", ""),
+            tool_input=data.get("tool_input"),
+            call_index=data.get("call_index", 0),
+        )
+
+    elif event_type == "execution.tool.completed":
+        return ToolCallCompleted(
+            execution_id=event.aggregate_id,
+            ac_id=data.get("ac_id", ""),
+            tool_name=data.get("tool_name", ""),
+            tool_detail=data.get("tool_detail", ""),
+            call_index=data.get("call_index", 0),
+            duration_seconds=data.get("duration_seconds", 0.0),
+            success=_resolve_tool_completion_success(data),
+        )
+
+    elif event_type == "execution.agent.thinking":
+        return AgentThinkingUpdated(
+            execution_id=event.aggregate_id,
+            ac_id=data.get("ac_id", ""),
+            thinking_text=data.get("thinking_text", ""),
+        )
+
+    elif event_type == "execution.ac.model_routed":
+        node_id = data.get("node_id") if isinstance(data.get("node_id"), str) else None
+        ac_index = data.get("ac_index")
+        ac_index = ac_index if type(ac_index) is int else -1
+        if node_id is None and ac_index < 0:
+            # No usable join key — drop rather than stamp the wrong node.
+            return None
+        return ACModelRouted(
+            node_id=node_id,
+            ac_index=ac_index,
+            model_tier=data.get("model_tier") if isinstance(data.get("model_tier"), str) else None,
+            model=data.get("model") if isinstance(data.get("model"), str) else None,
+            model_mode=data.get("model_mode") if isinstance(data.get("model_mode"), str) else "",
+            retry_attempt=_coerce_event_int(data.get("retry_attempt")) or 0,
+        )
+
+    elif event_type == "execution.ac.token_attribution.reported":
+        # reject_negative=True: a malformed payload never produces a message (it
+        # can no longer poison the run total downstream, where negatives were
+        # previously dropped only after the fact).
+        spend = _coerce_finite_spend(data.get("token_spend"), reject_negative=True)
+        if spend is None:
+            return None
+        node_id = data.get("node_id") if isinstance(data.get("node_id"), str) else None
+        ac_index = data.get("ac_index")
+        ac_index = ac_index if type(ac_index) is int else -1
+        return ACTokenAttribution(
+            node_id=node_id,
+            ac_index=ac_index,
+            token_spend=spend,
+            model_tier=data.get("model_tier") if isinstance(data.get("model_tier"), str) else None,
+        )
+
+    elif event_type == "execution.frugality_proof.evaluated":
+        status = data.get("status")
+        if not isinstance(status, str) or not status:
+            return None
+        return FrugalityProofEvaluated(
+            status=status,
+            # reject_negative=False: a negative pct legitimately means spend increased.
+            token_reduction_pct=_coerce_finite_spend(data.get("token_reduction_pct")),
+            reason=data.get("reason") if isinstance(data.get("reason"), str) else "",
+        )
+
+    elif event_type == "execution.frugality_retrospective.reported":
+        summary = project_frugality_retrospective(data)
+        if summary is None:
+            return None
+        execution_id = data.get("execution_id")
+        return FrugalityRetrospectiveReported(
+            execution_id=(
+                execution_id
+                if isinstance(execution_id, str) and execution_id
+                else event.aggregate_id
+            ),
+            summary=summary,
+        )
+
+    # Return None for unhandled event types
+    return None
+
+
+_FRUGALITY_STATUS_LABELS = {
+    "pass": "frugal",
+    "fail_grounding_regression": "grounding regressed",
+    "fail_no_frugality": "no savings",
+    "insufficient_sample": "insufficient sample",
+    "insufficient_data": "insufficient data",
+}
+
+
+def format_frugality_summary(
+    status: str,
+    token_reduction_pct: float | None,
+) -> str:
+    """Return a one-line frugality-proof verdict for run-end display.
+
+    Shared by the app (folds it into ``TUIState.frugality_summary``) and the
+    dashboard bar so the two never phrase the same verdict differently. The ``⚖``
+    glyph doubles as a dedup marker when appended to an existing progress line.
+    """
+    label = _FRUGALITY_STATUS_LABELS.get(status, status or "unknown")
+    if (
+        status == "pass"
+        and isinstance(token_reduction_pct, (int, float))
+        and not isinstance(token_reduction_pct, bool)
+    ):
+        return f"⚖ {label} −{float(token_reduction_pct):.0f}% tok"
+    return f"⚖ {label}"
+
+
+def _format_evidence_tokens(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "0 tok"
+    tokens = float(value)
+    if tokens >= 1000:
+        return f"{tokens / 1000:.1f}".rstrip("0").rstrip(".") + "k tok"
+    return f"{tokens:.0f} tok"
+
+
+def format_frugality_retrospective_summary(summary: dict[str, Any]) -> str:
+    """Return one neutral evidence line for the execution-finalized report."""
+    parts: list[str] = []
+    if summary.get("retry_associated_attempts"):
+        parts.append(
+            "retry-associated " + _format_evidence_tokens(summary.get("retry_associated_tokens"))
+        )
+    if summary.get("unaccepted_attempts"):
+        parts.append("unaccepted " + _format_evidence_tokens(summary.get("unaccepted_tokens")))
+    parts.append(
+        "coverage "
+        f"{summary.get('measured_attempts', 0)} measured/"
+        f"{summary.get('unknown_attempts', 0)} unknown/"
+        f"{summary.get('invalid_attempts', 0)} invalid"
+    )
+    return "Evidence: " + " | ".join(parts)
+
+
+__all__ = [
+    "ACModelRouted",
+    "ACTokenAttribution",
+    "ACUpdated",
+    "AgentThinkingUpdated",
+    "CostUpdated",
+    "DriftUpdated",
+    "ExecutionUpdated",
+    "FrugalityProofEvaluated",
+    "FrugalityRetrospectiveReported",
+    "GenerationSelected",
+    "LineageSelected",
+    "LogMessage",
+    "ParallelBatchCompleted",
+    "ParallelBatchStarted",
+    "PauseRequested",
+    "PhaseChanged",
+    "ResumeRequested",
+    "SubtaskUpdated",
+    "TUIState",
+    "ToolCallCompleted",
+    "ToolCallStarted",
+    "WorkflowProgressUpdated",
+    "create_message_from_event",
+    "format_frugality_retrospective_summary",
+    "format_frugality_summary",
+]

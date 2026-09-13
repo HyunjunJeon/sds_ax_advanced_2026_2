@@ -1,0 +1,376 @@
+/** Telegram transport and presentation helpers shared by the managed provider adapter. */
+
+import * as crypto from "node:crypto";
+import {
+	bold,
+	buildCompactChoiceGrid,
+	escapeHtml,
+	numberedOptionList,
+	renumberableOptionText,
+	splitTelegramHtml,
+	TELEGRAM_PARSE_MODE,
+} from "./html-format";
+
+/** One inline-keyboard button. */
+export interface InlineButton {
+	text: string;
+	callback_data: string;
+}
+
+/** Typed action controls are protocol data, never inferred from option labels. */
+export interface TelegramActionControl {
+	id: "navigation_forward";
+	kind: "navigation";
+	label: "Next" | "Done";
+	enabled: boolean;
+}
+
+export type TelegramCallbackAnswer = number | string | { controlId: TelegramActionControl["id"] };
+
+/** A rendered Telegram message for an `action_needed`. */
+export interface RenderedMessage {
+	text: string;
+	inline_keyboard?: InlineButton[][];
+}
+
+type TelegramSend = (method: string, body: unknown) => Promise<Response>;
+
+/** Encode `actionId` + option `index` into Telegram callback_data (<=64 bytes). */
+export function encodeCallbackData(actionId: string, index: number): string {
+	return `r:${index}:${actionId}`.slice(0, 64);
+}
+
+/** Decode callback_data produced by {@link encodeCallbackData}. */
+export function decodeCallbackData(data: string): { id: string; index: number } | null {
+	const m = /^r:(\d+):(.+)$/.exec(data);
+	if (!m) return null;
+	return { index: Number(m[1]), id: m[2]! };
+}
+
+/** Encode a typed control independently from option labels. */
+export function encodeControlCallbackData(actionId: string, controlId: TelegramActionControl["id"]): string {
+	const encoded = `c:${controlId === "navigation_forward" ? "n" : controlId}:${actionId}`;
+	if (Buffer.byteLength(encoded, "utf8") > 64) throw new Error("control callback data exceeded Telegram limit");
+	return encoded;
+}
+
+export function decodeControlCallbackData(data: string): { id: string; controlId: TelegramActionControl["id"] } | null {
+	const match = /^c:n:(.+)$/.exec(data);
+	return match ? { controlId: "navigation_forward", id: match[1]! } : null;
+}
+
+export interface CallbackRoute {
+	sessionId: string;
+	actionId: string;
+	answer: TelegramCallbackAnswer;
+	/** Durable audit metadata only; never sufficient to route a callback after restart. */
+	chatId?: string;
+	messageId?: number;
+	ownerId?: string;
+	generation?: number;
+}
+
+export interface SerializedAliasTable {
+	version: 1 | 2;
+	next: number;
+	routes: Record<string, CallbackRoute>;
+}
+
+export interface AliasTable {
+	allocate(isReserved?: (alias: string) => boolean): string;
+	activate(alias: string, route: CallbackRoute): boolean;
+	put(route: CallbackRoute): string;
+	get(alias: string): CallbackRoute | undefined;
+	update(alias: string, patch: Partial<CallbackRoute>): boolean;
+	delete(alias: string): boolean;
+	clear(): void;
+	serialize(): SerializedAliasTable;
+	load(json: unknown): void;
+	entries(): Array<[string, CallbackRoute]>;
+}
+
+function isCallbackRoute(value: unknown): value is CallbackRoute {
+	if (!value || typeof value !== "object") return false;
+	const route = value as Partial<CallbackRoute>;
+	return (
+		typeof route.sessionId === "string" &&
+		typeof route.actionId === "string" &&
+		(typeof route.answer === "string" ||
+			typeof route.answer === "number" ||
+			(typeof route.answer === "object" &&
+				route.answer !== null &&
+				(route.answer as { controlId?: unknown }).controlId === "navigation_forward")) &&
+		(route.chatId === undefined || typeof route.chatId === "string") &&
+		(route.messageId === undefined || (Number.isSafeInteger(route.messageId) && route.messageId > 0)) &&
+		(route.ownerId === undefined || typeof route.ownerId === "string") &&
+		(route.generation === undefined || (Number.isSafeInteger(route.generation) && route.generation >= 0))
+	);
+}
+
+/** Create a compact, durable callback alias table. Serialized data contains routing ids only. */
+export function createAliasTable(): AliasTable {
+	let next = 1;
+	const routes = new Map<string, CallbackRoute>();
+	return {
+		allocate(isReserved) {
+			let alias: string;
+			do {
+				// `b1_` is intentionally disjoint from every legacy sequential `aN`
+				// token, including accepted keyboards lost before their old daemon
+				// could persist them.
+				alias = `b1_${crypto.randomBytes(18).toString("base64url")}`;
+			} while (routes.has(alias) || isReserved?.(alias) === true);
+			next++;
+			if (Buffer.byteLength(alias, "utf8") > 64) throw new Error("callback alias exceeded Telegram limit");
+			return alias;
+		},
+		activate(alias, route) {
+			if (routes.has(alias) || Buffer.byteLength(alias, "utf8") > 64 || !isCallbackRoute(route)) return false;
+			routes.set(alias, { ...route });
+			return true;
+		},
+		put(route) {
+			const alias = this.allocate();
+			if (!this.activate(alias, route)) throw new Error("callback alias activation failed");
+			return alias;
+		},
+		get(alias) {
+			const route = routes.get(alias);
+			return route ? { ...route } : undefined;
+		},
+		update(alias, patch) {
+			const route = routes.get(alias);
+			if (!route) return false;
+			routes.set(alias, { ...route, ...patch });
+			return true;
+		},
+		delete(alias) {
+			return routes.delete(alias);
+		},
+		clear() {
+			routes.clear();
+		},
+		serialize() {
+			return { version: 2, next, routes: Object.fromEntries(routes.entries()) };
+		},
+		load(json) {
+			routes.clear();
+			const data = typeof json === "string" ? JSON.parse(json) : json;
+			if (!data || typeof data !== "object") return;
+			const obj = data as { next?: unknown; routes?: unknown };
+			if (typeof obj.next === "number" && Number.isFinite(obj.next) && obj.next > 0) next = Math.floor(obj.next);
+			if (!obj.routes || typeof obj.routes !== "object" || Array.isArray(obj.routes)) return;
+			for (const [alias, route] of Object.entries(obj.routes)) {
+				if (Buffer.byteLength(alias, "utf8") <= 64 && isCallbackRoute(route)) routes.set(alias, { ...route });
+			}
+		},
+		entries() {
+			return Array.from(routes.entries()).map(([alias, route]) => [alias, { ...route }]);
+		},
+	};
+}
+/** Copy labels for display and annotate one valid recommended option only. */
+function withRecommendedOptionLabel(options: readonly string[], recommendedIndex: unknown): string[] {
+	if (
+		typeof recommendedIndex !== "number" ||
+		!Number.isFinite(recommendedIndex) ||
+		!Number.isInteger(recommendedIndex) ||
+		recommendedIndex < 0 ||
+		recommendedIndex >= options.length
+	)
+		return [...options];
+	return options.map((label, index) => (index === recommendedIndex ? `${label} (Recommended)` : label));
+}
+
+/**
+ * Render an `action_needed` payload into a Telegram message.
+ *
+ * `sessionTag` is the short per-session display tag appended to idle markers.
+ * It identifies the session only where the delivery container carries no
+ * identity of its own (the flat private-chat fallback); thread/topic delivery
+ * passes undefined so #981's identity-once contract stays intact.
+ */
+export function buildActionMessage(action: {
+	kind: "ask" | "idle";
+	id: string;
+	question?: string;
+	options?: string[];
+	recommendedIndex?: unknown;
+	controls?: readonly TelegramActionControl[];
+	summary?: string;
+	sessionTag?: string;
+}): RenderedMessage {
+	if (action.kind === "idle") {
+		const heading = action.sessionTag ? `🟢 Agent idle · ${escapeHtml(action.sessionTag)}` : "🟢 Agent idle";
+		const text = action.summary ? `${heading}\n${escapeHtml(action.summary)}` : heading;
+		return { text };
+	}
+	const text = `❓ ${bold(action.question ?? "Question")}`;
+	const options = action.options ?? [];
+	const displayOptions = withRecommendedOptionLabel(options, action.recommendedIndex);
+	const controls = (action.controls ?? []).filter(control => control.enabled);
+	if (options.length === 0 && controls.length === 0) return { text: `${text}\n\n(reply with text)` };
+	const body = options.length ? `${text}\n\n${numberedOptionList(displayOptions)}` : text;
+	const inline_keyboard = [
+		...(options.length ? buildCompactChoiceGrid(options, i => encodeCallbackData(action.id, i)) : []),
+		...controls.map(control => [
+			{ text: control.label, callback_data: encodeControlCallbackData(action.id, control.id) },
+		]),
+	];
+	return { text: body, inline_keyboard };
+}
+
+/** Render an `action_needed` body as raw markdown (rich-message source; the HTML fallback stays on buildActionMessage). */
+export function buildActionMarkdown(action: {
+	kind: "ask" | "idle";
+	question?: string;
+	options?: string[];
+	recommendedIndex?: unknown;
+	summary?: string;
+	sessionTag?: string;
+}): string {
+	if (action.kind === "idle") {
+		const heading = action.sessionTag ? `🟢 Agent idle · ${action.sessionTag}` : "🟢 Agent idle";
+		return action.summary ? `${heading}\n${action.summary}` : heading;
+	}
+	const question = (action.question ?? "Question")
+		.split(/\r\n|\r|\n/)
+		.map(line => line.trimEnd())
+		.map(line => (line ? `**${line}**` : ""))
+		.join("  \n");
+	const heading = `❓ ${question}`;
+	const options = action.options ?? [];
+	const displayOptions = withRecommendedOptionLabel(options, action.recommendedIndex);
+	if (options.length === 0) return `${heading}\n\n(reply with text)`;
+	const list = displayOptions.map((label, i) => `${i + 1}. ${renumberableOptionText(label)}`).join("\n");
+	return `${heading}\n\n${list}`;
+}
+
+export type TelegramNotificationSound = "all" | "important" | "none";
+
+export type TelegramDeliveryLane = "ask" | "idle" | "live" | "finalized";
+
+/**
+ * Resolve Telegram's optional silent-delivery flag. `finalChunk` silences
+ * non-final actionable chunks under the `important` policy; `undefined`
+ * intentionally omits the field so Telegram uses its normal audible delivery
+ * behavior.
+ */
+export function telegramDisableNotification(
+	sound: TelegramNotificationSound | undefined,
+	lane: TelegramDeliveryLane,
+	finalChunk = true,
+): true | undefined {
+	if (sound === "none") return true;
+	if (sound !== "important") return undefined;
+	return (lane === "ask" || lane === "idle") && finalChunk ? undefined : true;
+}
+
+/** Send Telegram HTML text chunks sequentially so long messages preserve order. */
+export async function sendTelegramHtmlChunks(
+	send: TelegramSend,
+	chatId: string,
+	text: string,
+	inlineKeyboard?: InlineButton[][],
+	sound?: TelegramNotificationSound,
+	lane: TelegramDeliveryLane = "ask",
+): Promise<void> {
+	const chunks = splitTelegramHtml(text);
+	for (let i = 0; i < chunks.length; i++) {
+		const disableNotification = telegramDisableNotification(sound, lane, i === chunks.length - 1);
+		await send("sendMessage", {
+			chat_id: chatId,
+			text: chunks[i]!,
+			parse_mode: TELEGRAM_PARSE_MODE,
+			...(disableNotification === true ? { disable_notification: true } : {}),
+			...(i === chunks.length - 1 && inlineKeyboard ? { reply_markup: { inline_keyboard: inlineKeyboard } } : {}),
+		});
+	}
+}
+
+/** A protocol `reply` frame the client should send to the server. */
+export interface ReplyFrame {
+	type: "reply";
+	id: string;
+	answer: TelegramCallbackAnswer;
+	token: string;
+}
+
+/**
+ * Map a Telegram update into a reply frame, given the most recent pending ask id
+ * (for free-text replies). Returns `null` when the update is not actionable.
+ */
+export function telegramUpdateToReply(
+	update: unknown,
+	token: string,
+	latestPendingAskId: string | undefined,
+): ReplyFrame | null {
+	const u = update as { callback_query?: { data?: string }; message?: { text?: string } };
+	if (u.callback_query?.data) {
+		const decoded = decodeCallbackData(u.callback_query.data);
+		if (decoded) return { type: "reply", id: decoded.id, answer: decoded.index, token };
+		const control = decodeControlCallbackData(u.callback_query.data);
+		if (control) return { type: "reply", id: control.id, answer: { controlId: control.controlId }, token };
+	}
+	if (u.message?.text && latestPendingAskId)
+		return { type: "reply", id: latestPendingAskId, answer: u.message.text, token };
+	return null;
+}
+
+export type RouteDecision =
+	| ({ kind: "reply" } & CallbackRoute)
+	| { kind: "stale"; reason: string }
+	| { kind: "ignore" };
+
+export interface RouteInboundContext {
+	aliasTable: Pick<AliasTable, "get">;
+	messageRoutes: Map<string | number, CallbackRoute | Omit<CallbackRoute, "answer">>;
+	pairedChatId: string;
+}
+
+type TelegramUpdateShape = {
+	callback_query?: {
+		id?: unknown;
+		data?: unknown;
+		message?: { chat?: { id?: unknown }; message_id?: unknown };
+	};
+	message?: {
+		text?: unknown;
+		chat?: { id?: unknown };
+		message_id?: unknown;
+		reply_to_message?: { message_id?: unknown };
+	};
+};
+
+function updateChatId(update: TelegramUpdateShape): string | undefined {
+	const id = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
+	return id === undefined || id === null ? undefined : String(id);
+}
+
+function routeWithAnswer(
+	route: CallbackRoute | Omit<CallbackRoute, "answer">,
+	answer: TelegramCallbackAnswer,
+): CallbackRoute {
+	return { sessionId: route.sessionId, actionId: route.actionId, answer };
+}
+
+/** Route a Telegram update to a session/action without I/O. Fail closed under ambiguity. */
+export function routeInboundUpdate(update: unknown, ctx: RouteInboundContext): RouteDecision {
+	const u = update as TelegramUpdateShape;
+	if (updateChatId(u) !== String(ctx.pairedChatId)) return { kind: "ignore" };
+
+	const callbackData = u.callback_query?.data;
+	if (typeof callbackData === "string") {
+		const route = ctx.aliasTable.get(callbackData);
+		return route ? { kind: "reply", ...route } : { kind: "stale", reason: "unknown_alias" };
+	}
+
+	const text = typeof u.message?.text === "string" ? u.message.text : undefined;
+	const replyTo = u.message?.reply_to_message?.message_id;
+	if (replyTo !== undefined && text) {
+		const route = ctx.messageRoutes.get(String(replyTo)) ?? ctx.messageRoutes.get(Number(replyTo));
+		if (!route) return { kind: "stale", reason: "unknown_reply_message" };
+		return { kind: "reply", ...routeWithAnswer(route, text) };
+	}
+	return { kind: "ignore" };
+}

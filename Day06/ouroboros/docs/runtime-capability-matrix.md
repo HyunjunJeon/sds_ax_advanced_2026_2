@@ -1,0 +1,257 @@
+# Runtime Capability Matrix
+
+> **New here?** Start with the [Getting Started guide](getting-started.md) for install and onboarding.
+> This page is a **reference table** for comparing runtime backends.
+
+Ouroboros is a **specification-first workflow engine**. The core workflow model -- Seed files, acceptance criteria, evaluation principles, and exit conditions -- is identical regardless of which runtime backend executes it. The runtime backend determines *how* and *where* agent work happens, not *what* gets specified.
+
+> **Key insight:** Same core workflow, different UX surfaces.
+
+## Configuration
+
+The runtime backend is selected via the `orchestrator.runtime_backend` config key:
+
+```yaml
+orchestrator:
+  runtime_backend: claude   # SDK default on MCP 1.x; `claude_mcp` is the MCP 2 CLI worker
+                            # The runtime abstraction layer also accepts custom
+                            # adapters registered in runtime_factory.py
+```
+
+Or on the command line with `--runtime`:
+
+```bash
+ouroboros run workflow --runtime codex seed.yaml
+```
+
+You can also override the configured backend with the `OUROBOROS_AGENT_RUNTIME` environment variable.
+
+> **Extensibility:** Ouroboros uses a pluggable `AgentRuntime` protocol. Claude Code, Codex CLI, OpenCode, Hermes, Gemini CLI, Kiro CLI, GitHub Copilot CLI, Pi CLI, OMP (Oh My Pi, `omp`), GJC, Antigravity (`agy`), Grok Build (`grok`), and Zcode (`zcode`) are natively shipped backends. Antigravity and Grok are runtime-only; Zcode and OMP also support explicit LLM-completion selection with `llm.backend: zcode` / `llm.backend: omp`. Additional runtimes can be registered by implementing the protocol and extending `runtime_factory.py`. See [Architecture - How to add a new runtime adapter](architecture.md#how-to-add-a-new-runtime-adapter).
+
+## Capability Matrix
+
+> **Note — newer backends not yet threaded as columns:** The tables below
+> predate the newer runtime surfaces added more recently. Their per-capability
+> contract lives in the per-runtime guide rather than as a column here:
+> Antigravity (`agy`) → [runtime-guides/antigravity.md](runtime-guides/antigravity.md);
+> Grok (`grok`) → [runtime-guides/grok.md](runtime-guides/grok.md);
+> Zcode (`zcode`) → [runtime-guides/zcode.md](runtime-guides/zcode.md).
+
+### Workflow Layer (identical across runtimes)
+
+These capabilities are part of the Ouroboros core engine and work the same way regardless of runtime backend.
+
+| Capability                         | Claude Code | Codex CLI | OpenCode | Hermes | Gemini CLI | Kiro CLI | Copilot CLI | Pi CLI | OMP CLI | GJC | Notes                                                       |
+| ---------------------------------- | :---------: | :-------: | :------: | :----: | :--------: | :------: | :---------: | :----: | :-----: | :-: | ----------------------------------------------------------- |
+| Seed file parsing                  |     Yes     |    Yes    |   Yes    |  Yes   |    Yes     |   Yes    |     Yes     |  Yes   |  Yes   | Yes | Same YAML schema, same validation                           |
+| Acceptance criteria tree           |     Yes     |    Yes    |   Yes    |  Yes   |    Yes     |   Yes    |     Yes     |  Yes   |  Yes   | Yes | Structured AC decomposition                                 |
+| Evaluation principles              |     Yes     |    Yes    |   Yes    |  Yes   |    Yes     |   Yes    |     Yes     |  Yes   |  Yes   | Yes | Weighted scoring against principles                         |
+| Exit conditions                    |     Yes     |    Yes    |   Yes    |  Yes   |    Yes     |   Yes    |     Yes     |  Yes   |  Yes   | Yes | Deterministic termination logic                             |
+| Event sourcing (SQLite)            |     Yes     |    Yes    |   Yes    |  Yes   |    Yes     |   Yes    |     Yes     |  Yes   |  Yes   | Yes | Full event log, replay support                              |
+| Checkpoint / resume                |     Yes     |    Yes    |   Yes    |  Yes   |     No     | Partial  |     No      |  Yes   |  Yes   | No  | Native resume varies by backend: Claude/Codex/OpenCode/Hermes use `--resume <session_id>`; Gemini, Copilot CLI, and GJC do not expose native session-resume APIs in v1; Kiro forwards to `--resume-id` **when the caller supplies the id** — headless does not surface session ids, so automatic checkpoint/resume is future work; Pi resumes with its native `--session` flag; OMP resumes with its native `--resume` flag |
+| TUI dashboard                      |     Yes     |    Yes    |   Yes    |  Yes   |    Yes     |   Yes    |     Yes     |  Yes   |  Yes   | Yes | Textual-based progress view                                 |
+| Interview (Socratic seed creation) |     Yes     |    Yes    |   Yes    |  Yes   |    Yes     |   Yes    |     Yes     |  Yes   |  Yes   | Yes | `ouroboros init start ...` with the appropriate LLM backend |
+| Dry-run validation                 |     Yes     |    Yes    |   Yes    |  Yes   |    Yes     |   Yes    |     Yes     |  Yes   |  Yes   | Yes | `--dry-run` validates without executing                     |
+| Live model discovery               |     No      |    No     |    No    |   No   |     No     |    No    |     Yes     |   No   |   No    | No  | Only Copilot queries its provider's models API at setup time and lets you pick a default from the live list |
+
+### Runtime Layer (differs by backend)
+
+These capabilities depend on the runtime backend's native features and execution model.
+
+| Capability                |             Claude Code             |       Codex CLI       |                         OpenCode                          |                                   Hermes                                   |                  Gemini CLI                  |           Kiro CLI           |                                Copilot CLI                                |             Pi CLI              |            OMP CLI             |             GJC              | Notes                                                            |
+| ------------------------- | :---------------------------------: | :-------------------: | :-------------------------------------------------------: | :------------------------------------------------------------------------: | :------------------------------------------: | :--------------------------: | :-----------------------------------------------------------------------: | :-----------------------------: | :----------------------------: | :--------------------------: | ---------------------------------------------------------------- |
+| **Authentication**        |        Max Plan subscription        | Codex account sign-in or OpenAI API key |        Provider API keys (configured in OpenCode)         |        NousResearch (or compatible provider) API key or local model        | Google auth (`gemini auth` or `GOOGLE_API_KEY`) |      Kiro AWS sign-in        | GitHub Copilot subscription via `gh auth login`                           | Pi provider auth via `/login` or provider API key | OMP model/provider auth configured in OMP itself | GJC provider auth | No separate Ouroboros API key is needed for Claude Code, Kiro, Copilot, Pi CLI, OMP, or GJC; the selected runtime still needs its own provider credentials |
+| **Underlying model**      |         Claude (Anthropic)          | Codex-selected OpenAI model | Provider-dependent (OpenCode supports multiple providers) | Provider-dependent (Hermes supports multiple providers) or Any local model | Gemini-selected or `--model` value           | Claude (via AWS) + others    | Live-discovered (Claude, GPT-5, etc.; whatever your subscription grants)  | Pi-selected or `--model` value  | OMP-selected (smol/slow/plan roles) or `--model` value | GJC-selected or `set_model` override | Copilot is the only runtime with a live model picker             |
+| **Tool surface**          | Read, Write, Edit, Bash, Glob, Grep | Codex-native tool set |            Read, Write, Edit, Bash, Glob, Grep            |                      Custom skills via MCP + run cmd                       | Gemini-managed tool set                      |   Kiro-native tool set       | Read, Write, Edit, Bash, Glob, Grep (via `--available-tools` allowlist)   | Pi-native tool set              | OMP built-ins (`read`, `write`, `edit`, `bash`, `grep`, `glob`, `lsp`) plus `task`, `todo`, `web_search`, `eval`, `hub`, `mcp__*`; `glob` enumerates directories (no `ls` built-in) | GJC-native tool set          | Different tool implementations; same task outcomes               |
+| **Sandbox / permissions** |    Claude Code permission system    |  Codex sandbox model  |                OpenCode permission system                 |                          Hermes permission system                          | `--approval-mode auto_edit` / `yolo`         | `--trust-tools` / `--trust-all-tools` | `--add-dir <CWD>` boundary + `--allow-tool` envelope             | Pi CLI permission model         | OMP permission model (headless JSON mode exposes no approval switch) | GJC permission model         | Each runtime manages its own safety boundaries                   |
+| **Cost model**            |        Included in Max Plan         | Per-token API charges |              Depends on configured provider               |                            Depends on API/Local                            | Depends on Google account/API usage          |    Included in Kiro plan     | Included in Copilot subscription                                          | Depends on Pi account/provider  | Depends on OMP's configured model/provider | Depends on GJC account/provider | See [OpenAI pricing](https://openai.com/pricing) for Codex costs |
+| **Declared capabilities** | skill_dispatch, targeted_resume, structured_output | all three | all three | all three | skill_dispatch and structured_output; `targeted_resume=False` (no native resume API) | skill_dispatch only; `targeted_resume=False` (headless does not surface session ids), `structured_output=False` (plain-text stdio) | skill_dispatch only; `targeted_resume=False` (no resume API); `structured_output=False` (no `--output-schema`, JSON via prompt directive) | all three | all three | skill_dispatch, targeted_resume, structured_output via Coordinator MCP | Runtime-specific capability declarations are not interchangeable |
+
+### Parameter handling (negotiation)
+
+Beyond the feature flags above, `RuntimeCapabilities` declares how each runtime honors the
+execution **parameters** Ouroboros passes to `execute_task` — `system_prompt`, the `tools`
+allow-list, and `permission_mode`. Each is one of:
+
+- **`native`** — honored directly (e.g. a separate system-prompt field, a real tool allow-list).
+- **`translated`** — honored only through a lossy adaptation (the intent is partially preserved,
+  but not in the form supplied).
+- **`ignored`** — silently dropped.
+
+| Parameter       | Claude Code | Codex | Gemini | Goose | Copilot | OpenCode | Hermes | Pi | OMP | Kiro |
+| --------------- | :---------: | :---: | :-----: | :---: | :-----: | :------: | :----: | :-: | :-: | :--: |
+| `system_prompt` | native | translated | translated | translated | translated | translated | translated | native* | native | translated |
+| `permission_mode` | native | native | native | native | native | translated | translated | ignored | ignored | translated |
+| `tools` (allow-list) | native | translated | translated | translated | translated | translated | translated | native* | native | translated |
+| `reasoning_effort` | native | native | ignored | ignored | native | ignored | ignored | ignored | ignored | ignored |
+| `model` (per call) | native | native | ignored | ignored | ignored | ignored | ignored | ignored | native | ignored |
+
+> Most CLI runtimes compose the system prompt **into the user message** (e.g.
+> `## System Instructions\n...`) rather than passing a native system directive. Codex,
+> Gemini, Goose, Copilot, OpenCode, and Hermes also render requested tool
+> allow-lists only as prompt guidance, so `tools` is translated rather than a
+> native runtime allow-list when the list is non-empty. An explicit empty
+> allow-list (`tools=[]`) cannot be translated by those prompt-only composers
+> because no tool names are rendered; the orchestrator reports that no-tools
+> restriction as `ignored` for observability. Kiro maps `permission_mode` onto
+> coarse `--trust-*` flags. When full bypass is requested, `--trust-all-tools`
+> takes precedence and any simultaneous tool envelope remains prompt guidance.
+> OpenCode and Hermes translate full bypass onto
+> `--dangerously-skip-permissions` and `--yolo --accept-hooks`, respectively. Pi keeps the
+> requested mode in runtime metadata because its CLI does not expose an approval switch. OMP likewise keeps the requested mode in runtime metadata because its JSON mode exposes no approval switch, while its documented `--append-system-prompt` / `--tools` / `--no-tools` flags deliver `system_prompt` and `tools` natively with no capability probe.
+> \*Pi's native `--append-system-prompt` and `--tools` flags deliver these parameters
+> directly when the paired path is available. Independently probed `--no-tools`
+> is published separately as `empty_tool_restriction_support`: `native` when an
+> explicit empty allow-list can be enforced, `ignored` otherwise. This keeps
+> no-tools-only and incapable Pi binaries distinct in public negotiation and
+> durable execution-semantics fingerprints. A Pi binary without `--no-tools`
+> **fails closed** when `tools=[]` is requested — the runtime emits a
+> `ToolRestrictionUnenforced` error before process creation instead of silently
+> widening to unrestricted access.
+
+**Observability:** when a workflow supplies a parameter the active runtime does not honor
+natively, the orchestrator surfaces a one-time notice (console + a structured
+degradation log such as `coordinator.param_degraded`, `orchestrator.runner.param_degraded`,
+or `orchestrator.parallel_executor.param_degraded`) so the degradation is visible instead of
+silent. The shared announcer's fallback event is
+`orchestrator.runtime_params.param_degraded`. This is **informational only** — it does not
+change what is passed to the runtime.
+
+Per-AC investment decisions are separately observable. The executor emits
+`execution.ac.investment_assessed` for normalized difficulty/stakes authority,
+`execution.ac.effort_routed` for the enforced or advised effort result, and
+`execution.ac.model_routed` for model-tier resolution. A decomposed child cannot
+lower its model tier unless the routing call receives explicit trusted
+decomposition authorization. Current live decomposition supplies no such issuer,
+so live children stay at the base tier.
+
+### Integration Surface (UX differences)
+
+| Aspect                      | Claude Code                                   | Codex CLI                                                                                                                                                                                                                                                    | OpenCode                                           | Hermes                                           | Gemini CLI                                      | Kiro CLI                                                                                      | Copilot CLI                                                                                                                                                  | Pi CLI                                      | OMP CLI                                  | GJC                                      |
+| --------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------- | ------------------------------------------------ | ----------------------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------- | ---------------------------------------- | ---------------------------------------- |
+| **Primary UX**              | In-session skills; SDK runtime on MCP 1.x; isolated MCP 2 server uses CLI worker | Session-oriented Ouroboros runtime over Codex CLI transport                                                                                                                                                                                                  | MCP server integration                             | In-session skills and MCP server                 | Gemini CLI `stream-json` runtime                | In-session skills and MCP server (Kiro headless mode)                                         | In-session skills and MCP server (Copilot CLI session)                                                                                                       | Pi CLI JSON-mode runtime                    | OMP CLI JSON-mode runtime                | GJC Coordinator MCP / SDK runtime          |
+| **Skill shortcuts (`ooo`)** | Yes -- skills loaded into Claude Code session | Yes -- after `ouroboros setup --runtime codex` installs managed skills into `~/.codex/skills/`, rules into `~/.codex/rules/`, and the MCP/env hookup into `~/.codex/config.toml`. Keep role-specific Ouroboros model overrides in `~/.ouroboros/config.yaml` | Yes -- after `ouroboros setup --runtime opencode`  | Yes -- after `ouroboros setup --runtime hermes`  | Yes -- adapter-level `ooo <skill>` dispatch after `ouroboros setup --runtime gemini` writes config | Yes -- after `ouroboros setup --runtime kiro` the Ouroboros MCP server is registered in `~/.kiro/settings/mcp.json` with `OUROBOROS_RUNTIME=kiro` / `OUROBOROS_LLM_BACKEND=kiro` baked in | Yes -- after `ouroboros setup --runtime copilot` the MCP server is registered in `~/.copilot/mcp-config.json` with `OUROBOROS_AGENT_RUNTIME=copilot` / `OUROBOROS_LLM_BACKEND=copilot` baked in | Yes -- `SkillInterceptor` routes `ooo <skill>` prefixes before spawning Pi | Yes -- `SkillInterceptor` routes `ooo <skill>` prefixes before spawning OMP; setup also installs an OMP-side bridge extension | Yes -- `SkillInterceptor` routes `ooo <skill>` prefixes before spawning GJC; setup also installs a GJC-side bridge extension |
+| **MCP integration**         | Claude setup does not mutate host-owned MCP config; plugin MCP 2 launcher runs `[mcp]` separately with the `[claude-cli]` worker | Deterministic skill/MCP dispatch through the Ouroboros Codex adapter                                                                                                                                                                                         | Native MCP server support                          | Native MCP server support                        | Deterministic skill/MCP dispatch through the Ouroboros Gemini adapter | Native MCP server support; `SkillInterceptor` routes `ooo <skill>` prefixes before spawning Kiro subprocess | Native MCP server support; restart required after first registration so Copilot binds the new child         | Deterministic skill/MCP dispatch through the Ouroboros Pi adapter | Deterministic skill/MCP dispatch through the Ouroboros OMP adapter | Deterministic skill/MCP dispatch through the Ouroboros GJC adapter |
+| **Session context**         | Shares Claude Code session context            | Preserved via runtime handles, native session IDs, and resume support                                                                                                                                                                                        | Session IDs + resume via `--session`               | Preserved via session IDs and internal parser    | Stateless native CLI; checkpointing happens at the Ouroboros lineage layer | Headless runs do not surface session IDs; callers may pass an externally sourced `--resume-id`, but automatic targeted resume is not declared yet | Copilot CLI does not expose a session resume API; checkpointing happens at the Ouroboros lineage layer                                                       | Native Pi session IDs preserved through runtime handles | Native OMP session IDs preserved through runtime handles; resume via `--resume` | GJC SDK session IDs and pending-question bindings preserved through runtime handles |
+| **Install extras**          | `[claude]`/`[claude-sdk]` for SDK/MCP 1; plugin launcher uses isolated `[mcp]`/MCP 2 plus `[claude-cli]` worker | `ouroboros-ai` (base package) + `codex` on PATH                                                                                                                                                                                                              | `ouroboros-ai` (base package) + `opencode` on PATH | `ouroboros-ai` (base package) + `hermes` on PATH | `ouroboros-ai` (base package) + `gemini` on PATH | `ouroboros-ai[mcp]` + `kiro-cli` on PATH                                                         | `ouroboros-ai[mcp]` + `copilot` on PATH + `gh` on PATH (for live model discovery)                                                                            | `ouroboros-ai` (base package) + `pi` on PATH | `ouroboros-ai` (base package) + `omp` on PATH | `ouroboros-ai[mcp]` + `gjc` on PATH |
+
+## What Stays the Same
+
+Regardless of runtime backend, every Ouroboros workflow:
+
+1. **Starts from the same Seed file** -- YAML specification with goal, constraints, acceptance criteria, ontology, and evaluation principles.
+2. **Follows the same orchestration pipeline** -- the 6-phase pipeline (Big Bang → PAL Router → Double Diamond → Resilience → Evaluation → Secondary Loop) is runtime-agnostic. See [Architecture](architecture.md#the-six-phases) for the canonical phase definitions.
+3. **Produces the same event stream** -- all events are stored in the shared SQLite event store with identical schemas.
+4. **Evaluates against the same criteria** -- acceptance criteria and evaluation principles are applied uniformly.
+5. **Reports through the same interfaces** -- CLI output, TUI dashboard, and event logs work identically.
+
+## What Differs
+
+The runtime backend affects:
+
+- **Agent capabilities**: Each runtime has its own model, tool set, and reasoning characteristics. The same Seed file may produce different execution paths.
+- **Performance profile**: Token costs, latency, and throughput vary by provider and model.
+- **Permission model**: Sandbox behavior and file-system access rules are runtime-specific.
+- **Error surfaces**: Error messages and failure modes reflect the underlying runtime.
+
+> **No implied parity:** Each supported runtime is an independent product with its own strengths, limitations, and behavior. Ouroboros provides a unified workflow harness, but does not guarantee identical behavior or output quality across runtimes. This applies equally to any future or custom adapter implementations.
+
+## `ooo auto`: Authoring vs Run Handoff
+
+`ooo auto` runs four logical phases, but `--runtime <X>` only decides which
+backend handles the **run-handoff** phase. The three preceding *authoring*
+phases (interview, seed generation, seed repair) **always execute
+in-process** inside the Ouroboros MCP server in auto flow, regardless of
+runtime backend. Both auto entry points
+([`cli/commands/auto.py`](https://github.com/Q00/ouroboros/blob/main/src/ouroboros/cli/commands/auto.py)
+and [`mcp/tools/auto_handler.py`](https://github.com/Q00/ouroboros/blob/main/src/ouroboros/mcp/tools/auto_handler.py))
+demote a persisted `opencode_mode == "plugin"` to `subprocess` for the
+authoring handlers, because a `_subagent` envelope would have no receiver
+outside an active OpenCode bridge plugin session.
+
+| Phase                   | `claude` | `codex` | `opencode` | `hermes` | `gemini` | `kiro` | `copilot` | `pi` | `omp` | `gjc` |
+| ----------------------- | :------: | :-----: | :--------: | :------: | :------: | :----: | :-------: | :--: | :---: | :---: |
+| 1. Interview authoring  | in-process | in-process | in-process | in-process | in-process | in-process | in-process | in-process | in-process | in-process |
+| 2. Seed generation      | in-process | in-process | in-process | in-process | in-process | in-process | in-process | in-process | in-process | in-process |
+| 3. Seed repair          | in-process | in-process | in-process | in-process | in-process | in-process | in-process | in-process | in-process | in-process |
+| 4. Run handoff (Seed →) | claude adapter | codex adapter | opencode adapter (see entry-point note below) | hermes adapter | gemini adapter | kiro adapter | copilot adapter | pi adapter | omp adapter | gjc adapter |
+
+> **Run-handoff `opencode_mode` differs by entry point.** The CLI
+> entry point [`cli/commands/auto.py`](https://github.com/Q00/ouroboros/blob/main/src/ouroboros/cli/commands/auto.py)
+> demotes `opencode_mode == "plugin"` to `"subprocess"` for the
+> run-handoff handler too, because the standalone CLI process is not
+> running inside the OpenCode session that owns the bridge plugin.
+> The MCP entry point [`mcp/tools/auto_handler.py`](https://github.com/Q00/ouroboros/blob/main/src/ouroboros/mcp/tools/auto_handler.py)
+> only demotes the authoring handlers and keeps `"plugin"` for the
+> run-handoff handler, since it *is* invoked from inside the OpenCode
+> session. Authoring is in-process for both entry points.
+
+> **Common misconception:** `ooo auto --runtime codex` does **not** mean
+> "Codex runs the entire pipeline". The Ouroboros MCP server itself runs
+> the interview question and seed generation, and only hands the executed
+> Seed off to the Codex runtime adapter at phase 4. If `interview.start`
+> blocks or times out, the failure is in the in-process authoring path, not
+> in the Codex CLI. See the [`ooo auto` CLI reference](cli-reference.md#what---runtime-controls-in-ooo-auto)
+> for the per-phase breakdown and resume guidance.
+
+### Underlying MCP-handler dispatch (outside `ooo auto`)
+
+The same `InterviewHandler` / `GenerateSeedHandler` classes can short-circuit
+to a `_subagent` envelope **only when called directly from inside an
+active OpenCode bridge plugin session** — not from `ouroboros auto`. The
+dispatch gate lives in
+[`should_dispatch_via_plugin()`](https://github.com/Q00/ouroboros/blob/main/src/ouroboros/mcp/tools/subagent.py)
+and is pinned by
+`tests/unit/mcp/tools/test_subagent.py::TestShouldDispatchViaPlugin`:
+
+- `runtime_backend` not in `{opencode, opencode_cli}` → never dispatches.
+- `runtime_backend` in `{opencode, opencode_cli}` and `opencode_mode == "plugin"` → dispatch envelope.
+- `runtime_backend` in `{opencode, opencode_cli}` and `opencode_mode in {None, "", "subprocess", anything else}` → in-process. The safe default exists so users who upgraded without re-running `ouroboros setup` are not silently switched to envelope dispatch their session cannot intercept.
+
+This rule describes the gate function in isolation. It is reachable from
+an OpenCode plugin session calling the MCP authoring tools directly. From
+`ouroboros auto` it is **not** reachable — the auto entry points always
+hand `opencode_mode="subprocess"` to the authoring handlers.
+
+## Choosing a Runtime
+
+The table below covers the currently shipped backends. Because Ouroboros uses a pluggable `AgentRuntime` protocol, teams can register additional backends without modifying the core engine.
+
+| If you...                                                              | Consider                                                                      |
+| ---------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Have a Claude Code Max Plan and want zero API key setup                | Claude Agent SDK (`runtime_backend: claude`)                                  |
+| Want a Codex-backed Ouroboros session instead of a Claude Code session | Codex CLI (`runtime_backend: codex`)                                          |
+| Want to use OpenCode with multiple model providers                     | OpenCode (`runtime_backend: opencode`)                                        |
+| Want to use the Hermes Agent (open source local & API agent)           | Hermes (`runtime_backend: hermes`)                                            |
+| Want to use Google's Gemini CLI in headless `stream-json` mode         | Gemini CLI (`runtime_backend: gemini`)                                        |
+| Want to use Kiro CLI (AWS-provided coding agent, browser-free headless) | Kiro (`runtime_backend: kiro`)                                                |
+| Have a GitHub Copilot subscription and want the live model picker       | Copilot CLI (`runtime_backend: copilot`)                                      |
+| Want to use the Pi coding agent through JSON mode                       | Pi CLI (`runtime_backend: pi`)                                                |
+| Want to use the Oh My Pi (OMP) coding agent through JSON mode          | OMP CLI (`runtime_backend: omp`)                                             |
+| Want to use the GJC coding agent through the supported SDK boundary       | GJC (`runtime_backend: gjc`)                                                 |
+| Want to use Z.ai's ZCode desktop coding agent                           | Zcode (`runtime_backend: zcode`)                                             |
+| Want to use Anthropic's Claude models                                  | Claude Code or Copilot CLI (Claude models exposed via Copilot subscription)   |
+| Want to use Google's Gemini models                                     | Gemini CLI                                                                   |
+| Want to use OpenAI's GPT models                                        | Codex CLI or Copilot CLI                                                      |
+| Want to use multiple providers via a single runtime                    | OpenCode or Copilot CLI (Copilot multiplexes Anthropic + OpenAI under one auth) |
+| Need native MCP host integration                                       | Claude Code, OpenCode, Hermes, Kiro, or Copilot CLI                           |
+| Want deterministic adapter-level skill/MCP dispatch                    | Codex CLI, Gemini CLI, Pi CLI, OMP CLI, or GJC                                |
+| Want minimal Python dependencies                                       | Codex CLI, OpenCode, or Hermes                                                |
+| Want to integrate a custom or third-party AI coding agent              | Implement the `AgentRuntime` protocol and register it in `runtime_factory.py` |
+
+## Further Reading
+
+- [Claude Code runtime guide](runtime-guides/claude-code.md)
+- [Codex CLI runtime guide](runtime-guides/codex.md)
+- [Gemini CLI runtime guide](runtime-guides/gemini.md)
+- [Hermes Agent runtime guide](runtime-guides/hermes.md)
+- [OpenCode runtime guide](runtime-guides/opencode.md)
+- [Kiro CLI runtime guide](runtime-guides/kiro.md)
+- [GitHub Copilot CLI runtime guide](runtime-guides/copilot.md)
+- [Pi CLI runtime guide](runtime-guides/pi.md)
+- [OMP CLI runtime guide](runtime-guides/omp.md)
+- [GJC runtime guide](runtime-guides/gjc.md)
+- [Zcode runtime guide](runtime-guides/zcode.md)
+- [Pi JSON mode documentation](https://pi.dev/docs/latest/json)
+- [Platform support matrix](platform-support.md) (OS and Python version compatibility)
+- [Architecture overview](architecture.md) — including [How to add a new runtime adapter](architecture.md#how-to-add-a-new-runtime-adapter)

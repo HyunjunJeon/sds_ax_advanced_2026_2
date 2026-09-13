@@ -1,0 +1,1144 @@
+"""Unit tests for OuroborosTUI application."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from ouroboros.events.base import BaseEvent
+from ouroboros.persistence.event_store import EventStore
+from ouroboros.tui.app import OuroborosTUI, _EventSubscriptionContext
+from ouroboros.tui.events import (
+    ACModelRouted,
+    ACTokenAttribution,
+    CostUpdated,
+    DriftUpdated,
+    ExecutionUpdated,
+    FrugalityProofEvaluated,
+    FrugalityRetrospectiveReported,
+    PauseRequested,
+    PhaseChanged,
+    ResumeRequested,
+    SubtaskUpdated,
+    TUIState,
+)
+
+
+async def _wait_for_status(app: OuroborosTUI, status: str, *, timeout: float = 5.0) -> None:
+    """Wait for the async subscription poller to apply a status update."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while app.state.status != status:
+        if asyncio.get_running_loop().time() >= deadline:
+            msg = f"Timed out waiting for TUI status {status!r}; current={app.state.status!r}"
+            raise AssertionError(msg)
+        await asyncio.sleep(0.01)
+
+
+@pytest.fixture
+async def memory_event_store() -> AsyncIterator[EventStore]:
+    """Provide an initialized in-memory event store."""
+    store = EventStore("sqlite+aiosqlite:///:memory:")
+    await store.initialize()
+    try:
+        yield store
+    finally:
+        await store.close()
+
+
+class TestOuroborosTUIConstruction:
+    """Tests for OuroborosTUI construction."""
+
+    def test_create_tui_default(self) -> None:
+        """Test creating TUI with defaults."""
+        app = OuroborosTUI()
+
+        assert app._event_store is None
+        assert app._execution_id is None
+        assert isinstance(app._state, TUIState)
+        assert app._is_paused is False
+
+    def test_create_tui_with_event_store(self) -> None:
+        """Test creating TUI with event store."""
+        mock_store = MagicMock()
+
+        app = OuroborosTUI(event_store=mock_store)
+
+        assert app._event_store is mock_store
+
+    def test_create_tui_with_execution_id(self) -> None:
+        """Test creating TUI with execution ID."""
+        app = OuroborosTUI(execution_id="exec_123")
+
+        assert app._execution_id == "exec_123"
+
+
+class TestOuroborosTUIState:
+    """Tests for TUI state management."""
+
+    def test_state_property(self) -> None:
+        """Test accessing state property."""
+        app = OuroborosTUI()
+
+        state = app.state
+
+        assert isinstance(state, TUIState)
+        assert state.status == "idle"
+
+    def test_set_execution(self) -> None:
+        """Test setting execution to monitor."""
+        app = OuroborosTUI()
+
+        app.set_execution("exec_123", "sess_456")
+
+        assert app._execution_id == "exec_123"
+        assert app.state.execution_id == "exec_123"
+        assert app.state.session_id == "sess_456"
+        assert app.state.status == "running"
+
+    def test_set_execution_resets_stale_hud_state(self) -> None:
+        """Switching executions should clear HUD state from the previous context."""
+        app = OuroborosTUI()
+        app.state.current_phase = "deliver"
+        app.state.iteration = 4
+        app.state.total_tokens = 999
+        app.state.ac_tree = {"nodes": {"ac_1": {"id": "ac_1"}}}
+        app.state.active_tools["ac_1"] = {"tool_name": "Edit"}
+        app.state.tool_history["ac_1"] = [{"tool_name": "Read"}]
+        app.state.thinking["ac_1"] = "stale thought"
+
+        app.set_execution("exec_fresh", "sess_fresh")
+
+        assert app.state.execution_id == "exec_fresh"
+        assert app.state.session_id == "sess_fresh"
+        assert app.state.current_phase == ""
+        assert app.state.iteration == 0
+        assert app.state.total_tokens == 0
+        assert app.state.ac_tree == {}
+        assert app.state.active_tools == {}
+        assert app.state.tool_history == {}
+        assert app.state.thinking == {}
+
+    def test_update_ac_tree(self) -> None:
+        """Test updating AC tree data."""
+        app = OuroborosTUI()
+        tree_data = {
+            "root_id": "ac_123",
+            "nodes": {"ac_123": {"id": "ac_123", "content": "Test"}},
+        }
+
+        app.update_ac_tree(tree_data)
+
+        assert app.state.ac_tree == tree_data
+
+
+class TestOuroborosTUICallbacks:
+    """Tests for pause/resume callbacks."""
+
+    def test_set_pause_callback(self) -> None:
+        """Test setting pause callback."""
+        app = OuroborosTUI()
+        callback = MagicMock()
+
+        app.set_pause_callback(callback)
+
+        assert app._pause_callback is callback
+
+    def test_set_resume_callback(self) -> None:
+        """Test setting resume callback."""
+        app = OuroborosTUI()
+        callback = MagicMock()
+
+        app.set_resume_callback(callback)
+
+        assert app._resume_callback is callback
+
+
+class TestOuroborosTUIMessageHandlers:
+    """Tests for TUI message handlers."""
+
+    def test_on_execution_updated(self) -> None:
+        """Test handling ExecutionUpdated message."""
+        app = OuroborosTUI()
+        msg = ExecutionUpdated(
+            execution_id="exec_123",
+            session_id="sess_456",
+            status="running",
+        )
+
+        app.on_execution_updated(msg)
+
+        assert app.state.execution_id == "exec_123"
+        assert app.state.session_id == "sess_456"
+        assert app.state.status == "running"
+        assert app.state.is_paused is False
+
+    def test_on_execution_updated_paused(self) -> None:
+        """Test handling paused ExecutionUpdated."""
+        app = OuroborosTUI()
+        msg = ExecutionUpdated(
+            execution_id="exec_123",
+            session_id="sess_456",
+            status="paused",
+        )
+
+        app.on_execution_updated(msg)
+
+        assert app.state.status == "paused"
+        assert app.state.is_paused is True
+
+    def test_on_phase_changed(self) -> None:
+        """Test handling PhaseChanged message."""
+        app = OuroborosTUI()
+        msg = PhaseChanged(
+            execution_id="exec_123",
+            previous_phase="discover",
+            current_phase="define",
+            iteration=2,
+        )
+
+        app.on_phase_changed(msg)
+
+        assert app.state.current_phase == "define"
+        assert app.state.iteration == 2
+
+    def test_on_drift_updated(self) -> None:
+        """Test handling DriftUpdated message."""
+        app = OuroborosTUI()
+        msg = DriftUpdated(
+            execution_id="exec_123",
+            goal_drift=0.15,
+            constraint_drift=0.1,
+            ontology_drift=0.05,
+            combined_drift=0.12,
+            is_acceptable=True,
+        )
+
+        app.on_drift_updated(msg)
+
+        assert app.state.goal_drift == 0.15
+        assert app.state.constraint_drift == 0.1
+        assert app.state.ontology_drift == 0.05
+        assert app.state.combined_drift == 0.12
+
+    def test_on_cost_updated(self) -> None:
+        """Test handling CostUpdated message."""
+        app = OuroborosTUI()
+        msg = CostUpdated(
+            execution_id="exec_123",
+            total_tokens=10000,
+            total_cost_usd=0.05,
+            tokens_this_phase=2500,
+        )
+
+        app.on_cost_updated(msg)
+
+        assert app.state.total_tokens == 10000
+        assert app.state.total_cost_usd == 0.05
+
+    def test_on_acmodel_routed_folds_tier_latest_wins(self) -> None:
+        """Model routing folds tier/model per node, latest-wins."""
+        app = OuroborosTUI()
+
+        app.on_acmodel_routed(
+            ACModelRouted(
+                node_id="node_1",
+                ac_index=0,
+                model_tier="frugal",
+                model="claude-haiku-4-5",
+                model_mode="enforced",
+                retry_attempt=0,
+            )
+        )
+        assert app.state.tier_by_node["node_1"] == "frugal"
+        assert app.state.model_by_node["node_1"] == "claude-haiku-4-5"
+
+        # A later routing for the same node overwrites (retry escalated the tier).
+        app.on_acmodel_routed(
+            ACModelRouted(
+                node_id="node_1",
+                ac_index=0,
+                model_tier="standard",
+                model="claude-sonnet-5",
+                model_mode="enforced",
+                retry_attempt=1,
+            )
+        )
+        assert app.state.tier_by_node["node_1"] == "standard"
+        assert app.state.model_by_node["node_1"] == "claude-sonnet-5"
+
+    def test_on_acmodel_routed_uses_ac_index_key_without_node_id(self) -> None:
+        """Without a node_id the fold keys on the ac_<index> fallback."""
+        app = OuroborosTUI()
+
+        app.on_acmodel_routed(
+            ACModelRouted(
+                node_id=None,
+                ac_index=3,
+                model_tier="frugal",
+                model=None,
+                model_mode="advised",
+                retry_attempt=0,
+            )
+        )
+
+        assert app.state.tier_by_node["ac_3"] == "frugal"
+
+    def test_on_actoken_attribution_accumulates_per_node_and_run_total(self) -> None:
+        """Token spend accumulates per node and sums into the run total."""
+        app = OuroborosTUI()
+
+        app.on_actoken_attribution(
+            ACTokenAttribution(node_id="node_1", ac_index=0, token_spend=100.0, model_tier="frugal")
+        )
+        app.on_actoken_attribution(
+            ACTokenAttribution(node_id="node_1", ac_index=0, token_spend=50.0, model_tier="frugal")
+        )
+        app.on_actoken_attribution(
+            ACTokenAttribution(node_id="node_2", ac_index=1, token_spend=25.0, model_tier="frugal")
+        )
+
+        assert app.state.tokens_by_node["node_1"] == 150.0
+        assert app.state.tokens_by_node["node_2"] == 25.0
+        assert app.state.run_total_tokens == 175.0
+
+    def test_on_frugality_proof_evaluated_sets_summary_once(self) -> None:
+        """The run-end verdict is folded into frugality_summary exactly once."""
+        app = OuroborosTUI()
+
+        app.on_frugality_proof_evaluated(
+            FrugalityProofEvaluated(status="pass", token_reduction_pct=20.0, reason="saved 20%")
+        )
+        assert app.state.frugality_summary == "⚖ frugal −20% tok"
+
+        # A second (spurious) verdict must not overwrite the first.
+        app.on_frugality_proof_evaluated(
+            FrugalityProofEvaluated(status="fail_no_frugality", token_reduction_pct=None, reason="")
+        )
+        assert app.state.frugality_summary == "⚖ frugal −20% tok"
+
+    def test_on_frugality_retrospective_reported_sets_neutral_summary_once(self) -> None:
+        app = OuroborosTUI()
+        summary = {
+            "terminal_status": "failed",
+            "measured_attempts": 3,
+            "unknown_attempts": 1,
+            "invalid_attempts": 0,
+            "total_measured_tokens": 250.0,
+            "retry_associated_tokens": 100.0,
+            "retry_associated_attempts": 1,
+            "unaccepted_tokens": 150.0,
+            "unaccepted_attempts": 2,
+        }
+
+        app.on_frugality_retrospective_reported(
+            FrugalityRetrospectiveReported(execution_id="exec_1", summary=summary)
+        )
+
+        assert app.state.frugality_retrospective == summary
+        assert app.state.frugality_retrospective_summary == (
+            "Evidence: retry-associated 100 tok | unaccepted 150 tok | "
+            "coverage 3 measured/1 unknown/0 invalid"
+        )
+
+        app.on_frugality_retrospective_reported(
+            FrugalityRetrospectiveReported(
+                execution_id="exec_1",
+                summary={**summary, "measured_attempts": 999},
+            )
+        )
+        assert app.state.frugality_retrospective == summary
+
+    def test_apply_provider_tags_stamps_frugality_telemetry_onto_tree(self) -> None:
+        """Folded tier/model/tokens are stamped onto the AC tree node for rendering."""
+        app = OuroborosTUI()
+        app.state.ac_tree = {
+            "root_id": "root",
+            "nodes": {
+                "root": {"id": "root", "children_ids": ["node_1"]},
+                "node_1": {"id": "node_1", "node_id": "node_1", "children_ids": []},
+            },
+        }
+
+        app.on_acmodel_routed(
+            ACModelRouted(
+                node_id="node_1",
+                ac_index=0,
+                model_tier="frugal",
+                model="claude-haiku-4-5",
+                model_mode="enforced",
+                retry_attempt=0,
+            )
+        )
+        app.on_actoken_attribution(
+            ACTokenAttribution(
+                node_id="node_1", ac_index=0, token_spend=1200.0, model_tier="frugal"
+            )
+        )
+
+        node = app.state.ac_tree["nodes"]["node_1"]
+        assert node["model_tier"] == "frugal"
+        assert node["model"] == "claude-haiku-4-5"
+        assert node["tokens"] == 1200.0
+
+    def test_on_subtask_updated_preserves_runtime_activity_on_tree_node(self) -> None:
+        """Sub-AC runtime snapshots should remain attached to the rendered tree node."""
+        app = OuroborosTUI()
+        app.state.ac_tree = {
+            "root_id": "root",
+            "nodes": {
+                "root": {
+                    "id": "root",
+                    "content": "Acceptance Criteria",
+                    "children_ids": ["ac_1"],
+                },
+                "ac_1": {
+                    "id": "ac_1",
+                    "content": "Composite AC",
+                    "status": "executing",
+                    "children_ids": [],
+                },
+            },
+        }
+
+        app.on_subtask_updated(
+            SubtaskUpdated(
+                execution_id="exec_123",
+                ac_index=1,
+                sub_task_index=1,
+                sub_task_id="ac_1_sub_1",
+                content="Patch the event bridge",
+                status="executing",
+                current_tool_activity={
+                    "message_type": "tool",
+                    "tool_name": "Edit",
+                    "tool_input": {"file_path": "src/ouroboros/tui/events.py"},
+                },
+                last_update={
+                    "message_type": "tool",
+                    "tool_name": "Edit",
+                    "tool_input": {"file_path": "src/ouroboros/tui/events.py"},
+                },
+            )
+        )
+
+        subtask_node = app.state.ac_tree["nodes"]["ac_1_sub_1"]
+        assert subtask_node["parent_id"] == "ac_1"
+        assert subtask_node["current_tool_activity"] == {
+            "message_type": "tool",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "src/ouroboros/tui/events.py"},
+        }
+        assert subtask_node["last_update"] == {
+            "message_type": "tool",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "src/ouroboros/tui/events.py"},
+        }
+        assert app.state.ac_tree["nodes"]["ac_1"]["children_ids"] == ["ac_1_sub_1"]
+
+    def test_on_subtask_updated_attaches_by_parent_node_id_when_present(self) -> None:
+        """Node identity should be authoritative over legacy AC indexes."""
+        app = OuroborosTUI()
+        app.state.ac_tree = {
+            "root_id": "root",
+            "nodes": {
+                "root": {
+                    "id": "root",
+                    "content": "Acceptance Criteria",
+                    "children_ids": ["ac_0", "ac_1"],
+                },
+                "ac_0": {
+                    "id": "ac_0",
+                    "content": "Composite AC",
+                    "status": "executing",
+                    "children_ids": [],
+                },
+                "ac_1": {
+                    "id": "ac_1",
+                    "content": "Unrelated AC",
+                    "status": "pending",
+                    "children_ids": [],
+                },
+            },
+        }
+
+        app.on_subtask_updated(
+            SubtaskUpdated(
+                execution_id="exec_123",
+                ac_index=2,
+                sub_task_index=1,
+                sub_task_id="node_child",
+                content="Nested child",
+                status="pending",
+                parent_node_id="ac_1",
+            )
+        )
+        assert app.state.ac_tree["nodes"]["ac_1"]["children_ids"] == ["node_child"]
+
+        app.on_subtask_updated(
+            SubtaskUpdated(
+                execution_id="exec_123",
+                ac_index=2,
+                sub_task_index=1,
+                sub_task_id="ac_2_sub_1",
+                content="Nested child",
+                status="executing",
+                node_id="node_child",
+                parent_node_id="ac_0",
+                display_path="1.1",
+                path=[0, 0],
+                depth=1,
+                ordinal=0,
+            )
+        )
+
+        assert app.state.ac_tree["nodes"]["node_child"]["parent_id"] == "ac_0"
+        assert app.state.ac_tree["nodes"]["ac_0"]["children_ids"] == ["node_child"]
+        assert app.state.ac_tree["nodes"]["ac_1"]["children_ids"] == []
+
+    def test_on_subtask_updated_falls_back_to_legacy_parent_alias(self) -> None:
+        """Mixed-history node events should attach to legacy-keyed parents."""
+        app = OuroborosTUI()
+        app.state.ac_tree = {
+            "root_id": "root",
+            "nodes": {
+                "root": {
+                    "id": "root",
+                    "content": "Acceptance Criteria",
+                    "children_ids": ["ac_1"],
+                },
+                "ac_1": {
+                    "id": "ac_1",
+                    "content": "Legacy parent",
+                    "status": "executing",
+                    "children_ids": [],
+                    "depth": 1,
+                },
+            },
+        }
+
+        app.on_subtask_updated(
+            SubtaskUpdated(
+                execution_id="exec_123",
+                ac_index=1,
+                sub_task_index=1,
+                sub_task_id="ac_1_sub_1",
+                content="Resumed child",
+                status="executing",
+                node_id="node_child",
+                parent_node_id="node_missing_parent",
+                legacy_parent_node_aliases=["ac_1"],
+                depth=1,
+            )
+        )
+
+        assert app.state.ac_tree["nodes"]["node_child"]["parent_id"] == "ac_1"
+        assert app.state.ac_tree["nodes"]["ac_1"]["children_ids"] == ["node_child"]
+
+    def test_on_subtask_updated_falls_back_to_legacy_parent_node_id(self) -> None:
+        """Legacy zero-based parent IDs should keep pre-migration trees live."""
+        app = OuroborosTUI()
+        app.state.ac_tree = {
+            "root_id": "root",
+            "nodes": {
+                "root": {
+                    "id": "root",
+                    "content": "Acceptance Criteria",
+                    "children_ids": ["ac_0"],
+                },
+                "ac_0": {
+                    "id": "ac_0",
+                    "content": "Legacy zero-based parent",
+                    "status": "executing",
+                    "children_ids": [],
+                    "depth": 1,
+                },
+            },
+        }
+
+        app.on_subtask_updated(
+            SubtaskUpdated(
+                execution_id="exec_123",
+                ac_index=1,
+                sub_task_index=1,
+                sub_task_id="ac_1_sub_1",
+                content="Resumed child",
+                status="executing",
+                node_id="node_child",
+                parent_node_id="node_missing_parent",
+                legacy_parent_node_id="ac_0",
+                depth=1,
+            )
+        )
+
+        assert app.state.ac_tree["nodes"]["node_child"]["parent_id"] == "ac_0"
+        assert app.state.ac_tree["nodes"]["ac_0"]["children_ids"] == ["node_child"]
+
+    def test_on_subtask_updated_does_not_attach_deep_event_by_ac_index(self) -> None:
+        """Depth-2 updates should not attach to the root AC when parent is missing."""
+        app = OuroborosTUI()
+        app.state.ac_tree = {
+            "root_id": "root",
+            "nodes": {
+                "root": {
+                    "id": "root",
+                    "content": "Acceptance Criteria",
+                    "children_ids": ["ac_1"],
+                },
+                "ac_1": {
+                    "id": "ac_1",
+                    "content": "Root AC",
+                    "status": "executing",
+                    "children_ids": [],
+                    "depth": 1,
+                },
+            },
+        }
+
+        app.on_subtask_updated(
+            SubtaskUpdated(
+                execution_id="exec_123",
+                ac_index=1,
+                sub_task_index=1,
+                sub_task_id="ac_1_sub_1",
+                content="Deep child with missing parent",
+                status="executing",
+                node_id="node_grandchild",
+                parent_node_id="node_missing_parent",
+                depth=2,
+            )
+        )
+
+        assert app.state.ac_tree["nodes"]["node_grandchild"]["parent_id"] == ("node_missing_parent")
+        assert app.state.ac_tree["nodes"]["ac_1"]["children_ids"] == []
+
+    def test_merge_ac_progress_replaces_legacy_root_with_canonical_node(self) -> None:
+        """Mixed-history resume should not keep duplicate legacy and node roots."""
+        app = OuroborosTUI()
+        app.state.ac_tree = {
+            "root_id": "root",
+            "nodes": {
+                "root": {
+                    "id": "root",
+                    "content": "Acceptance Criteria",
+                    "children_ids": ["ac_1"],
+                },
+                "ac_1": {
+                    "id": "ac_1",
+                    "content": "Legacy root AC",
+                    "status": "executing",
+                    "children_ids": ["node_child"],
+                    "depth": 1,
+                },
+                "node_child": {
+                    "id": "node_child",
+                    "content": "Resumed child",
+                    "status": "executing",
+                    "parent_id": "ac_1",
+                    "children_ids": [],
+                    "depth": 2,
+                },
+            },
+        }
+
+        app._merge_ac_progress(
+            [
+                {
+                    "index": 1,
+                    "node_id": "node_root",
+                    "ac_id": "ac_1",
+                    "content": "Canonical root AC",
+                    "status": "in_progress",
+                    "root_ac_index": 0,
+                },
+            ],
+            current_ac_index=1,
+        )
+
+        nodes = app.state.ac_tree["nodes"]
+        assert "ac_1" not in nodes
+        assert nodes["root"]["children_ids"] == ["node_root"]
+        assert nodes["node_root"]["children_ids"] == ["node_child"]
+        assert nodes["node_child"]["parent_id"] == "node_root"
+        assert nodes["node_root"]["content"] == "Canonical root AC"
+
+    def test_on_pause_requested_without_owner_keeps_status(self) -> None:
+        """A pause request with no execution owner must not claim 'paused'."""
+        app = OuroborosTUI()
+        app.set_execution("exec_123")
+        initial_log_count = len(app.state.logs)
+        msg = PauseRequested(execution_id="exec_123")
+
+        app.on_pause_requested(msg)
+
+        assert app.state.is_paused is False
+        assert app.state.status == "running"
+        assert len(app.state.logs) == initial_log_count + 1
+        assert app.state.logs[-1]["level"] == "warning"
+        assert "unavailable" in app.state.logs[-1]["message"]
+
+    def test_on_resume_requested_without_owner_keeps_status(self) -> None:
+        """A resume request with no execution owner must not claim 'running'."""
+        app = OuroborosTUI()
+        app.set_execution("exec_123")
+        app._state.is_paused = True
+        app._state.status = "paused"
+        initial_log_count = len(app.state.logs)
+        msg = ResumeRequested(execution_id="exec_123")
+
+        app.on_resume_requested(msg)
+
+        assert app.state.is_paused is True
+        assert app.state.status == "paused"
+        assert len(app.state.logs) == initial_log_count + 1
+        assert app.state.logs[-1]["level"] == "warning"
+        assert "unavailable" in app.state.logs[-1]["message"]
+
+
+class TestOuroborosTUIActions:
+    """Tests for TUI actions."""
+
+    def test_action_pause_posts_message(self) -> None:
+        """Test pause action posts message when execution active."""
+        app = OuroborosTUI()
+        app.set_pause_callback(MagicMock())
+        app.set_execution("exec_123")
+        app.post_message = MagicMock()  # type: ignore
+
+        app.action_pause()
+
+        # Should have posted a PauseRequested message
+        app.post_message.assert_called_once()
+        msg = app.post_message.call_args[0][0]
+        assert isinstance(msg, PauseRequested)
+        assert msg.execution_id == "exec_123"
+
+    def test_action_pause_no_execution(self) -> None:
+        """Test pause action does nothing without execution."""
+        app = OuroborosTUI()
+        app.set_pause_callback(MagicMock())
+        app.post_message = MagicMock()  # type: ignore
+
+        app.action_pause()
+
+        app.post_message.assert_not_called()
+
+    def test_action_pause_already_paused(self) -> None:
+        """Test pause action does nothing when already paused."""
+        app = OuroborosTUI()
+        app.set_pause_callback(MagicMock())
+        app.set_execution("exec_123")
+        app._state.is_paused = True
+        app.post_message = MagicMock()  # type: ignore
+
+        app.action_pause()
+
+        app.post_message.assert_not_called()
+
+    def test_pause_binding_is_hidden_without_owner(self) -> None:
+        """`False` (hidden), not `None` (greyed out but still advertised)."""
+        app = OuroborosTUI()
+
+        assert app.check_action("pause", ()) is False
+
+    def test_action_resume_posts_message(self) -> None:
+        """Test resume action posts message when paused."""
+        app = OuroborosTUI()
+        app.set_resume_callback(MagicMock())
+        app.set_execution("exec_123")
+        app._state.is_paused = True
+        app.post_message = MagicMock()  # type: ignore
+
+        app.action_resume()
+
+        app.post_message.assert_called_once()
+        msg = app.post_message.call_args[0][0]
+        assert isinstance(msg, ResumeRequested)
+
+    def test_action_resume_not_paused(self) -> None:
+        """Test resume action does nothing when not paused."""
+        app = OuroborosTUI()
+        app.set_resume_callback(MagicMock())
+        app.set_execution("exec_123")
+        app._state.is_paused = False
+        app.post_message = MagicMock()  # type: ignore
+
+        app.action_resume()
+
+        app.post_message.assert_not_called()
+
+    def test_resume_binding_is_hidden_without_owner(self) -> None:
+        """`False` (hidden), not `None` (greyed out but still advertised)."""
+        app = OuroborosTUI()
+
+        assert app.check_action("resume", ()) is False
+
+    def test_check_action_shows_controls_when_owner_connected(self) -> None:
+        """Bindings are advertised once an execution owner is connected."""
+        app = OuroborosTUI()
+        app.set_pause_callback(MagicMock())
+        app.set_resume_callback(MagicMock())
+
+        assert app.check_action("pause", ()) is True
+        assert app.check_action("resume", ()) is True
+
+    def test_check_action_leaves_unrelated_actions_alone(self) -> None:
+        """Only the lifecycle bindings are gated."""
+        app = OuroborosTUI()
+
+        assert app.check_action("quit", ()) is True
+        assert app.check_action("show_logs", ()) is True
+
+    @pytest.mark.asyncio
+    async def test_pause_key_spam_starts_one_request_until_acknowledged(self) -> None:
+        app = OuroborosTUI()
+        release = asyncio.Event()
+
+        async def _blocked_pause(_execution_id: str) -> None:
+            await release.wait()
+
+        callback = AsyncMock(side_effect=_blocked_pause)
+        app.set_pause_callback(callback)
+        app.set_execution("exec_123")
+        message = PauseRequested("exec_123")
+
+        app.on_pause_requested(message)
+        app.on_pause_requested(message)
+        app.on_pause_requested(message)
+        await asyncio.sleep(0)
+
+        callback.assert_awaited_once_with("exec_123")
+        assert app.check_action("pause", ()) is False
+
+        release.set()
+        await asyncio.sleep(0)
+        app._update_state_from_event(
+            BaseEvent(
+                type="orchestrator.session.paused",
+                aggregate_type="session",
+                aggregate_id="sess_123",
+                data={"execution_id": "exec_123"},
+            )
+        )
+
+        assert ("pause", "exec_123") not in app._control_requests
+
+    @pytest.mark.asyncio
+    async def test_control_failure_releases_gate_for_retry(self) -> None:
+        app = OuroborosTUI()
+        callback = AsyncMock(side_effect=RuntimeError("owner unavailable"))
+        app.set_resume_callback(callback)
+        app.set_execution("exec_123")
+        app._state.status = "paused"
+        app._state.is_paused = True
+        message = ResumeRequested("exec_123")
+
+        app.on_resume_requested(message)
+        await asyncio.sleep(0)
+        app.on_resume_requested(message)
+        await asyncio.sleep(0)
+
+        assert callback.await_count == 2
+        assert ("resume", "exec_123") not in app._control_requests
+
+    @pytest.mark.asyncio
+    async def test_session_switch_cancels_pending_control(self) -> None:
+        app = OuroborosTUI()
+        release = asyncio.Event()
+
+        async def _blocked_pause(_execution_id: str) -> None:
+            await release.wait()
+
+        callback = AsyncMock(side_effect=_blocked_pause)
+        app.set_pause_callback(callback)
+        app.set_execution("exec_old")
+        app.on_pause_requested(PauseRequested("exec_old"))
+        await asyncio.sleep(0)
+
+        app.set_execution("exec_new")
+        await asyncio.sleep(0)
+
+        assert not app._control_requests
+        assert app.state.execution_id == "exec_new"
+
+
+class TestOuroborosTUIEventSubscription:
+    """Tests for event store subscription."""
+
+    @pytest.mark.asyncio
+    async def test_subscription_reads_active_session_events(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Session aggregate events should update HUD state for the active context."""
+        await memory_event_store.append(
+            BaseEvent(
+                type="orchestrator.session.started",
+                aggregate_type="session",
+                aggregate_id="sess_active",
+                data={"execution_id": "exec_active"},
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                type="workflow.progress.updated",
+                aggregate_type="execution",
+                aggregate_id="exec_active",
+                data={
+                    "execution_id": "exec_active",
+                    "current_phase": "deliver",
+                    "completed_count": 1,
+                    "total_count": 2,
+                    "acceptance_criteria": [
+                        {"index": 1, "content": "First criterion", "status": "completed"},
+                        {"index": 2, "content": "Second criterion", "status": "in_progress"},
+                    ],
+                },
+            )
+        )
+
+        app = OuroborosTUI(event_store=memory_event_store)
+        app._poll_interval_seconds = 0.01
+        app.set_execution("exec_active", "sess_active")
+        await asyncio.sleep(0.03)
+
+        await memory_event_store.append(
+            BaseEvent(
+                type="orchestrator.session.completed",
+                aggregate_type="session",
+                aggregate_id="sess_active",
+                data={"execution_id": "exec_active"},
+            )
+        )
+        await _wait_for_status(app, "completed")
+
+        assert app.state.execution_id == "exec_active"
+        assert app.state.session_id == "sess_active"
+        assert app.state.status == "completed"
+
+        if app._subscription_task is not None:
+            app._subscription_task.cancel()
+            await app._subscription_task
+
+    @pytest.mark.asyncio
+    async def test_subscription_delivers_worker_scoped_telemetry(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Per-AC telemetry persisted under a WORKER-scoped aggregate id must reach
+        the HUD. On a real decomposed run ``execution.ac.model_routed`` lands on
+        ``exec_<id>_node_<NODEID>`` with the run id only in the payload, so the
+        prior exact aggregate-id poll never saw it (PR #1602 regression)."""
+        await memory_event_store.append(
+            BaseEvent(
+                type="orchestrator.session.started",
+                aggregate_type="session",
+                aggregate_id="sess_active",
+                data={"execution_id": "exec_active"},
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                type="execution.ac.model_routed",
+                aggregate_type="execution",
+                aggregate_id="exec_active_node_6RU7IB5VIJMCE",
+                data={
+                    "execution_id": "exec_active",
+                    "session_id": "sess_active",
+                    "node_id": "6RU7IB5VIJMCE",
+                    "ac_index": 1,
+                    "model_tier": "frugal",
+                    "model": "haiku",
+                },
+            )
+        )
+
+        app = OuroborosTUI(event_store=memory_event_store)
+        app._poll_interval_seconds = 0.01
+        app.post_message = MagicMock()  # type: ignore[method-assign]
+        app.set_execution("exec_active", "sess_active")
+        await asyncio.sleep(0.05)
+
+        if app._subscription_task is not None:
+            app._subscription_task.cancel()
+            await app._subscription_task
+
+        routed = [
+            call.args[0]
+            for call in app.post_message.call_args_list
+            if call.args and isinstance(call.args[0], ACModelRouted)
+        ]
+        assert routed, "worker-scoped model_routed event never reached the TUI"
+        assert routed[0].model_tier == "frugal"
+        assert routed[0].model == "haiku"
+        assert routed[0].node_id == "6RU7IB5VIJMCE"
+
+    @pytest.mark.asyncio
+    async def test_subscription_task_drops_stale_context_parameters(self) -> None:
+        """A running poller must not start listening to a new context implicitly."""
+
+        class RecordingEventStore:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str | None, int]] = []
+
+            async def query_session_related_events_after(
+                self,
+                session_id: str,
+                execution_id: str | None = None,
+                last_row_id: int = 0,
+            ) -> tuple[list[BaseEvent], int]:
+                self.calls.append((session_id, execution_id, last_row_id))
+                return [], last_row_id
+
+        event_store = RecordingEventStore()
+        app = OuroborosTUI(event_store=event_store)  # type: ignore[arg-type]
+        app._poll_interval_seconds = 0.01
+        app._execution_id = "exec_old"
+        app.state.session_id = "sess_old"
+        app._subscription_generation = 1
+        context = _EventSubscriptionContext(
+            execution_id="exec_old",
+            session_id="sess_old",
+            generation=1,
+        )
+
+        task = asyncio.create_task(app._subscribe_to_events(context))
+        await asyncio.sleep(0.03)
+        app._execution_id = "exec_new"
+        app.state.session_id = "sess_new"
+        await asyncio.wait_for(task, timeout=0.1)
+
+        assert task.done()
+        assert ("sess_new", "exec_new", 0) not in event_store.calls
+        assert any(call[:2] == ("sess_old", "exec_old") for call in event_store.calls)
+
+    @pytest.mark.asyncio
+    async def test_update_state_from_event_session_started(self) -> None:
+        """Test state update from session started event."""
+        app = OuroborosTUI()
+        event = BaseEvent(
+            type="orchestrator.session.started",
+            aggregate_type="session",
+            aggregate_id="sess_123",
+            data={"execution_id": "exec_456"},
+        )
+
+        app._update_state_from_event(event)
+
+        assert app.state.execution_id == "exec_456"
+        assert app.state.session_id == "sess_123"
+        assert app.state.status == "running"
+
+    @pytest.mark.asyncio
+    async def test_update_state_from_event_phase_completed(self) -> None:
+        """Test state update from phase completed event."""
+        app = OuroborosTUI()
+        event = BaseEvent(
+            type="execution.phase.completed",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={"phase": "design", "iteration": 3},
+        )
+
+        app._update_state_from_event(event)
+
+        assert app.state.current_phase == "design"
+        assert app.state.iteration == 3
+
+    @pytest.mark.asyncio
+    async def test_update_state_from_execution_terminal_paused(self) -> None:
+        """Paused terminal events should put the TUI into paused state."""
+        app = OuroborosTUI()
+        event = BaseEvent(
+            type="execution.terminal",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={"session_id": "sess_123", "status": "paused"},
+        )
+
+        app._update_state_from_event(event)
+
+        assert app.state.status == "paused"
+        assert app.state.is_paused is True
+
+    @pytest.mark.asyncio
+    async def test_update_state_from_event_drift_measured(self) -> None:
+        """Test state update from drift measured event."""
+        app = OuroborosTUI()
+        event = BaseEvent(
+            type="observability.drift.measured",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "goal_drift": 0.2,
+                "constraint_drift": 0.15,
+                "ontology_drift": 0.1,
+                "combined_drift": 0.17,
+            },
+        )
+
+        app._update_state_from_event(event)
+
+        assert app.state.goal_drift == 0.2
+        assert app.state.constraint_drift == 0.15
+        assert app.state.ontology_drift == 0.1
+        assert app.state.combined_drift == 0.17
+
+    @pytest.mark.asyncio
+    async def test_call_pause_callback_sync(self) -> None:
+        """Test calling sync pause callback."""
+        app = OuroborosTUI()
+        callback = MagicMock()
+        app.set_pause_callback(callback)
+
+        await app._call_pause_callback("exec_123")
+
+        callback.assert_called_once_with("exec_123")
+
+    @pytest.mark.asyncio
+    async def test_call_pause_callback_async(self) -> None:
+        """Test calling async pause callback."""
+        app = OuroborosTUI()
+        callback = AsyncMock()
+        app.set_pause_callback(callback)
+
+        await app._call_pause_callback("exec_123")
+
+        callback.assert_called_once_with("exec_123")
+
+    @pytest.mark.asyncio
+    async def test_call_resume_callback_sync(self) -> None:
+        """Test calling sync resume callback."""
+        app = OuroborosTUI()
+        callback = MagicMock()
+        app.set_resume_callback(callback)
+
+        await app._call_resume_callback("exec_123")
+
+        callback.assert_called_once_with("exec_123")
+
+    @pytest.mark.asyncio
+    async def test_call_resume_callback_async(self) -> None:
+        """Test calling async resume callback."""
+        app = OuroborosTUI()
+        callback = AsyncMock()
+        app.set_resume_callback(callback)
+
+        await app._call_resume_callback("exec_123")
+
+        callback.assert_called_once_with("exec_123")
+
+    @pytest.mark.asyncio
+    async def test_callback_error_handling(self) -> None:
+        """Test that callback errors are logged."""
+        app = OuroborosTUI()
+        callback = MagicMock(side_effect=ValueError("Test error"))
+        app.set_pause_callback(callback)
+
+        await app._call_pause_callback("exec_123")
+
+        # Should have logged the error
+        assert len(app.state.logs) == 1
+        assert "Pause callback failed" in app.state.logs[0]["message"]

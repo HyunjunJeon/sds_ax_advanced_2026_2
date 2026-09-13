@@ -1,0 +1,673 @@
+"""Unit tests for provider factory helpers."""
+
+import builtins
+import sys
+from unittest.mock import patch
+
+import pytest
+
+from ouroboros.events.base import BaseEvent
+from ouroboros.events.io_recorder import IOJournalRecorder
+from ouroboros.providers.claude_code_adapter import ClaudeCodeAdapter
+from ouroboros.providers.codex_cli_adapter import CodexCliLLMAdapter
+from ouroboros.providers.copilot_cli_adapter import CopilotCliLLMAdapter
+from ouroboros.providers.factory import (
+    create_llm_adapter,
+    resolve_llm_backend,
+    resolve_llm_permission_mode,
+)
+from ouroboros.providers.gjc_llm_adapter import GjcLLMAdapter
+from ouroboros.providers.goose_cli_adapter import GooseCliLLMAdapter
+from ouroboros.providers.hermes_cli_adapter import HermesCliLLMAdapter
+from ouroboros.providers.omp_llm_adapter import OmpLLMAdapter
+from ouroboros.providers.opencode_adapter import OpenCodeLLMAdapter
+from ouroboros.providers.pi_llm_adapter import PiLLMAdapter
+
+try:
+    from ouroboros.providers.litellm_adapter import LiteLLMAdapter
+except ImportError:
+    LiteLLMAdapter = None  # type: ignore[assignment,misc]
+
+
+class _FakeEventStore:
+    async def append(self, event: BaseEvent) -> None:
+        pass
+
+
+class TestResolveLLMBackend:
+    """Tests for backend normalization."""
+
+    def test_resolves_claude_aliases(self) -> None:
+        """Claude aliases normalize to claude_code."""
+        assert resolve_llm_backend("claude") == "claude_code"
+        assert resolve_llm_backend("claude_code") == "claude_code"
+
+    def test_resolves_litellm_aliases(self) -> None:
+        """LiteLLM aliases normalize to litellm."""
+        assert resolve_llm_backend("litellm") == "litellm"
+        assert resolve_llm_backend("openai") == "litellm"
+        assert resolve_llm_backend("openrouter") == "litellm"
+
+    def test_resolves_codex_aliases(self) -> None:
+        """Codex aliases normalize to codex."""
+        assert resolve_llm_backend("codex") == "codex"
+        assert resolve_llm_backend("codex_cli") == "codex"
+
+    def test_resolves_opencode_aliases(self) -> None:
+        """OpenCode aliases normalize to opencode."""
+        assert resolve_llm_backend("opencode") == "opencode"
+        assert resolve_llm_backend("opencode_cli") == "opencode"
+
+    def test_resolves_copilot_aliases(self) -> None:
+        """Copilot aliases normalize to copilot."""
+        assert resolve_llm_backend("copilot") == "copilot"
+        assert resolve_llm_backend("copilot_cli") == "copilot"
+
+    def test_falls_back_to_configured_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Configured backend is used when no explicit backend is provided."""
+        monkeypatch.setattr("ouroboros.providers.factory.get_llm_backend", lambda: "openai")
+        assert resolve_llm_backend() == "litellm"
+
+    def test_rejects_unknown_backend(self) -> None:
+        """Unknown backend names raise ValueError."""
+        with pytest.raises(ValueError, match="Unsupported LLM backend"):
+            resolve_llm_backend("invalid")
+
+    def test_resolves_hermes_aliases(self) -> None:
+        """Hermes aliases normalize to hermes."""
+        assert resolve_llm_backend("hermes") == "hermes"
+        assert resolve_llm_backend("hermes_cli") == "hermes"
+
+    def test_resolves_goose_aliases(self) -> None:
+        """Goose aliases normalize to goose."""
+        assert resolve_llm_backend("goose") == "goose"
+        assert resolve_llm_backend("goose_cli") == "goose"
+
+    def test_resolves_pi_aliases(self) -> None:
+        """Pi aliases normalize to pi."""
+        assert resolve_llm_backend("pi") == "pi"
+        assert resolve_llm_backend("pi_cli") == "pi"
+
+    def test_resolves_omp_aliases(self) -> None:
+        """OMP aliases normalize to omp."""
+        assert resolve_llm_backend("omp") == "omp"
+        assert resolve_llm_backend("omp_cli") == "omp"
+
+    def test_resolves_gjc_aliases(self) -> None:
+        """GJC aliases normalize to gjc."""
+        assert resolve_llm_backend("gjc") == "gjc"
+        assert resolve_llm_backend("gajae-code") == "gjc"
+
+
+class TestCreateLLMAdapter:
+    """Tests for adapter construction."""
+
+    def test_creates_claude_code_adapter(self) -> None:
+        """Claude backend returns ClaudeCodeAdapter."""
+        adapter = create_llm_adapter(backend="claude_code")
+        assert isinstance(adapter, ClaudeCodeAdapter)
+
+    def test_passes_timeout_to_claude_code_adapter(self) -> None:
+        """Claude backend forwards application-level timeout to the adapter."""
+        adapter = create_llm_adapter(backend="claude_code", timeout=42.0)
+        assert isinstance(adapter, ClaudeCodeAdapter)
+        assert adapter._timeout == 42.0
+
+    def test_passes_cwd_to_claude_code_adapter(self) -> None:
+        """Claude backend forwards cwd to the SDK adapter."""
+        adapter = create_llm_adapter(backend="claude_code", cwd="/tmp/project")
+        assert isinstance(adapter, ClaudeCodeAdapter)
+        assert adapter._cwd == "/tmp/project"
+
+    def test_claude_code_interview_use_case_does_not_auto_enable_strict_mcp_config(
+        self,
+    ) -> None:
+        """``use_case="interview"`` MUST NOT auto-enable strict MCP isolation.
+
+        CLI interview entrypoints (``ooo init`` / ``ooo pm``) take this
+        path and rely on plugin/project ``.mcp.json`` servers being
+        reachable for brownfield repository tooling.  Only the nested
+        MCP-tool entrypoint opts in explicitly.
+        """
+        adapter = create_llm_adapter(
+            backend="claude_code",
+            use_case="interview",
+            allowed_tools=["Read"],
+        )
+        assert isinstance(adapter, ClaudeCodeAdapter)
+        assert adapter._strict_mcp_config is False
+
+    def test_claude_code_explicit_strict_mcp_config_is_forwarded(self) -> None:
+        """The MCP nested-interview handler opts in via this explicit flag."""
+        adapter = create_llm_adapter(
+            backend="claude_code",
+            use_case="interview",
+            allowed_tools=["Read"],
+            strict_mcp_config=True,
+        )
+        assert isinstance(adapter, ClaudeCodeAdapter)
+        assert adapter._strict_mcp_config is True
+
+    def test_claude_code_default_keeps_plugin_mcp_servers(self) -> None:
+        """Default callers (no opt-in) must keep plugin/project MCP servers
+        reachable, even when an explicit envelope is supplied."""
+        adapter = create_llm_adapter(
+            backend="claude_code",
+            allowed_tools=["Read", "mcp__ouroboros__qa"],
+        )
+        assert isinstance(adapter, ClaudeCodeAdapter)
+        assert adapter._strict_mcp_config is False
+
+    def test_creates_pi_adapter(self) -> None:
+        """Pi backend returns PiLLMAdapter."""
+        adapter = create_llm_adapter(backend="pi", cli_path="/tmp/pi")
+        assert isinstance(adapter, PiLLMAdapter)
+        assert adapter._cli_path == "/tmp/pi"
+
+    def test_creates_omp_adapter(self) -> None:
+        """OMP backend returns OmpLLMAdapter."""
+        adapter = create_llm_adapter(backend="omp", cli_path="/tmp/omp")
+        assert isinstance(adapter, OmpLLMAdapter)
+        assert adapter._cli_path == "/tmp/omp"
+
+    def test_creates_omp_adapter_with_stale_config_fallback(self) -> None:
+        """PR #2299 round 5: stale configured omp path falls back to a valid PATH install."""
+        import os
+
+        from ouroboros.config.models import OrchestratorConfig, OuroborosConfig
+
+        def fake_which(name: str) -> str | None:
+            return "/usr/bin/omp" if name == "omp" else None
+
+        config = OuroborosConfig(
+            orchestrator=OrchestratorConfig(omp_cli_path="/missing/configured/omp")
+        )
+        with (
+            patch.dict(os.environ, {"OUROBOROS_OMP_CLI_PATH": ""}),
+            patch("ouroboros.config._omp_cli.load_config", return_value=config),
+            patch("shutil.which", side_effect=fake_which),
+        ):
+            adapter = create_llm_adapter(backend="omp")
+
+        assert isinstance(adapter, OmpLLMAdapter)
+        assert adapter._cli_path == "/usr/bin/omp"
+
+    def test_omp_interview_use_case_bypasses_permissions(self) -> None:
+        """OMP interview driver mirrors Pi's text-only bypass permission convention."""
+        assert (
+            resolve_llm_permission_mode(backend="omp", use_case="interview") == "bypassPermissions"
+        )
+
+    def test_creates_gjc_adapter(self) -> None:
+        """GJC backend returns GjcLLMAdapter."""
+        adapter = create_llm_adapter(backend="gjc", cli_path="/tmp/gjc")
+        assert isinstance(adapter, GjcLLMAdapter)
+        assert adapter._cli_path == "/tmp/gjc"
+
+    def test_creates_gjc_adapter_uses_configured_cli_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GJC factory consumes the shared CLI path helper when no explicit path is passed."""
+        monkeypatch.setattr("ouroboros.providers.factory.get_gjc_cli_path", lambda: "/tmp/gjc")
+
+        adapter = create_llm_adapter(backend="gjc", cwd="/tmp/project")
+
+        assert isinstance(adapter, GjcLLMAdapter)
+        assert adapter._cli_path == "/tmp/gjc"
+        assert adapter._cwd == "/tmp/project"
+
+    def test_gjc_interview_use_case_bypasses_permissions(self) -> None:
+        """GJC interview driver mirrors Pi's text-only bypass permission convention."""
+        assert (
+            resolve_llm_permission_mode(backend="gjc", use_case="interview") == "bypassPermissions"
+        )
+
+    def test_pi_interview_use_case_bypasses_permissions(self) -> None:
+        """Pi interview driver uses the text-only bypass permission convention."""
+        assert (
+            resolve_llm_permission_mode(backend="pi", use_case="interview") == "bypassPermissions"
+        )
+
+    def test_creates_litellm_adapter(self) -> None:
+        """LiteLLM backend returns LiteLLMAdapter."""
+        if LiteLLMAdapter is None:
+            pytest.skip("litellm not installed")
+        adapter = create_llm_adapter(backend="litellm")
+        assert isinstance(adapter, LiteLLMAdapter)
+
+    def test_litellm_frugality_proof_is_task_local(self) -> None:
+        """Proof construction must not change ordinary LiteLLM policies."""
+        if LiteLLMAdapter is None:
+            pytest.skip("litellm not installed")
+
+        ordinary = create_llm_adapter(backend="litellm")
+        proof = create_llm_adapter(backend="litellm", frugality_proof=True)
+
+        assert isinstance(ordinary, LiteLLMAdapter)
+        assert ordinary._max_retries == 3
+        assert ordinary._timeout is None
+        assert isinstance(proof, LiteLLMAdapter)
+        assert proof._max_retries == 1
+        assert proof._timeout == 60.0
+
+    def test_forwards_io_recorder_to_litellm_adapter(self) -> None:
+        """LiteLLM factory path preserves explicit recorder wiring."""
+        if LiteLLMAdapter is None:
+            pytest.skip("litellm not installed")
+        recorder = IOJournalRecorder(
+            event_store=_FakeEventStore(),
+            target_type="execution",
+            target_id="exec_factory",
+        )
+
+        adapter = create_llm_adapter(backend="litellm", io_recorder=recorder)
+
+        assert isinstance(adapter, LiteLLMAdapter)
+        assert adapter._io_recorder is recorder
+
+    def test_litellm_import_error_raises_runtime_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Missing litellm dependency raises a helpful RuntimeError."""
+        module_name = "ouroboros.providers.litellm_adapter"
+        real_import = builtins.__import__
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):  # type: ignore[no-untyped-def]
+            if name == module_name:
+                raise ImportError("No module named 'litellm'")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        with pytest.raises(
+            RuntimeError, match="litellm backend requested but litellm is not installed"
+        ):
+            create_llm_adapter(backend="litellm")
+
+    def test_litellm_import_error_on_python_314_names_supported_remedy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Python 3.14 guidance must not recommend an unsupported LiteLLM install."""
+        module_name = "ouroboros.providers.litellm_adapter"
+        real_import = builtins.__import__
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):  # type: ignore[no-untyped-def]
+            if name == module_name:
+                raise ImportError("No module named 'litellm'")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        monkeypatch.setattr(
+            "ouroboros.providers.factory.sys.version_info",
+            (3, 14, 0, "final", 0),
+        )
+
+        with pytest.raises(RuntimeError) as exc_info:
+            create_llm_adapter(backend="litellm")
+
+        message = str(exc_info.value)
+        assert "Python >=3.12,<3.14" in message
+        assert "Python 3.13" in message
+        assert "python3.13 -m pip install 'ouroboros-ai[litellm]'" in message
+        assert "python3.14" not in message.lower()
+
+    def test_creates_codex_adapter(self) -> None:
+        """Codex backend returns CodexCliLLMAdapter."""
+        adapter = create_llm_adapter(backend="codex", cwd="/tmp/project")
+        assert isinstance(adapter, CodexCliLLMAdapter)
+        assert adapter._cwd == "/tmp/project"
+
+    def test_codex_explicit_strict_mcp_config_is_forwarded(self) -> None:
+        """Nested MCP handlers can seal the Codex LLM-only child."""
+        adapter = create_llm_adapter(
+            backend="codex",
+            cli_path="codex",
+            use_case="interview",
+            allowed_tools=[],
+            strict_mcp_config=True,
+        )
+
+        assert isinstance(adapter, CodexCliLLMAdapter)
+        assert adapter._strict_mcp_config is True
+
+    def test_codex_interview_use_case_does_not_auto_enable_strict_mcp_config(
+        self,
+    ) -> None:
+        """Only nested MCP handlers opt in; ordinary Codex interviews do not."""
+        adapter = create_llm_adapter(
+            backend="codex",
+            cli_path="codex",
+            use_case="interview",
+            allowed_tools=[],
+        )
+
+        assert isinstance(adapter, CodexCliLLMAdapter)
+        assert adapter._strict_mcp_config is False
+
+    def test_creates_codex_adapter_propagates_runtime_profile(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``get_runtime_profile()`` must reach CodexCliLLMAdapter via the factory.
+
+        Same regression-lock as the orchestrator runtime: if the
+        provider factory ever drops ``runtime_profile=...`` from the
+        adapter call, worker-subprocess isolation breaks for every LLM
+        path that runs through Codex (interview, evaluation, …).
+        """
+        monkeypatch.setattr(
+            "ouroboros.providers.factory.get_runtime_profile",
+            lambda: "worker",
+        )
+
+        adapter = create_llm_adapter(backend="codex", cwd="/tmp/project")
+
+        assert isinstance(adapter, CodexCliLLMAdapter)
+        assert adapter._runtime_profile == "worker"
+        assert adapter._codex_profile == "ouroboros-worker"
+
+    def test_creates_codex_adapter_default_profile_is_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unset profile must remain unset on the adapter."""
+        monkeypatch.setattr(
+            "ouroboros.providers.factory.get_runtime_profile",
+            lambda: None,
+        )
+
+        adapter = create_llm_adapter(backend="codex", cwd="/tmp/project")
+
+        assert isinstance(adapter, CodexCliLLMAdapter)
+        assert adapter._runtime_profile is None
+        assert adapter._codex_profile is None
+
+    def test_creates_codex_adapter_uses_configured_cli_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Codex factory consumes the shared CLI path helper when no explicit path is passed."""
+        monkeypatch.setattr("ouroboros.providers.factory.get_codex_cli_path", lambda: "/tmp/codex")
+
+        adapter = create_llm_adapter(backend="codex", cwd="/tmp/project")
+
+        assert isinstance(adapter, CodexCliLLMAdapter)
+        assert adapter._cli_path == "/tmp/codex"
+
+    def test_creates_goose_adapter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Goose backend returns GooseCliLLMAdapter."""
+        monkeypatch.setattr("ouroboros.providers.factory.get_goose_cli_path", lambda: "/tmp/goose")
+
+        adapter = create_llm_adapter(backend="goose", cwd="/tmp/project", allowed_tools=["Read"])
+
+        assert isinstance(adapter, GooseCliLLMAdapter)
+        assert adapter._cli_path == "/tmp/goose"
+        assert adapter._cwd == "/tmp/project"
+        assert adapter._allowed_tools == ["Read"]
+
+    def test_creates_opencode_adapter(self) -> None:
+        """OpenCode backend returns OpenCodeLLMAdapter."""
+        adapter = create_llm_adapter(backend="opencode", cwd="/tmp/project")
+        assert isinstance(adapter, OpenCodeLLMAdapter)
+        assert adapter._cwd == "/tmp/project"
+
+    def test_creates_hermes_adapter(self) -> None:
+        """Hermes backend returns HermesCliLLMAdapter."""
+        adapter = create_llm_adapter(backend="hermes", cwd="/tmp/project")
+        assert isinstance(adapter, HermesCliLLMAdapter)
+        assert adapter._cwd is not None
+        assert adapter._cwd.name == "project"
+
+    def test_hermes_adapter_preserves_unsupported_tool_envelope(self) -> None:
+        """Factory preserves unsupported envelopes so Hermes can fail explicitly."""
+        adapter = create_llm_adapter(backend="hermes", allowed_tools=[], cwd="/tmp/project")
+
+        assert isinstance(adapter, HermesCliLLMAdapter)
+        assert adapter._allowed_tools == ()
+
+    def test_creates_opencode_adapter_uses_configured_cli_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """OpenCode factory consumes the shared CLI path helper when no explicit path is passed."""
+        monkeypatch.setattr(
+            "ouroboros.providers.opencode_adapter.get_opencode_cli_path",
+            lambda: "/tmp/opencode",
+        )
+
+        adapter = create_llm_adapter(backend="opencode", cwd="/tmp/project")
+
+        assert isinstance(adapter, OpenCodeLLMAdapter)
+        assert adapter._cli_path == "/tmp/opencode"
+
+    def test_uses_configured_opencode_backend_alias_when_backend_omitted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Configured OpenCode aliases should wire through the shared factory path."""
+        monkeypatch.setattr("ouroboros.providers.factory.get_llm_backend", lambda: "opencode_cli")
+        monkeypatch.setattr(
+            "ouroboros.providers.factory.get_llm_permission_mode",
+            lambda backend=None: "acceptEdits",  # noqa: ARG005
+        )
+
+        adapter = create_llm_adapter(cwd="/tmp/project", allowed_tools=["Read"], max_turns=2)
+
+        assert isinstance(adapter, OpenCodeLLMAdapter)
+        assert adapter._cwd == "/tmp/project"
+        assert adapter._permission_mode == "acceptEdits"
+        assert adapter._allowed_tools == ["Read"]
+        assert adapter._max_turns == 2
+
+    def test_forwards_interview_options_to_codex_adapter(self) -> None:
+        """Codex backend receives interview/debug options through the factory."""
+        callback_calls: list[tuple[str, str]] = []
+
+        def callback(message_type: str, content: str) -> None:
+            callback_calls.append((message_type, content))
+
+        adapter = create_llm_adapter(
+            backend="codex",
+            cwd="/tmp/project",
+            use_case="interview",
+            allowed_tools=["Read", "Grep"],
+            max_turns=5,
+            on_message=callback,
+        )
+
+        assert isinstance(adapter, CodexCliLLMAdapter)
+        assert adapter._allowed_tools == ["Read", "Grep"]
+        assert adapter._max_turns == 5
+        assert adapter._on_message is callback
+
+    def test_uses_configured_permission_mode_when_omitted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Factory uses config/env permission defaults when no explicit mode is provided."""
+        monkeypatch.setattr(
+            "ouroboros.providers.factory.get_llm_permission_mode",
+            lambda backend=None: "acceptEdits",  # noqa: ARG005
+        )
+
+        adapter = create_llm_adapter(backend="codex", cwd="/tmp/project")
+
+        assert isinstance(adapter, CodexCliLLMAdapter)
+        assert adapter._permission_mode == "acceptEdits"
+
+    def test_opencode_adapter_uses_backend_specific_permission_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """OpenCode uses its dedicated auto-approve default rather than the generic LLM mode."""
+        monkeypatch.setattr(
+            "ouroboros.providers.factory.get_llm_permission_mode",
+            lambda backend=None: "acceptEdits" if backend == "opencode" else "default",
+        )
+
+        adapter = create_llm_adapter(backend="opencode", cwd="/tmp/project")
+
+        assert isinstance(adapter, OpenCodeLLMAdapter)
+        assert adapter._permission_mode == "acceptEdits"
+
+
+class TestResolveLLMPermissionMode:
+    """Tests for use-case-aware permission defaults."""
+
+    def test_interview_mode_escalates_to_bypass_for_claude(self) -> None:
+        """Interview needs bypassPermissions for Claude — read-only sandbox blocks LLM output."""
+        assert (
+            resolve_llm_permission_mode(backend="claude_code", use_case="interview")
+            == "bypassPermissions"
+        )
+
+    def test_interview_mode_escalates_to_bypass_for_codex(self) -> None:
+        """Interview needs bypassPermissions for Codex — read-only sandbox blocks LLM output."""
+        assert (
+            resolve_llm_permission_mode(backend="codex", use_case="interview")
+            == "bypassPermissions"
+        )
+
+    def test_interview_mode_escalates_to_bypass_for_opencode(self) -> None:
+        """Interview needs bypassPermissions for OpenCode — read-only sandbox blocks LLM output."""
+        assert (
+            resolve_llm_permission_mode(backend="opencode", use_case="interview")
+            == "bypassPermissions"
+        )
+
+    def test_interview_mode_escalates_to_bypass_for_goose(self) -> None:
+        """Interview needs permissive mode for Goose CLI output/tool flows."""
+        assert (
+            resolve_llm_permission_mode(backend="goose", use_case="interview")
+            == "bypassPermissions"
+        )
+
+
+class TestGeminiSoftToolEnforcement:
+    """Gemini accepts ``allowed_tools`` but enforces them softly.
+
+    The Gemini CLI has no ``--allowed-tools`` flag, so the adapter injects
+    the envelope as a system-prompt directive and detects out-of-envelope
+    ``tool_use`` events post-hoc.  The factory's job is to (a) still
+    construct the adapter — failing fast would turn every interview or
+    evaluation on Gemini into a hard error with no recovery path — and
+    (b) make the soft-enforcement trade-off visible at construction time
+    so operators can tell it apart from hard-enforced sessions.
+    """
+
+    def _stub_gemini_cli(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        fake_cli = tmp_path / "gemini"
+        fake_cli.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+        fake_cli.chmod(0o755)
+        monkeypatch.setenv("OUROBOROS_GEMINI_CLI_PATH", str(fake_cli))
+
+    def test_gemini_backend_accepts_allowed_tools_with_soft_enforcement(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """Factory still builds a working adapter when Gemini gets an envelope."""
+        self._stub_gemini_cli(monkeypatch, tmp_path)
+
+        adapter = create_llm_adapter(
+            backend="gemini",
+            allowed_tools=["Read", "Grep", "Glob", "WebFetch", "WebSearch"],
+        )
+
+        assert adapter.__class__.__name__ == "GeminiCLIAdapter"
+        # The adapter keeps the envelope for prompt injection + post-hoc
+        # violation detection.
+        assert adapter._allowed_tools == (  # type: ignore[attr-defined]
+            "Read",
+            "Grep",
+            "Glob",
+            "WebFetch",
+            "WebSearch",
+        )
+
+    def test_gemini_backend_accepts_empty_allowed_tools(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """An explicit empty envelope still produces a working adapter —
+        the prompt directive becomes "no tools allowed" instead of a
+        named allowlist.
+        """
+        self._stub_gemini_cli(monkeypatch, tmp_path)
+
+        adapter = create_llm_adapter(backend="gemini", allowed_tools=[])
+
+        assert adapter.__class__.__name__ == "GeminiCLIAdapter"
+        assert adapter._allowed_tools == ()  # type: ignore[attr-defined]
+
+    def test_gemini_backend_accepts_unrestricted_callers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """``allowed_tools=None`` means "caller did not request enforcement"."""
+        self._stub_gemini_cli(monkeypatch, tmp_path)
+
+        adapter = create_llm_adapter(backend="gemini", allowed_tools=None)
+
+        assert adapter.__class__.__name__ == "GeminiCLIAdapter"
+        assert adapter._allowed_tools is None  # type: ignore[attr-defined]
+
+
+class TestCopilotBackend:
+    """GitHub Copilot CLI factory dispatch.
+
+    Mirrors :class:`TestGeminiSoftToolEnforcement`. Copilot CLI honours a
+    real ``--available-tools`` allowlist, so the envelope is hard-enforced
+    rather than soft-enforced — the adapter still has to round-trip the
+    list, empty list, and ``None`` cases through construction.
+    """
+
+    def _stub_copilot_cli(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        fake_cli = tmp_path / "copilot"
+        fake_cli.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+        fake_cli.chmod(0o755)
+        monkeypatch.setenv("OUROBOROS_COPILOT_CLI_PATH", str(fake_cli))
+
+    def test_copilot_backend_returns_copilot_adapter(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        self._stub_copilot_cli(monkeypatch, tmp_path)
+        adapter = create_llm_adapter(backend="copilot")
+        assert isinstance(adapter, CopilotCliLLMAdapter)
+
+    def test_copilot_backend_accepts_allowed_tools_envelope(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        self._stub_copilot_cli(monkeypatch, tmp_path)
+        adapter = create_llm_adapter(
+            backend="copilot",
+            allowed_tools=["Read", "Grep", "Glob"],
+        )
+        assert isinstance(adapter, CopilotCliLLMAdapter)
+        assert adapter._allowed_tools == ["Read", "Grep", "Glob"]  # type: ignore[attr-defined]
+
+    def test_copilot_backend_accepts_empty_allowed_tools(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """An explicit empty allowlist produces a hard "no tools" envelope."""
+        self._stub_copilot_cli(monkeypatch, tmp_path)
+        adapter = create_llm_adapter(backend="copilot", allowed_tools=[])
+        assert isinstance(adapter, CopilotCliLLMAdapter)
+        assert adapter._allowed_tools == []  # type: ignore[attr-defined]
+
+    def test_copilot_backend_accepts_unrestricted_callers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """``allowed_tools=None`` means the caller did not constrain tools."""
+        self._stub_copilot_cli(monkeypatch, tmp_path)
+        adapter = create_llm_adapter(backend="copilot", allowed_tools=None)
+        assert isinstance(adapter, CopilotCliLLMAdapter)
+        assert adapter._allowed_tools is None  # type: ignore[attr-defined]
+
+    def test_copilot_backend_uses_copilot_cli_alias(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """The ``copilot_cli`` alias resolves to the same adapter."""
+        self._stub_copilot_cli(monkeypatch, tmp_path)
+        adapter = create_llm_adapter(backend="copilot_cli")
+        assert isinstance(adapter, CopilotCliLLMAdapter)
+
+
+def test_ourocode_backend_builds_ourocode_llm_adapter() -> None:
+    """The ``ourocode`` backend resolves to the ACP-backed LLM adapter."""
+    from ouroboros.providers.factory import create_llm_adapter
+    from ouroboros.providers.ourocode_llm_adapter import OurocodeLLMAdapter
+
+    adapter = create_llm_adapter(backend="ourocode")
+    assert isinstance(adapter, OurocodeLLMAdapter)

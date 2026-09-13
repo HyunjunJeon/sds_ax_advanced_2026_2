@@ -1,0 +1,541 @@
+import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { lifecyclePaths } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
+import packageJson from "../package.json";
+import { interactiveBootstrapText, routeModelsAlias, routeRootArgv } from "../src/cli";
+import { parseArgs } from "../src/cli/args";
+
+const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
+const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
+
+function extractRegisteredCommands(source: string): string[] {
+	const commandsBlock = source.match(/const commands: CommandEntry\[\] = \[([\s\S]*?)\];/);
+	if (!commandsBlock) return [];
+	return [...commandsBlock[1].matchAll(/\bname:\s*"([^"]+)"/g)].map(match => match[1]);
+}
+
+describe("GJC public CLI command surface", () => {
+	it("routes legacy coordinator MCP invocations to native commands", () => {
+		expect(routeRootArgv(["coordinator-mcp"])).toEqual(["mcp-serve", "coordinator"]);
+		// The legacy `--team` launch shim is gone: it is an ordinary launch prompt now.
+		expect(routeRootArgv(["--team"])).toEqual(["launch", "--team"]);
+	});
+
+	it("routes bare models to --list-models instead of a launch prompt (#3857)", () => {
+		expect(routeModelsAlias(["models"])).toEqual(["launch", "--list-models"]);
+		expect(routeModelsAlias(["models", "deepseek"])).toEqual(["launch", "--list-models", "deepseek"]);
+		expect(routeModelsAlias(["models", "claude", "sonnet"])).toEqual(["launch", "--list-models", "claude sonnet"]);
+		expect(routeModelsAlias(["models", "--json"])).toEqual(["launch", "--list-models", "--json"]);
+		expect(routeModelsAlias(["models", "presets"])).toEqual(["model-presets"]);
+		expect(routeModelsAlias(["models", "presets", "refresh", "--json"])).toEqual([
+			"model-presets",
+			"refresh",
+			"--json",
+		]);
+		expect(routeModelsAlias(["stats"])).toBeUndefined();
+		expect(routeRootArgv(["models"])).toEqual(["launch", "--list-models"]);
+		expect(routeRootArgv(["models", "opus"])).toEqual(["launch", "--list-models", "opus"]);
+		expect(routeRootArgv(["models", "presets", "status"])).toEqual(["model-presets", "status"]);
+		// Ordinary free-form prompts still launch; only the bare `models` token is remapped.
+		expect(routeRootArgv(["list available models"])).toEqual(["launch", "list available models"]);
+	});
+
+	it("renders an immediate keyboard-ready bootstrap only for interactive launch routes", () => {
+		expect(interactiveBootstrapText(["launch"], true, true)).toContain("> ");
+		expect(interactiveBootstrapText(["launch", "hello"], true, true)).toContain("warming workspace");
+		expect(interactiveBootstrapText(["launch", "--print", "hello"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--export", "session.md"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--list-models"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--mode", "json"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--mode=acp"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--export=session.md"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--list-models=opus"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["config", "get", "theme"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch"], false, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch"], true, false)).toBeUndefined();
+	});
+	it("suppresses the interactive bootstrap for every explicit output mode form", () => {
+		expect(interactiveBootstrapText(["launch", "--mode", "text"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--mode=text"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--mode", "text", "--mode=json"], true, true)).toBeUndefined();
+		expect(interactiveBootstrapText(["launch", "--mode=acp", "--mode", "text"], true, true)).toBeUndefined();
+	});
+
+	it("suppresses the interactive bootstrap for explicit launch help and version aliases", () => {
+		for (const flag of ["--help", "-h", "--version", "-v"]) {
+			expect(interactiveBootstrapText(["launch", flag], true, true)).toBeUndefined();
+		}
+	});
+	it("suppresses the interactive bootstrap for parser-accepted equals forms of print, help, and version", () => {
+		for (const flag of ["--print=true", "--help=true", "--version=true", "--print=false"]) {
+			expect(interactiveBootstrapText(["launch", flag], true, true)).toBeUndefined();
+		}
+	});
+
+	it("does not prefix spawned noninteractive launch help output with the bootstrap", () => {
+		const result = Bun.spawnSync(["bun", cliEntry, "launch", "--help"], {
+			cwd: repoRoot,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
+		expect(result.exitCode, output).toBe(0);
+		expect(result.stdout.toString()).not.toContain("warming workspace");
+	});
+	it("routes the internal managed-owner supervisor through its child admission barrier", async () => {
+		if (process.platform !== "linux") return;
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-cli-supervisor-"));
+		const lifecycle = lifecyclePaths(stateDir, "session-cli-route", "generation-cli-route");
+		const managedOwnerEnv = {
+			...process.env,
+			GJC_TMUX_OWNER_STATE_DIR: stateDir,
+			GJC_COORDINATOR_SESSION_ID: "session-cli-route",
+			GJC_TMUX_OWNER_GENERATION: "generation-cli-route",
+			GJC_MANAGED_OWNER_RUN_ID: "run-cli-route",
+			GJC_MANAGED_OWNER_INCARNATION: "incarnation-cli-route",
+		};
+		try {
+			const admitted = Bun.spawnSync(["bun", cliEntry, "--internal-managed-owner-supervisor"], {
+				cwd: repoRoot,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: {
+					...managedOwnerEnv,
+					GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([process.execPath, cliEntry, "--version"]),
+				},
+			});
+			const admittedOutput = `${admitted.stdout.toString()}\n${admitted.stderr.toString()}`;
+			expect(admitted.exitCode, admittedOutput).toBe(0);
+			expect(admitted.stdout.toString()).toMatch(/^gjc\/\d+\.\d+\.\d+\n$/);
+			const bindingFiles = (await fs.readdir(lifecycle.root)).filter(
+				file => file.startsWith("child-") && file.endsWith(".binding.json"),
+			);
+			expect(bindingFiles).toHaveLength(1);
+			await fs.rm(path.join(lifecycle.root, bindingFiles[0]!));
+
+			const unboundChild = `import { readdir, writeFile } from "node:fs/promises";
+const binding = (await readdir(process.env.GJC_MANAGED_OWNER_BINDING_DIR!)).find(file => file.startsWith("child-"));
+if (!binding) throw new Error("binding_missing");
+await writeFile(\`\${process.env.GJC_MANAGED_OWNER_BINDING_DIR}/\${binding}\`, "{}\\n");
+const child = Bun.spawn([${JSON.stringify(process.execPath)}, ${JSON.stringify(cliEntry)}, "--version"], { stdout: "inherit", stderr: "inherit" });
+process.exitCode = await child.exited;`;
+			const blocked = Bun.spawnSync(["bun", cliEntry, "--internal-managed-owner-supervisor"], {
+				cwd: repoRoot,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: {
+					...managedOwnerEnv,
+					GJC_TMUX_OWNER_GENERATION: "generation-cli-blocked",
+					GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([process.execPath, "-e", unboundChild]),
+					GJC_MANAGED_OWNER_BINDING_DIR: lifecyclePaths(stateDir, "session-cli-route", "generation-cli-blocked")
+						.root,
+				},
+			});
+			const blockedOutput = `${blocked.stdout.toString()}\n${blocked.stderr.toString()}`;
+			expect(blocked.exitCode, blockedOutput).toBe(75);
+			expect(blockedOutput).not.toContain("gjc/");
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("registers launch plus retained workflow/runtime utility endpoints", async () => {
+		const source = await Bun.file(cliEntry).text();
+		expect(extractRegisteredCommands(source)).toEqual([
+			"codex-native-hook",
+			"state",
+			"setup",
+			"acp",
+			"auth-broker",
+			"auth-gateway",
+			"skills",
+			"session",
+			"accounts",
+			"harness",
+			"coordinator",
+			"ultragoal",
+			"gc",
+			"crash",
+			"autoresearch",
+			"ralplan",
+			"config",
+			"stats",
+			"notify",
+			"sdk",
+			"daemon",
+			"web-search",
+			"local-provider",
+			"model-presets",
+			"mcp-serve",
+			"mcp",
+			"contribute-pr",
+			"deep-interview",
+			"migrate",
+			"update",
+			"read",
+			"customize",
+			"plugin",
+			"completion",
+			"launch",
+			"quick-lane",
+		]);
+	});
+
+	it("maps the removed worktree package subpaths to throwing tombstone modules", () => {
+		for (const [subpath, target] of [
+			["./cli/worktree-cli", "./src/cli/worktree-cli.ts"],
+			["./cli/worktree-cli.js", "./src/cli/worktree-cli.ts"],
+			["./commands/worktree", "./src/commands/worktree.ts"],
+			["./commands/worktree.js", "./src/commands/worktree.ts"],
+		] as const)
+			expect(packageJson.exports[subpath]).toEqual({ types: target, import: target });
+	});
+
+	it("serves migration guidance for removed worktree subpaths from the packed package", async () => {
+		const stageDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-worktree-tombstone-"));
+		try {
+			const packageDir = path.join(repoRoot, "packages", "coding-agent");
+			const pack = Bun.spawnSync(["bun", "pm", "pack", "--destination", stageDir], {
+				cwd: packageDir,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(pack.exitCode, pack.stderr.toString()).toBe(0);
+			const tarball = (await fs.readdir(stageDir)).find(name => name.endsWith(".tgz"));
+			if (!tarball) throw new Error("bun pm pack produced no tarball");
+			const extract = Bun.spawnSync(["tar", "xzf", tarball], { cwd: stageDir, stdout: "pipe", stderr: "pipe" });
+			expect(extract.exitCode, extract.stderr.toString()).toBe(0);
+			const consumerDir = path.join(stageDir, "consumer");
+			await fs.mkdir(path.join(consumerDir, "node_modules", "@gajae-code"), { recursive: true });
+			await fs.symlink(
+				path.join(stageDir, "package"),
+				path.join(consumerDir, "node_modules", "@gajae-code", "coding-agent"),
+			);
+			for (const subpath of [
+				"@gajae-code/coding-agent/cli/worktree-cli",
+				"@gajae-code/coding-agent/cli/worktree-cli.js",
+				"@gajae-code/coding-agent/commands/worktree",
+				"@gajae-code/coding-agent/commands/worktree.js",
+			]) {
+				const child = Bun.spawnSync([process.execPath, "-e", `await import(${JSON.stringify(subpath)})`], {
+					cwd: consumerDir,
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const output = `${child.stdout.toString()}${child.stderr.toString()}`;
+				expect(child.exitCode, output).not.toBe(0);
+				expect(output).toContain("was deliberately removed");
+				expect(output).toContain("Inspect leftover managed worktrees under ~/.gjc/wt manually");
+				expect(output).toContain("`git worktree remove` or `git worktree prune` instead");
+			}
+		} finally {
+			await fs.rm(stageDir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	it("exposes the update command help without launching the TUI", () => {
+		const result = Bun.spawnSync(["bun", cliEntry, "update", "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const stdout = result.stdout.toString();
+		const stderr = result.stderr.toString();
+		const combined = `${stdout}\n${stderr}`;
+
+		expect(result.exitCode, combined).toBe(0);
+		expect(stdout).toContain("Check for and install updates");
+		expect(combined).not.toContain("What's New");
+		expect(combined).not.toContain("chatContainer");
+	}, 30_000);
+	it("documents the session-index repair flag in gc help", () => {
+		const result = Bun.spawnSync(["bun", cliEntry, "gc", "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
+		expect(result.exitCode, output).toBe(0);
+		expect(output).toContain("--repair-session-index");
+		expect(output.toLowerCase()).toContain("quarantine a corrupt session-index suffix");
+	}, 30_000);
+
+	it("documents the native CLI surface in command help", async () => {
+		for (const command of ["ralplan", "deep-interview", "state", "autoresearch"]) {
+			const result = Bun.spawnSync(["bun", cliEntry, command, "--help"], {
+				cwd: repoRoot,
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
+
+			expect(result.exitCode, output).toBe(0);
+			expect(output).not.toContain("GJC_RUNTIME_BINARY");
+			expect(output).not.toContain("private runtime");
+		}
+	}, 30_000);
+
+	it("preserves root fast-path precedence", () => {
+		const cases = [
+			{ args: ["--tmux", "--version"], output: /^gjc\/\d+\.\d+\.\d+\n$/ },
+			{ args: ["--tmux", "-v"], output: /^gjc\/\d+\.\d+\.\d+\n$/ },
+			{ args: ["--resume", "--version"], output: /^gjc\/\d+\.\d+\.\d+\n$/ },
+			{ args: ["--resume", "-v"], output: /^gjc\/\d+\.\d+\.\d+\n$/ },
+			{ args: ["--help"], output: "USAGE" },
+			{ args: ["--tmux", "--help"], output: "USAGE" },
+			{ args: ["--resume", "--help"], output: "USAGE" },
+		];
+
+		for (const { args, output } of cases) {
+			const result = Bun.spawnSync(["bun", cliEntry, ...args], {
+				cwd: repoRoot,
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const stdout = result.stdout.toString();
+			const stderr = result.stderr.toString();
+
+			expect(result.exitCode, stderr).toBe(0);
+			if (typeof output === "string") expect(stdout).toContain(output);
+			else expect(stdout).toMatch(output);
+		}
+	}, 30_000);
+
+	it("routes compact worktree selectors before root help and version fast paths", () => {
+		for (const args of [
+			["-winvalid..branch", "--help"],
+			["-w=invalid..branch", "--help"],
+		]) {
+			const result = Bun.spawnSync(["bun", cliEntry, ...args], {
+				cwd: repoRoot,
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const output = `${result.stdout.toString()}\n${result.stderr.toString()}`;
+
+			expect(result.exitCode, output).toBe(0);
+			expect(result.stdout.toString()).toContain("$ gjc launch");
+		}
+
+		for (const args of [
+			["-winvalid..branch", "--version"],
+			["-w=invalid..branch", "--version"],
+		]) {
+			const result = Bun.spawnSync(["bun", cliEntry, ...args], {
+				cwd: repoRoot,
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+
+			expect(result.exitCode, result.stderr.toString()).toBe(0);
+			expect(result.stdout.toString()).toBe(`${packageJson.version}\n`);
+		}
+
+		const delimiter = Bun.spawnSync(["bun", cliEntry, "-winvalid..branch", "--", "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const delimiterOutput = `${delimiter.stdout.toString()}\n${delimiter.stderr.toString()}`;
+		expect(delimiter.exitCode, delimiterOutput).not.toBe(0);
+		expect(delimiterOutput).toContain("invalid..branch");
+
+		const unrelated = Bun.spawnSync(["bun", cliEntry, "-xnot-worktree", "--version"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		expect(unrelated.exitCode, unrelated.stderr.toString()).toBe(0);
+		expect(unrelated.stdout.toString()).toMatch(/^gjc\/\d+\.\d+\.\d+\n$/);
+	}, 30_000);
+
+	it("does not capture absolute-path prompts as startup slash commands", () => {
+		const parsed = parseArgs(["/tmp/request.md", "--model", "opus", "summarize"]);
+
+		expect(parsed.model).toBe("opus");
+		expect(parsed.messages).toEqual(["/tmp/request.md", "summarize"]);
+	});
+
+	it("keeps startup slash payload intact after normal CLI flags", () => {
+		const parsed = parseArgs([
+			"--no-lsp",
+			"/provider",
+			"add",
+			"--compat",
+			"anthropic",
+			"--provider",
+			"minimax",
+			"--base-url",
+			"https://api.minimax.io/anthropic",
+			"--api-key-env",
+			"MINIMAX_APIKEY",
+			"--model",
+			"MiniMax-M2.7-highspeed",
+		]);
+
+		expect(parsed.noLsp).toBe(true);
+		expect(parsed.provider).toBeUndefined();
+		expect(parsed.model).toBeUndefined();
+		expect(parsed.messages).toEqual([
+			"/provider add --compat anthropic --provider minimax --base-url https://api.minimax.io/anthropic --api-key-env MINIMAX_APIKEY --model MiniMax-M2.7-highspeed",
+		]);
+	});
+
+	it("keeps CLI slash-command invocations as one initial message", () => {
+		const parsed = parseArgs([
+			"/provider",
+			"add",
+			"--compat",
+			"anthropic",
+			"--provider",
+			"minimax",
+			"--base-url",
+			"https://api.minimax.io/anthropic",
+			"--api-key-env",
+			"MINIMAX_APIKEY",
+			"--model",
+			"MiniMax-M2.7-highspeed",
+		]);
+
+		expect(parsed.messages).toEqual([
+			"/provider add --compat anthropic --provider minimax --base-url https://api.minimax.io/anthropic --api-key-env MINIMAX_APIKEY --model MiniMax-M2.7-highspeed",
+		]);
+	});
+
+	it("routes bare setup as the default workflow-skill setup command", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-setup-command-home-"));
+		try {
+			const result = Bun.spawnSync(["bun", cliEntry, "setup", "--json"], {
+				cwd: repoRoot,
+				env: { ...process.env, HOME: home, GJC_CODING_AGENT_DIR: path.join(home, ".gjc", "agent") },
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const stdout = result.stdout.toString();
+			const stderr = result.stderr.toString();
+
+			expect(result.exitCode, stderr).toBe(0);
+			const payload = JSON.parse(stdout) as { written?: number; targetRoot?: string };
+			expect(payload.written).toBe(10);
+			expect(payload.targetRoot).toContain(path.join(home, ".gjc", "agent"));
+		} finally {
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("routes every advertised SDK family and rejects the removed daemon session route", async () => {
+		const sdkHelp = Bun.spawnSync(["bun", cliEntry, "sdk", "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const sdkHelpOutput = `${sdkHelp.stdout.toString()}\n${sdkHelp.stderr.toString()}`;
+		expect(sdkHelp.exitCode, sdkHelpOutput).toBe(0);
+		for (const token of ["serve", "session", "guides"]) expect(sdkHelp.stdout.toString()).toContain(token);
+
+		const serve = Bun.spawnSync(["bun", cliEntry, "sdk", "serve"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const serveOutput = `${serve.stdout.toString()}\n${serve.stderr.toString()}`;
+		expect(serve.exitCode, serveOutput).toBe(2);
+		expect(serveOutput).toContain("gjc sdk serve: specify exactly one of");
+
+		const guideAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-guides-command-"));
+		try {
+			const guides = Bun.spawnSync(["bun", cliEntry, "sdk", "guides", "list", "--agent-dir", guideAgentDir], {
+				cwd: repoRoot,
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const guidesOutput = `${guides.stdout.toString()}\n${guides.stderr.toString()}`;
+			expect(guides.exitCode, guidesOutput).toBe(0);
+			expect(JSON.parse(guides.stdout.toString())).toMatchObject({ ok: true, result: { source: "bundled" } });
+		} finally {
+			await fs.rm(guideAgentDir, { recursive: true, force: true });
+		}
+		const help = Bun.spawnSync(["bun", cliEntry, "sdk", "session", "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const helpOutput = `${help.stdout.toString()}\n${help.stderr.toString()}`;
+		expect(help.exitCode, helpOutput).toBe(0);
+		for (const token of [
+			"list",
+			"inspect",
+			"send",
+			"status",
+			"tail",
+			"raw",
+			"--until-idle",
+			"--strict",
+			"--all-events",
+		])
+			expect(help.stdout.toString()).toContain(token);
+		expect(help.stdout.toString()).not.toContain("elevate");
+		expect(help.stdout.toString()).not.toContain("show-endpoint-credential");
+
+		const missingVerb = Bun.spawnSync(["bun", cliEntry, "sdk", "session"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const missingOutput = `${missingVerb.stdout.toString()}\n${missingVerb.stderr.toString()}`;
+		expect(missingVerb.exitCode, missingOutput).toBe(2);
+		expect(JSON.parse(missingVerb.stdout.toString())).toMatchObject({
+			ok: false,
+			error: { code: "usage" },
+		});
+
+		const unknownVerb = Bun.spawnSync(["bun", cliEntry, "sdk", "session", "bogus"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const unknownOutput = `${unknownVerb.stdout.toString()}\n${unknownVerb.stderr.toString()}`;
+		expect(unknownVerb.exitCode, unknownOutput).toBe(2);
+		expect(unknownVerb.stderr.toString()).toContain("Expected verb to be one of");
+
+		// `gjc daemon session` is deleted without an alias (DR-13).
+		const daemonSession = Bun.spawnSync(["bun", cliEntry, "daemon", "session", "list"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const daemonOutput = `${daemonSession.stdout.toString()}\n${daemonSession.stderr.toString()}`;
+		expect(daemonSession.exitCode, daemonOutput).toBe(2);
+		expect(daemonSession.stderr.toString()).toContain("Expected action to be one of");
+	}, 30_000);
+});
+
+describe("startup login parsing", () => {
+	it("normalizes exact bare and slash login recovery forms", () => {
+		expect(parseArgs(["login"])).toMatchObject({ authBootstrap: true, messages: ["/login"] });
+		expect(parseArgs(["login", "openai-codex"])).toMatchObject({
+			authBootstrap: true,
+			messages: ["/login openai-codex"],
+		});
+		expect(parseArgs(["--no-title", "login", "openai-codex"])).toMatchObject({
+			noTitle: true,
+			authBootstrap: true,
+			messages: ["/login openai-codex"],
+		});
+		expect(parseArgs(["/login"])).toMatchObject({ authBootstrap: true, messages: ["/login"] });
+		expect(parseArgs(["/login", "https://localhost/callback?code=callback"])).toMatchObject({
+			authBootstrap: true,
+			messages: ["/login https://localhost/callback?code=callback"],
+		});
+	});
+
+	it("does not mark ordinary prompts or unsupported login-shaped commands as recovery", () => {
+		expect(parseArgs([]).authBootstrap).toBeUndefined();
+		expect(parseArgs(["/logout", "openai-codex"]).authBootstrap).toBeUndefined();
+		expect(parseArgs(["/provider", "login", "openai-codex"]).authBootstrap).toBeUndefined();
+		expect(parseArgs(["login", "openai-codex", "extra"]).authBootstrap).toBeUndefined();
+		expect(parseArgs(["/login", "openai-codex", "extra"]).authBootstrap).toBeUndefined();
+	});
+});

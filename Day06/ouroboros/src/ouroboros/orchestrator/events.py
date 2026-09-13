@@ -1,0 +1,822 @@
+"""Event creation helpers for orchestrator.
+
+This module provides factory functions for creating orchestrator-related events
+following the project's event naming convention (dot.notation.past_tense).
+
+Event Types:
+    - orchestrator.session.started: Session began execution
+    - orchestrator.session.completed: Session finished successfully
+    - orchestrator.session.failed: Session encountered fatal error
+    - orchestrator.session.cancelled: Session was cancelled by user/auto-cleanup
+    - orchestrator.session.paused: Session paused for resumption
+    - orchestrator.guidance.injected: Bounded guidance injection audit metadata
+    - orchestrator.progress.updated: Progress checkpoint
+    - orchestrator.task.started: Individual task started
+    - orchestrator.task.completed: Individual task completed
+    - orchestrator.tool.called: Tool was invoked by agent
+    - orchestrator.policy.capabilities.evaluated: Batched per-capability
+      policy decisions for a session-scoped policy evaluation
+    - execution.ac.investment_assessed: Exact AC investment authority used by
+      effort policy
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
+from uuid import NAMESPACE_URL, uuid5
+
+from ouroboros.core.project_identity import ProjectIdentity
+from ouroboros.events.base import BaseEvent
+from ouroboros.orchestrator.capabilities import CapabilityDescriptor, CapabilityGraph
+from ouroboros.orchestrator.policy import PolicyContext, PolicyDecision
+
+_MAX_GUIDANCE_REFS = 16
+_MAX_GUIDANCE_REF_VALUE_LENGTH = 512
+_GUIDANCE_REF_ALLOWED_KEYS = frozenset(
+    {
+        "id",
+        "stable_id",
+        "source",
+        "kind",
+        "stage",
+        "role",
+        "path",
+        "content_hash",
+        "size_bytes",
+    }
+)
+FRUGALITY_RETROSPECTIVE_EVENT_TYPE = "execution.frugality_retrospective.reported"
+
+
+def create_session_started_event(
+    session_id: str,
+    execution_id: str,
+    seed_id: str,
+    seed_goal: str,
+    *,
+    project_identity: ProjectIdentity | None = None,
+    gate_forced: bool | None = None,
+) -> BaseEvent:
+    """Create session started event.
+
+    Args:
+        session_id: Unique session identifier.
+        execution_id: Associated workflow execution ID.
+        seed_id: ID of the seed being executed.
+        seed_goal: Goal from the seed specification.
+        gate_forced: Whether the Seed bypassed the ambiguity gate. ``None``
+            preserves the legacy event shape when the decision is unknown.
+        project_identity: Canonical Project Map V1 anchor, mandatory for
+            runner-owned new sessions. Historical and contract-free low-level
+            events may omit it.
+
+    Returns:
+        BaseEvent for session start.
+    """
+    data = {
+        "execution_id": execution_id,
+        "seed_id": seed_id,
+        "seed_goal": seed_goal,
+        "start_time": datetime.now(UTC).isoformat(),
+    }
+    if project_identity is not None:
+        data.update(project_identity.to_event_data())
+    if gate_forced is not None:
+        data["gate_forced"] = gate_forced
+    return BaseEvent(
+        type="orchestrator.session.started",
+        aggregate_type="session",
+        aggregate_id=session_id,
+        data=data,
+    )
+
+
+def create_guidance_injected_event(
+    *,
+    session_id: str,
+    execution_id: str,
+    guidance_refs: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    fragment_hash: str,
+    fragment_size_bytes: int,
+    delivery_mode: str,
+    injection_key: str = "start",
+) -> BaseEvent:
+    """Create bounded audit metadata for injected implementation guidance.
+
+    The event intentionally records references and content fingerprints only.
+    It must not carry the raw guidance body; ref serialization accepts only
+    the known provenance fields and bounds every scalar value.
+    """
+    return BaseEvent(
+        type="orchestrator.guidance.injected",
+        aggregate_type="session",
+        aggregate_id=session_id,
+        data={
+            "session_id": session_id,
+            "execution_id": execution_id,
+            "guidance_refs": _serialize_guidance_refs(guidance_refs),
+            "fragment_hash": fragment_hash.strip()[:_MAX_GUIDANCE_REF_VALUE_LENGTH],
+            "fragment_size_bytes": max(fragment_size_bytes, 0),
+            "stage": "execute",
+            "role": "implementation",
+            "delivery_mode": delivery_mode.strip()[:_MAX_GUIDANCE_REF_VALUE_LENGTH],
+            "injection_key": injection_key.strip()[:_MAX_GUIDANCE_REF_VALUE_LENGTH],
+            "provenance_scope": "ouroboros_declared_guidance_only",
+            "injected_at": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+def create_session_completed_event(
+    session_id: str,
+    summary: dict[str, Any],
+    messages_processed: int,
+) -> BaseEvent:
+    """Create session completed event.
+
+    Args:
+        session_id: Session that completed.
+        summary: Execution summary data.
+        messages_processed: Total messages processed.
+
+    Returns:
+        BaseEvent for session completion.
+    """
+    return BaseEvent(
+        type="orchestrator.session.completed",
+        aggregate_type="session",
+        aggregate_id=session_id,
+        data={
+            "summary": summary,
+            "messages_processed": messages_processed,
+            "completed_at": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+def create_session_failed_event(
+    session_id: str,
+    error_message: str,
+    error_type: str | None = None,
+    messages_processed: int = 0,
+) -> BaseEvent:
+    """Create session failed event.
+
+    Args:
+        session_id: Session that failed.
+        error_message: Error description.
+        error_type: Type/category of error.
+        messages_processed: Messages processed before failure.
+
+    Returns:
+        BaseEvent for session failure.
+    """
+    return BaseEvent(
+        type="orchestrator.session.failed",
+        aggregate_type="session",
+        aggregate_id=session_id,
+        data={
+            "error": error_message,
+            "error_type": error_type,
+            "messages_processed": messages_processed,
+            "failed_at": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+def create_session_cancelled_event(
+    session_id: str,
+    reason: str,
+    cancelled_by: str = "user",
+) -> BaseEvent:
+    """Create session cancelled event.
+
+    Emitted when a session is cancelled by user request or auto-cleanup.
+
+    Args:
+        session_id: Session being cancelled.
+        reason: Why the session was cancelled.
+        cancelled_by: Who/what initiated cancellation ("user", "auto_cleanup").
+
+    Returns:
+        BaseEvent for session cancellation.
+    """
+    return BaseEvent(
+        type="orchestrator.session.cancelled",
+        aggregate_type="session",
+        aggregate_id=session_id,
+        data={
+            "reason": reason,
+            "cancelled_by": cancelled_by,
+            "cancelled_at": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+def create_session_paused_event(
+    session_id: str,
+    reason: str,
+    resume_hint: str | None = None,
+    *,
+    pause_seconds: int | None = None,
+    resume_after: datetime | None = None,
+    pause_kind: str | None = None,
+) -> BaseEvent:
+    """Create session paused event.
+
+    Args:
+        session_id: Session being paused.
+        reason: Why the session was paused.
+        resume_hint: Hint for resumption (e.g., last AC processed).
+
+    Returns:
+        BaseEvent for session pause.
+    """
+    data: dict[str, Any] = {
+        "reason": reason,
+        "resume_hint": resume_hint,
+        "paused_at": datetime.now(UTC).isoformat(),
+    }
+    if pause_seconds is not None:
+        data["pause_seconds"] = pause_seconds
+    if resume_after is not None:
+        data["resume_after"] = resume_after.isoformat()
+    if pause_kind is not None:
+        data["pause_kind"] = pause_kind
+
+    return BaseEvent(
+        type="orchestrator.session.paused",
+        aggregate_type="session",
+        aggregate_id=session_id,
+        data=data,
+    )
+
+
+def create_progress_event(
+    session_id: str,
+    message_type: str,
+    content_preview: str,
+    step: int | None = None,
+    tool_name: str | None = None,
+) -> BaseEvent:
+    """Create progress update event.
+
+    Emitted periodically during execution to track progress.
+    Useful for reconstructing session state during resumption.
+
+    Args:
+        session_id: Session being updated.
+        message_type: Type of message ("assistant", "tool", etc.).
+        content_preview: Preview of message content (truncated).
+        step: Optional step number.
+        tool_name: Tool being called (if message_type="tool").
+
+    Returns:
+        BaseEvent for progress update.
+    """
+    data: dict[str, Any] = {
+        "message_type": message_type,
+        "content_preview": content_preview[:200],  # Truncate for storage
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+    if step is not None:
+        data["step"] = step
+
+    if tool_name:
+        data["tool_name"] = tool_name
+
+    return BaseEvent(
+        type="orchestrator.progress.updated",
+        aggregate_type="session",
+        aggregate_id=session_id,
+        data=data,
+    )
+
+
+def create_task_started_event(
+    session_id: str,
+    task_description: str,
+    acceptance_criterion: str,
+    *,
+    ac_id: str | None = None,
+    retry_attempt: int = 0,
+) -> BaseEvent:
+    """Create task started event.
+
+    Args:
+        session_id: Session executing the task.
+        task_description: What the task aims to accomplish.
+        acceptance_criterion: AC from the seed being executed.
+        ac_id: Stable AC identifier for reopened execution attempts.
+        retry_attempt: Retry attempt number (0 for the first execution).
+
+    Returns:
+        BaseEvent for task start.
+    """
+    data: dict[str, Any] = {
+        "task_description": task_description,
+        "acceptance_criterion": acceptance_criterion,
+        "retry_attempt": retry_attempt,
+        "attempt_number": retry_attempt + 1,
+        "started_at": datetime.now(UTC).isoformat(),
+    }
+    if ac_id:
+        data["ac_id"] = ac_id
+
+    return BaseEvent(
+        type="orchestrator.task.started",
+        aggregate_type="session",
+        aggregate_id=session_id,
+        data=data,
+    )
+
+
+def create_task_completed_event(
+    session_id: str,
+    acceptance_criterion: str,
+    success: bool,
+    result_summary: str | None = None,
+    *,
+    ac_id: str | None = None,
+    retry_attempt: int = 0,
+) -> BaseEvent:
+    """Create task completed event.
+
+    Args:
+        session_id: Session that completed the task.
+        acceptance_criterion: AC that was executed.
+        success: Whether the task succeeded.
+        result_summary: Summary of what was accomplished.
+        ac_id: Stable AC identifier for reopened execution attempts.
+        retry_attempt: Retry attempt number (0 for the first execution).
+
+    Returns:
+        BaseEvent for task completion.
+    """
+    data: dict[str, Any] = {
+        "acceptance_criterion": acceptance_criterion,
+        "success": success,
+        "result_summary": result_summary,
+        "retry_attempt": retry_attempt,
+        "attempt_number": retry_attempt + 1,
+        "completed_at": datetime.now(UTC).isoformat(),
+    }
+    if ac_id:
+        data["ac_id"] = ac_id
+
+    return BaseEvent(
+        type="orchestrator.task.completed",
+        aggregate_type="session",
+        aggregate_id=session_id,
+        data=data,
+    )
+
+
+def create_tool_called_event(
+    session_id: str,
+    tool_name: str,
+    tool_input_preview: str | None = None,
+) -> BaseEvent:
+    """Create tool called event.
+
+    Args:
+        session_id: Session where tool was called.
+        tool_name: Name of the tool (Read, Edit, Bash, etc.).
+        tool_input_preview: Preview of tool input (truncated).
+
+    Returns:
+        BaseEvent for tool invocation.
+    """
+    data: dict[str, Any] = {
+        "tool_name": tool_name,
+        "called_at": datetime.now(UTC).isoformat(),
+    }
+
+    if tool_input_preview:
+        data["tool_input_preview"] = tool_input_preview[:100]
+
+    return BaseEvent(
+        type="orchestrator.tool.called",
+        aggregate_type="session",
+        aggregate_id=session_id,
+        data=data,
+    )
+
+
+def create_mcp_tools_loaded_event(
+    session_id: str,
+    tool_count: int,
+    server_names: tuple[str, ...],
+    conflict_count: int = 0,
+    tool_names: list[str] | None = None,
+) -> BaseEvent:
+    """Create MCP tools loaded event.
+
+    Emitted when MCP tools are discovered and loaded for a session.
+
+    Args:
+        session_id: Session loading the tools.
+        tool_count: Number of MCP tools loaded.
+        server_names: Names of MCP servers providing tools.
+        conflict_count: Number of tool name conflicts detected.
+        tool_names: Optional list of loaded tool names.
+
+    Returns:
+        BaseEvent for MCP tools loaded.
+    """
+    data: dict[str, Any] = {
+        "tool_count": tool_count,
+        "server_names": list(server_names),
+        "conflict_count": conflict_count,
+        "loaded_at": datetime.now(UTC).isoformat(),
+    }
+
+    if tool_names:
+        data["tool_names"] = tool_names[:50]  # Limit to 50 for storage
+
+    return BaseEvent(
+        type="orchestrator.mcp_tools.loaded",
+        aggregate_type="session",
+        aggregate_id=session_id,
+        data=data,
+    )
+
+
+def _serialize_guidance_refs(
+    guidance_refs: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> list[dict[str, str]]:
+    serialized: list[dict[str, str]] = []
+    for ref in guidance_refs[:_MAX_GUIDANCE_REFS]:
+        if not isinstance(ref, dict):
+            continue
+        item: dict[str, str] = {}
+        for key, value in ref.items():
+            if not isinstance(key, str):
+                continue
+            normalized_key = key.strip()
+            if normalized_key not in _GUIDANCE_REF_ALLOWED_KEYS:
+                continue
+            if isinstance(value, str):
+                normalized_value = value.strip()
+            elif isinstance(value, int | float | bool):
+                normalized_value = str(value)
+            else:
+                continue
+            if normalized_value:
+                item[normalized_key] = normalized_value[:_MAX_GUIDANCE_REF_VALUE_LENGTH]
+        if item:
+            serialized.append(item)
+    return serialized
+
+
+def _serialize_policy_capability_evaluation(
+    descriptor: CapabilityDescriptor,
+    decision: PolicyDecision,
+) -> dict[str, Any]:
+    """Serialize one capability-policy decision for audit events."""
+    return {
+        "capability": {
+            "stable_id": descriptor.stable_id,
+            "name": descriptor.name,
+            "source_kind": descriptor.source_kind,
+            "source_name": descriptor.source_name,
+            "origin": descriptor.semantics.origin.value,
+            "scope": descriptor.semantics.scope.value,
+            "mutation_class": descriptor.semantics.mutation_class.value,
+            "parallel_safety": descriptor.semantics.parallel_safety.value,
+            "approval_class": descriptor.semantics.approval_class.value,
+        },
+        "decision": {
+            "visible": decision.visible,
+            "executable": decision.executable,
+            "approval_class": decision.approval_class.value,
+            "reasons": list(decision.reasons),
+        },
+    }
+
+
+def create_policy_capabilities_evaluated_event(
+    session_id: str,
+    graph: CapabilityGraph,
+    decisions: tuple[PolicyDecision, ...],
+    context: PolicyContext,
+) -> BaseEvent:
+    """Create one batched audit event for all capability-policy decisions."""
+    decisions_by_id = {decision.stable_id: decision for decision in decisions}
+    evaluations = [
+        _serialize_policy_capability_evaluation(descriptor, decision)
+        for descriptor in graph.capabilities
+        if (decision := decisions_by_id.get(descriptor.stable_id)) is not None
+    ]
+    return BaseEvent(
+        type="orchestrator.policy.capabilities.evaluated",
+        aggregate_type="session",
+        aggregate_id=session_id,
+        data={
+            "evaluations": evaluations,
+            "capability_count": len(evaluations),
+            "context": {
+                "runtime_backend": context.runtime_backend,
+                "session_role": context.session_role.value,
+                "execution_phase": context.execution_phase.value,
+            },
+            "evaluated_at": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+def create_workflow_progress_event(
+    execution_id: str,
+    session_id: str,
+    acceptance_criteria: list[dict[str, Any]],
+    completed_count: int,
+    total_count: int,
+    current_ac_index: int | None = None,
+    current_phase: str = "Discover",
+    activity: str = "idle",
+    activity_detail: str = "",
+    elapsed_display: str = "",
+    estimated_remaining: str = "",
+    messages_count: int = 0,
+    tool_calls_count: int = 0,
+    estimated_tokens: int = 0,
+    estimated_cost_usd: float = 0.0,
+    last_update: dict[str, Any] | None = None,
+) -> BaseEvent:
+    """Create workflow progress event.
+
+    Emitted when WorkflowStateTracker updates with new progress.
+    Used by TUI to update ACProgressWidget.
+
+    Args:
+        execution_id: Current execution ID.
+        session_id: Current session ID.
+        acceptance_criteria: List of AC dicts with index, content, status, elapsed.
+        completed_count: Number of completed ACs.
+        total_count: Total number of ACs.
+        current_ac_index: Index of AC currently being worked on.
+        current_phase: Current Double Diamond phase.
+        activity: Current activity type.
+        activity_detail: Activity detail string.
+        elapsed_display: Total elapsed time display.
+        estimated_remaining: Estimated remaining time display.
+        messages_count: Total messages processed.
+        tool_calls_count: Total tool calls made.
+        estimated_tokens: Estimated token usage.
+        estimated_cost_usd: Estimated cost in USD.
+        last_update: Optional normalized artifact snapshot from the latest runtime message.
+
+    Returns:
+        BaseEvent for workflow progress update.
+    """
+    data: dict[str, Any] = {
+        "session_id": session_id,
+        "acceptance_criteria": acceptance_criteria,
+        "completed_count": completed_count,
+        "total_count": total_count,
+        "current_ac_index": current_ac_index,
+        "current_phase": current_phase,
+        "activity": activity,
+        "activity_detail": activity_detail,
+        "elapsed_display": elapsed_display,
+        "estimated_remaining": estimated_remaining,
+        "messages_count": messages_count,
+        "tool_calls_count": tool_calls_count,
+        "estimated_tokens": estimated_tokens,
+        "estimated_cost_usd": estimated_cost_usd,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+    if last_update:
+        data["last_update"] = dict(last_update)
+
+    return BaseEvent(
+        type="workflow.progress.updated",
+        aggregate_type="execution",
+        aggregate_id=execution_id,
+        data=data,
+    )
+
+
+def create_heartbeat_event(
+    session_id: str,
+    ac_index: int,
+    ac_id: str,
+    elapsed_seconds: float,
+    message_count: int,
+) -> BaseEvent:
+    """Create heartbeat event for AC liveness tracking.
+
+    Emitted periodically during AC execution to prove liveness.
+    Consumers (TUI, monitors) can detect stalls by the absence of heartbeats.
+
+    Args:
+        session_id: Parent session ID.
+        ac_index: AC being executed.
+        ac_id: AC identifier string (e.g., "node_7YK4Q2J9F6"; legacy "ac_1" allowed).
+        elapsed_seconds: Seconds since AC execution started.
+        message_count: Messages received so far.
+
+    Returns:
+        BaseEvent for heartbeat.
+    """
+    return BaseEvent(
+        type="execution.ac.heartbeat",
+        aggregate_type="execution",
+        aggregate_id=ac_id,
+        data={
+            "session_id": session_id,
+            "ac_index": ac_index,
+            "elapsed_seconds": elapsed_seconds,
+            "message_count": message_count,
+            "timestamp": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+def create_ac_stall_detected_event(
+    session_id: str,
+    ac_index: int,
+    ac_id: str,
+    silent_seconds: float,
+    attempt: int,
+    max_attempts: int,
+    action: str,
+) -> BaseEvent:
+    """Create stall detected event.
+
+    Emitted when an AC has produced no messages for longer than the stall timeout.
+
+    Args:
+        session_id: Parent session ID.
+        ac_index: Stalled AC index.
+        ac_id: AC identifier string.
+        silent_seconds: Seconds of silence before detection.
+        attempt: Current attempt number (1-based).
+        max_attempts: Maximum attempts before abandoning.
+        action: "restart" or "abandon".
+
+    Returns:
+        BaseEvent for stall detection.
+    """
+    return BaseEvent(
+        type="execution.ac.stall_detected",
+        aggregate_type="execution",
+        aggregate_id=ac_id,
+        data={
+            "session_id": session_id,
+            "ac_index": ac_index,
+            "ac_id": ac_id,
+            "silent_seconds": silent_seconds,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "action": action,
+            "timestamp": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+def create_drift_measured_event(
+    execution_id: str,
+    goal_drift: float,
+    constraint_drift: float,
+    ontology_drift: float,
+    combined_drift: float,
+    is_acceptable: bool,
+) -> BaseEvent:
+    """Create drift measured event.
+
+    Emitted when drift is measured during workflow execution.
+
+    Args:
+        execution_id: Current execution ID.
+        goal_drift: Goal drift value (0.0-1.0).
+        constraint_drift: Constraint drift value (0.0-1.0).
+        ontology_drift: Ontology drift value (0.0-1.0).
+        combined_drift: Combined weighted drift value.
+        is_acceptable: Whether drift is within acceptable threshold.
+
+    Returns:
+        BaseEvent for drift measurement.
+    """
+    return BaseEvent(
+        type="observability.drift.measured",
+        aggregate_type="execution",
+        aggregate_id=execution_id,
+        data={
+            "goal_drift": goal_drift,
+            "constraint_drift": constraint_drift,
+            "ontology_drift": ontology_drift,
+            "combined_drift": combined_drift,
+            "is_acceptable": is_acceptable,
+            "timestamp": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+def create_execution_terminal_event(
+    execution_id: str,
+    session_id: str,
+    status: str,
+    *,
+    summary: dict[str, Any] | None = None,
+    error_message: str | None = None,
+    messages_processed: int = 0,
+    pause_seconds: int | None = None,
+    resume_after: datetime | None = None,
+    pause_kind: str | None = None,
+    resume_hint: str | None = None,
+) -> BaseEvent:
+    """Mirror a session terminal state into the execution event stream.
+
+    The orchestrator stores lifecycle events (started/completed/failed)
+    under ``aggregate_type="session"`` while runtime progress events use
+    ``aggregate_type="execution"``.  TUI and other consumers that poll
+    only the execution stream would never see the terminal transition.
+
+    This helper emits an ``execution.terminal`` event under the execution
+    aggregate so that a single-stream consumer can detect completion
+    without polling a second channel.
+    """
+    data: dict[str, Any] = {
+        "session_id": session_id,
+        "status": status,
+        "messages_processed": messages_processed,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+    if summary is not None:
+        data["summary"] = summary
+    if error_message is not None:
+        data["error_message"] = error_message
+    if pause_seconds is not None:
+        data["pause_seconds"] = pause_seconds
+    if resume_after is not None:
+        data["resume_after"] = resume_after.isoformat()
+    if pause_kind is not None:
+        data["pause_kind"] = pause_kind
+    if resume_hint is not None:
+        data["resume_hint"] = resume_hint
+    return BaseEvent(
+        type="execution.terminal",
+        aggregate_type="execution",
+        aggregate_id=execution_id,
+        data=data,
+    )
+
+
+def create_frugality_retrospective_event(
+    execution_id: str,
+    data: dict[str, Any],
+    *,
+    session_id: str | None = None,
+) -> BaseEvent:
+    """Create a deterministic, session-scoped v1 retrospective event.
+
+    Execution ids can be intentionally shared by multiple orchestration
+    sessions.  Include the session (and, when present, acceptance generation)
+    in the event identity so one session's retrospective cannot deduplicate or
+    overwrite another's.
+    """
+    resolved_session_id = session_id or (
+        data.get("session_id") if isinstance(data.get("session_id"), str) else None
+    )
+    generation = (
+        data.get("acceptance_generation_id")
+        if isinstance(data.get("acceptance_generation_id"), str)
+        else None
+    )
+    identity_scope = "\x00".join((execution_id, resolved_session_id or "", generation or ""))
+    event_id = uuid5(
+        NAMESPACE_URL,
+        f"ouroboros:{FRUGALITY_RETROSPECTIVE_EVENT_TYPE}:v1:{identity_scope}",
+    )
+    return BaseEvent(
+        id=str(event_id),
+        type=FRUGALITY_RETROSPECTIVE_EVENT_TYPE,
+        aggregate_type="execution",
+        aggregate_id=execution_id,
+        data=data,
+    )
+
+
+__all__ = [
+    "FRUGALITY_RETROSPECTIVE_EVENT_TYPE",
+    "create_ac_stall_detected_event",
+    "create_drift_measured_event",
+    "create_execution_terminal_event",
+    "create_frugality_retrospective_event",
+    "create_heartbeat_event",
+    "create_mcp_tools_loaded_event",
+    "create_policy_capabilities_evaluated_event",
+    "create_progress_event",
+    "create_session_cancelled_event",
+    "create_session_completed_event",
+    "create_session_failed_event",
+    "create_session_paused_event",
+    "create_session_started_event",
+    "create_task_completed_event",
+    "create_task_started_event",
+    "create_tool_called_event",
+    "create_workflow_progress_event",
+]

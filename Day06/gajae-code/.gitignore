@@ -1,0 +1,99 @@
+# Dependencies
+node_modules/
+node_modules
+.npm/
+
+# Build output
+dist/
+packages/*/dist/
+packages/*/dist-chrome/
+packages/*/dist-firefox/
+target/
+*.tsbuildinfo
+*.node
+*.node.build.json
+*.b64.js
+# `bun build --compile` leaves these next to the entrypoint when it is interrupted.
+*.bun-build
+
+# Environment
+.env
+
+# Editors
+.vscode/
+.zed/
+.idea/
+*.swp
+*.swo
+*.kate-swp
+*~
+
+# OS
+*.tmp
+.DS_Store
+
+# Logs & profiling
+*.log
+tui-debug.log
+*.cpuprofile
+
+# Test & coverage
+coverage/
+.nyc_output/
+packages/ai/test/.temp-images/
+
+# Project specific
+!.gjc/
+!.gjc/agents/
+!.gjc/agents/**
+!.gjc/skills/
+!.gjc/skills/**
+.gjc/plugins/
+.gjc/context/
+.gjc/interviews/
+.gjc/plans/
+.gjc/ralplan/
+.gjc/specs/
+.gjc/ultragoal/
+.gjc/verification/
+.gjc/logs/
+.gjc/rlm/
+**/.gjc/state/
+.gjc/_session-*/
+.gjc/rss-checkpoints/
+.gjc/metrics.json
+**/.gjc/settings.json.fallback-invalid
+**/.gjc/settings.json.config-root.fallback-invalid
+**/.gjc/settings.json.strict-invalid
+.pi_config/
+.opencode/
+.worktrees/
+compaction-results/
+changes/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+
+# Scratch files
+syntax.jsonl
+out.jsonl
+out.html
+pi-*.html
+
+# Generated files
+packages/coding-agent/src/internal-urls/docs-index.generated.ts
+/runs/
+# parallel-agent worktrees
+.wt/
+CPU*.md
+packages/coding-agent/binaries/
+
+# Root artifacts/ is untracked test working space (issue #4420).
+# Tests write evidence there and read it back within the same run;
+# test fixtures belong in packages/*/test/fixtures/ instead.
+/artifacts/
+.release-040-artifacts/
+
+# Python SDK build output
+python/gjc-sdk/build/
+*.py[cod]

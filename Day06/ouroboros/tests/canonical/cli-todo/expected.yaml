@@ -1,0 +1,38 @@
+# L0 canonical acceptance scenario — cli-todo
+#
+# This scenario exercises the simplest end-to-end shape: a single-binary
+# CLI tool with deterministic stdout. The expected metadata below pins
+# what the auto pipeline must derive (`domain_class`) and how the
+# acceptance gate verifies the artifact (`completion_mode`,
+# `runtime_probe_kinds`).
+#
+# These values are validated against the L1 `TaskClassProfile` catalog
+# by `tests/canonical/test_canonical.py`.
+
+domain_class: cli
+completion_mode: product_complete
+
+runtime_probe_kinds:
+  - headless_run
+  - stdout_golden
+
+# 30-minute soft budget honored by the opt-in live canonical runner.
+wall_clock_budget_seconds: 1800
+
+# Live product-reality smoke contract (#1452). The live harness executes
+# these after ouroboros_auto reaches a successful product terminal.
+product_artifact_path: habit_tracker.py
+declared_output_paths:
+  - habits.json
+product_smoke_commands:
+  - argv: ["python", "{artifact}", "add", "drink water"]
+    expect_exit_code: 0
+    stdout_contains: ["drink water"]
+  - argv: ["python", "{artifact}", "list"]
+    expect_exit_code: 0
+    stdout_contains: ["drink water"]
+  - argv: ["python", "{artifact}", "done", "drink water"]
+    expect_exit_code: 0
+    stdout_contains: ["drink water"]
+  - argv: ["python", "{artifact}", "unknown-command"]
+    expect_exit_code: 2

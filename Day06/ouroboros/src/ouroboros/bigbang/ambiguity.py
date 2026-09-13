@@ -1,0 +1,1107 @@
+"""Ambiguity scoring module for requirement clarity assessment.
+
+This module implements ambiguity measurement for interview states, determining
+when requirements are clear enough (score <= 0.2) to proceed with Seed generation.
+
+The scoring algorithm evaluates three key components:
+- Goal Clarity (40%): How well the goal statement is defined
+- Constraint Clarity (30%): How clearly constraints are specified
+- Success Criteria Clarity (30%): How measurable the success criteria are
+"""
+
+import asyncio
+from dataclasses import dataclass, field
+from enum import StrEnum
+import json
+import math
+from typing import Any
+
+from pydantic import BaseModel, Field
+import structlog
+
+from ouroboros.bigbang.interview import (
+    INITIAL_CONTEXT_SUMMARY_QUESTION,
+    InterviewState,
+    initial_context_summary_missing,
+    prompt_safe_initial_context,
+)
+from ouroboros.config import get_llm_model_for_role
+from ouroboros.core.errors import ProviderError
+from ouroboros.core.json_utils import extract_json_payload
+from ouroboros.core.types import Result
+from ouroboros.providers.base import CompletionConfig, LLMAdapter, Message, MessageRole
+
+log = structlog.get_logger()
+
+# Threshold for allowing Seed generation (NFR6)
+AMBIGUITY_THRESHOLD = 0.2
+SEED_CLOSER_ACTIVATION_THRESHOLD = 0.25
+AUTO_COMPLETE_STREAK_REQUIRED = 2
+
+# Minimum per-dimension clarity required before interview auto-completion.
+GOAL_CLARITY_FLOOR = 0.75
+CONSTRAINT_CLARITY_FLOOR = 0.65
+SUCCESS_CRITERIA_CLARITY_FLOOR = 0.70
+BROWNFIELD_CONTEXT_CLARITY_FLOOR = 0.60
+
+# Weights for greenfield score components (3 dimensions)
+GOAL_CLARITY_WEIGHT = 0.40
+CONSTRAINT_CLARITY_WEIGHT = 0.30
+SUCCESS_CRITERIA_CLARITY_WEIGHT = 0.30
+
+# Weights for brownfield score components (4 dimensions)
+BROWNFIELD_GOAL_CLARITY_WEIGHT = 0.35
+BROWNFIELD_CONSTRAINT_CLARITY_WEIGHT = 0.25
+BROWNFIELD_SUCCESS_CRITERIA_CLARITY_WEIGHT = 0.25
+BROWNFIELD_CONTEXT_CLARITY_WEIGHT = 0.15
+
+# ---------------------------------------------------------------------------
+# Per-dimension scoring rubrics (K1 fan-out panel)
+# ---------------------------------------------------------------------------
+#
+# The combined scorer (``_build_scoring_system_prompt``) evaluates all
+# dimensions in ONE LLM call. The per-dimension panel splits that into one
+# focused scoring request per dimension so the calls can be fanned out (MCP
+# path) or run concurrently in-process (auto path). The per-dimension rubric
+# lines are extracted verbatim from the combined prompt so a single dimension
+# is scored identically to how the combined prompt scored it — only the
+# packaging changes, never the criteria or the weights.
+
+
+@dataclass(frozen=True, slots=True)
+class _DimensionSpec:
+    """One scorable ambiguity dimension: its name, weight, and focused rubric."""
+
+    key: str
+    name: str
+    weight: float
+    rubric: str
+
+
+# Rubric lines lifted verbatim from ``_build_scoring_system_prompt`` so the
+# per-dimension prompt asks exactly what the combined prompt asked.
+_GOAL_RUBRIC = "Goal Clarity: Is the goal specific and well-defined?"
+_CONSTRAINT_RUBRIC = "Constraint Clarity: Are constraints and limitations specified?"
+_SUCCESS_RUBRIC = "Success Criteria Clarity: Are success criteria measurable?"
+_CONTEXT_RUBRIC = (
+    "Context Clarity: Is the existing codebase context clear? Are referenced "
+    "codebases, patterns, and conventions well understood?"
+)
+
+
+def dimension_specs(*, is_brownfield: bool) -> tuple[_DimensionSpec, ...]:
+    """Return the ordered dimension specs for greenfield or brownfield scoring.
+
+    Weights are the SAME module constants the combined parser
+    (:meth:`AmbiguityScorer._parse_scoring_response`) assigns, so aggregating
+    per-dimension component scores yields a byte-identical overall score to the
+    combined path for the same clarity values.
+    """
+    if is_brownfield:
+        return (
+            _DimensionSpec(
+                "goal_clarity", "Goal Clarity", BROWNFIELD_GOAL_CLARITY_WEIGHT, _GOAL_RUBRIC
+            ),
+            _DimensionSpec(
+                "constraint_clarity",
+                "Constraint Clarity",
+                BROWNFIELD_CONSTRAINT_CLARITY_WEIGHT,
+                _CONSTRAINT_RUBRIC,
+            ),
+            _DimensionSpec(
+                "success_criteria_clarity",
+                "Success Criteria Clarity",
+                BROWNFIELD_SUCCESS_CRITERIA_CLARITY_WEIGHT,
+                _SUCCESS_RUBRIC,
+            ),
+            _DimensionSpec(
+                "context_clarity",
+                "Context Clarity",
+                BROWNFIELD_CONTEXT_CLARITY_WEIGHT,
+                _CONTEXT_RUBRIC,
+            ),
+        )
+    return (
+        _DimensionSpec("goal_clarity", "Goal Clarity", GOAL_CLARITY_WEIGHT, _GOAL_RUBRIC),
+        _DimensionSpec(
+            "constraint_clarity",
+            "Constraint Clarity",
+            CONSTRAINT_CLARITY_WEIGHT,
+            _CONSTRAINT_RUBRIC,
+        ),
+        _DimensionSpec(
+            "success_criteria_clarity",
+            "Success Criteria Clarity",
+            SUCCESS_CRITERIA_CLARITY_WEIGHT,
+            _SUCCESS_RUBRIC,
+        ),
+    )
+
+
+# Temperature for reproducible scoring
+SCORING_TEMPERATURE = 0.1
+
+# Maximum token limit (None = no limit, rely on model's context window)
+MAX_TOKEN_LIMIT: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# Ambiguity milestones — semantic labels for score ranges
+# ---------------------------------------------------------------------------
+
+
+class AmbiguityMilestone(StrEnum):
+    """Named milestones for ambiguity score ranges.
+
+    Each milestone represents a qualitative stage in the interview's progress
+    toward Seed-ready clarity.  Milestones are consumed by:
+    * ``format_score_display`` — human-readable progress label
+    * ``_build_ambiguity_snapshot_prompt`` (interview.py) — LLM context so the
+      question generator can adapt its strategy to the current stage
+    * MCP response ``meta`` — structured data for downstream tooling
+    """
+
+    INITIAL = "initial"
+    PROGRESS = "progress"
+    REFINED = "refined"
+    READY = "ready"
+
+
+# (upper_bound, milestone, description) — evaluated top-down; first match wins.
+MILESTONE_DEFINITIONS: tuple[tuple[float, AmbiguityMilestone, str], ...] = (
+    (
+        1.0,
+        AmbiguityMilestone.INITIAL,
+        "Core requirements identified. Major gaps in constraints and success criteria.",
+    ),
+    (
+        0.4,
+        AmbiguityMilestone.PROGRESS,
+        "Most requirements captured. Some details and edge cases missing.",
+    ),
+    (
+        0.3,
+        AmbiguityMilestone.REFINED,
+        "Success criteria partially defined. Edge cases and non-goals remain.",
+    ),
+    (
+        AMBIGUITY_THRESHOLD,
+        AmbiguityMilestone.READY,
+        "All criteria concrete and testable. Ready for Seed generation.",
+    ),
+)
+
+
+def get_milestone(score: float) -> tuple[AmbiguityMilestone, str]:
+    """Return the current milestone and its description for *score*.
+
+    Milestones are evaluated from the lowest threshold upward so the most
+    advanced matching milestone is returned.
+
+    >>> get_milestone(0.55)
+    (<AmbiguityMilestone.INITIAL: 'initial'>, 'Core requirements ...')
+    >>> get_milestone(0.15)
+    (<AmbiguityMilestone.READY: 'ready'>, 'All criteria ...')
+    """
+    # Walk from the most advanced milestone (lowest threshold) upward.
+    for threshold, milestone, description in reversed(MILESTONE_DEFINITIONS):
+        if score <= threshold:
+            return milestone, description
+    # score > 1.0 (shouldn't happen) — fall back to INITIAL.
+    return MILESTONE_DEFINITIONS[0][1], MILESTONE_DEFINITIONS[0][2]
+
+
+def get_next_milestone(
+    score: float,
+) -> tuple[float, AmbiguityMilestone, str] | None:
+    """Return the next milestone to reach, or ``None`` if already READY.
+
+    The "next" milestone is the most advanced one whose threshold is still
+    strictly below the current *score*.  We iterate top-down (highest
+    threshold first) and return the first entry the score hasn't yet reached.
+    """
+    for threshold, milestone, description in MILESTONE_DEFINITIONS:
+        if score > threshold:
+            return threshold, milestone, description
+    return None
+
+
+class ComponentScore(BaseModel):
+    """Individual component score with justification.
+
+    Attributes:
+        name: Name of the component being scored.
+        clarity_score: Clarity score between 0.0 (unclear) and 1.0 (perfectly clear).
+        weight: Weight of this component in the overall score.
+        justification: Explanation of why this score was given.
+    """
+
+    name: str
+    clarity_score: float = Field(ge=0.0, le=1.0)
+    weight: float = Field(ge=0.0, le=1.0)
+    justification: str
+
+
+class ScoreBreakdown(BaseModel):
+    """Detailed breakdown of ambiguity score with justifications.
+
+    Attributes:
+        goal_clarity: Score for goal statement clarity.
+        constraint_clarity: Score for constraint specification clarity.
+        success_criteria_clarity: Score for success criteria measurability.
+        context_clarity: Score for codebase context clarity (brownfield only).
+    """
+
+    goal_clarity: ComponentScore
+    constraint_clarity: ComponentScore
+    success_criteria_clarity: ComponentScore
+    context_clarity: ComponentScore | None = None
+
+    @property
+    def components(self) -> list[ComponentScore]:
+        """Return all component scores as a list."""
+        result = [
+            self.goal_clarity,
+            self.constraint_clarity,
+            self.success_criteria_clarity,
+        ]
+        if self.context_clarity is not None:
+            result.append(self.context_clarity)
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class AmbiguityScore:
+    """Result of ambiguity scoring for an interview state.
+
+    Attributes:
+        overall_score: Normalized ambiguity score (0.0 = clear, 1.0 = ambiguous).
+        breakdown: Detailed breakdown of component scores.
+        is_ready_for_seed: Whether score allows Seed generation (score <= 0.2).
+    """
+
+    overall_score: float
+    breakdown: ScoreBreakdown
+
+    @property
+    def is_ready_for_seed(self) -> bool:
+        """Check if ambiguity score allows Seed generation.
+
+        Returns:
+            True if overall_score <= AMBIGUITY_THRESHOLD (0.2).
+        """
+        return self.overall_score <= AMBIGUITY_THRESHOLD
+
+
+def get_completion_floor_failures(
+    score: AmbiguityScore,
+    *,
+    is_brownfield: bool,
+) -> list[str]:
+    """Return any unmet component floors for interview auto-completion."""
+    required_components: list[tuple[str, str, float]] = [
+        ("goal_clarity", "Goal Clarity", GOAL_CLARITY_FLOOR),
+        ("constraint_clarity", "Constraint Clarity", CONSTRAINT_CLARITY_FLOOR),
+        ("success_criteria_clarity", "Success Criteria Clarity", SUCCESS_CRITERIA_CLARITY_FLOOR),
+    ]
+    if is_brownfield:
+        required_components.append(
+            ("context_clarity", "Context Clarity", BROWNFIELD_CONTEXT_CLARITY_FLOOR)
+        )
+
+    failures: list[str] = []
+    for attribute_name, label, minimum_clarity in required_components:
+        component = getattr(score.breakdown, attribute_name)
+        if component is None:
+            failures.append(f"{label} missing (< {minimum_clarity:.2f})")
+            continue
+        if component.clarity_score < minimum_clarity:
+            failures.append(f"{label} {component.clarity_score:.2f} < {minimum_clarity:.2f}")
+
+    return failures
+
+
+def qualifies_for_seed_completion(
+    score: AmbiguityScore,
+    *,
+    is_brownfield: bool,
+) -> bool:
+    """Return True when ambiguity and all required component floors are satisfied."""
+    return score.is_ready_for_seed and not get_completion_floor_failures(
+        score,
+        is_brownfield=is_brownfield,
+    )
+
+
+def _reject_non_finite_score(token: str) -> float:
+    """json.loads hook: NaN/Infinity literals are malformed scores, not values."""
+    raise ValueError(f"non-finite score literal: {token}")
+
+
+@dataclass
+class AmbiguityScorer:
+    """Scorer for calculating ambiguity of interview requirements.
+
+    Uses LLM to evaluate clarity of goals, constraints, and success criteria
+    from interview conversation, producing reproducible scores.
+
+    Uses adaptive token allocation: starts with `initial_max_tokens` and
+    doubles on truncation up to `MAX_TOKEN_LIMIT`. Retries until success
+    by default (unlimited), or up to `max_retries` if specified.
+
+    Attributes:
+        llm_adapter: The LLM adapter for completions.
+        model: Model identifier to use.
+        temperature: Temperature for reproducibility (default 0.1).
+        initial_max_tokens: Starting token limit (default 2048).
+        max_retries: Maximum retry attempts, or None for unlimited (default).
+
+    Example:
+        scorer = AmbiguityScorer(llm_adapter=adapter)
+
+        result = await scorer.score(interview_state)
+        if result.is_ok:
+            ambiguity = result.value
+            if ambiguity.is_ready_for_seed:
+                # Proceed with Seed generation
+                ...
+            else:
+                # Generate additional questions
+                questions = scorer.generate_clarification_questions(ambiguity.breakdown)
+    """
+
+    llm_adapter: LLMAdapter
+    model: str | None = None
+    model_is_explicit: bool = field(default=False, init=False)
+    temperature: float = SCORING_TEMPERATURE
+    initial_max_tokens: int = 2048
+    max_retries: int | None = 10  # Default to 10 retries (None = unlimited)
+    max_format_error_retries: int = 5  # Stop after N format errors (non-truncation)
+    # When True, ``score`` splits the single combined LLM call into one focused
+    # call per dimension, run concurrently via ``asyncio.gather`` (the auto /
+    # in-process fan-out path). Defaults to False so the single-call behavior —
+    # and every existing caller / test — is preserved verbatim. See ``score``.
+    per_dimension: bool = False
+
+    def __post_init__(self) -> None:
+        """Resolve implicit default model while preserving explicit caller pins."""
+        self.model_is_explicit = self.model is not None
+        if self.model is None:
+            self.model = get_llm_model_for_role("clarification")
+
+    async def score(
+        self,
+        state: InterviewState,
+        is_brownfield: bool = False,
+        additional_context: str = "",
+    ) -> Result[AmbiguityScore, ProviderError]:
+        """Calculate ambiguity score for interview state.
+
+        Evaluates the interview conversation to determine clarity of:
+        - Goal statement (40% weight)
+        - Constraints (30% weight)
+        - Success criteria (30% weight)
+
+        Uses adaptive token allocation: starts with initial_max_tokens and
+        doubles on parse failure, up to max_retries attempts.
+
+        Items explicitly deferred via ``additional_context`` (e.g. decide-later
+        items from a PM interview) are treated as **intentional deferrals** and
+        must not reduce the clarity score.  The LLM is instructed to score only
+        what is present and answerable, not penalise deliberate gaps.
+
+        Args:
+            state: The interview state to score.
+            is_brownfield: Whether this is a brownfield project.
+            additional_context: Extra context appended to the user prompt.
+                Useful for supplying decide-later items or other metadata
+                that should inform scoring without penalty.
+
+        Returns:
+            Result containing AmbiguityScore or ProviderError.
+        """
+        log.debug(
+            "ambiguity.scoring.started",
+            interview_id=state.interview_id,
+            rounds=len(state.rounds),
+        )
+
+        # Use brownfield flag from state if available
+        is_brownfield = is_brownfield or getattr(state, "is_brownfield", False)
+
+        # Per-dimension fan-out path: one focused call per dimension, run
+        # concurrently. Deterministic aggregation reuses the SAME weighted
+        # formula as the combined path (see ``score_per_dimension``).
+        if self.per_dimension:
+            return await self.score_per_dimension(
+                state,
+                is_brownfield=is_brownfield,
+                additional_context=additional_context,
+            )
+
+        if initial_context_summary_missing(state):
+            return Result.err(
+                ProviderError(
+                    "Initial context summary required before ambiguity scoring",
+                    details={"interview_id": state.interview_id},
+                )
+            )
+
+        # Build the context from interview
+        context = self._build_interview_context(state)
+
+        # Create scoring prompt
+        system_prompt = self._build_scoring_system_prompt(is_brownfield=is_brownfield)
+        user_prompt = self._build_scoring_user_prompt(
+            context,
+            additional_context=additional_context,
+        )
+
+        messages = [
+            Message(role=MessageRole.SYSTEM, content=system_prompt),
+            Message(role=MessageRole.USER, content=user_prompt),
+        ]
+
+        current_max_tokens = self.initial_max_tokens
+        last_error: Exception | ProviderError | None = None
+        last_response: str = ""
+        attempt = 0
+        format_error_count = 0
+
+        while True:
+            # Check retry limit if set
+            if self.max_retries is not None and attempt >= self.max_retries:
+                break
+
+            attempt += 1
+
+            assert self.model is not None
+            config = CompletionConfig(
+                model=self.model,
+                role="ambiguity",
+                model_is_explicit=self.model_is_explicit,
+                temperature=self.temperature,
+                max_tokens=current_max_tokens,
+            )
+
+            result = await self.llm_adapter.complete(messages, config)
+
+            # Retry on provider errors (rate limits, transient failures)
+            if result.is_err:
+                last_error = result.error
+                log.warning(
+                    "ambiguity.scoring.provider_error_retrying",
+                    interview_id=state.interview_id,
+                    error=str(result.error),
+                    attempt=attempt,
+                    max_retries=self.max_retries or "unlimited",
+                )
+                continue
+
+            # Parse the LLM response into scores
+            try:
+                ambiguity_score = self.parse_score_response(
+                    result.value.content,
+                    is_brownfield=is_brownfield,
+                )
+                breakdown = ambiguity_score.breakdown
+                overall_score = ambiguity_score.overall_score
+
+                log.info(
+                    "ambiguity.scoring.completed",
+                    interview_id=state.interview_id,
+                    overall_score=overall_score,
+                    is_ready_for_seed=ambiguity_score.is_ready_for_seed,
+                    goal_clarity=breakdown.goal_clarity.clarity_score,
+                    constraint_clarity=breakdown.constraint_clarity.clarity_score,
+                    success_criteria_clarity=breakdown.success_criteria_clarity.clarity_score,
+                    tokens_used=current_max_tokens,
+                    attempt=attempt,
+                )
+
+                return Result.ok(ambiguity_score)
+
+            except (ValueError, KeyError) as e:
+                last_error = e
+                last_response = result.value.content
+
+                # Only increase tokens if response was truncated
+                is_truncated = result.value.finish_reason == "length"
+
+                if is_truncated:
+                    # Double tokens on truncation, capped at MAX_TOKEN_LIMIT if set
+                    next_tokens = current_max_tokens * 2
+                    if MAX_TOKEN_LIMIT is not None:
+                        next_tokens = min(next_tokens, MAX_TOKEN_LIMIT)
+                    log.warning(
+                        "ambiguity.scoring.truncated_retrying",
+                        interview_id=state.interview_id,
+                        error=str(e),
+                        attempt=attempt,
+                        current_tokens=current_max_tokens,
+                        next_tokens=next_tokens,
+                    )
+                    current_max_tokens = next_tokens
+                else:
+                    # Format error without truncation - retry with same tokens
+                    format_error_count += 1
+                    if format_error_count >= self.max_format_error_retries:
+                        log.warning(
+                            "ambiguity.scoring.format_errors_exhausted",
+                            interview_id=state.interview_id,
+                            error=str(e),
+                            format_error_count=format_error_count,
+                            max_format_error_retries=self.max_format_error_retries,
+                        )
+                        break
+                    log.warning(
+                        "ambiguity.scoring.format_error_retrying",
+                        interview_id=state.interview_id,
+                        error=str(e),
+                        attempt=attempt,
+                        format_error_count=format_error_count,
+                        finish_reason=result.value.finish_reason,
+                    )
+
+        # All retries exhausted (only reached if max_retries is set)
+        log.warning(
+            "ambiguity.scoring.failed",
+            interview_id=state.interview_id,
+            error=str(last_error),
+            response=last_response[:500] if last_response else None,
+            max_retries_exhausted=True,
+        )
+        return Result.err(
+            ProviderError(
+                f"Failed to parse scoring response after {self.max_retries} attempts: {last_error}",
+                details={"response_preview": last_response[:200] if last_response else None},
+            )
+        )
+
+    def _build_interview_context(self, state: InterviewState) -> str:
+        """Build context string from interview state.
+
+        Args:
+            state: The interview state.
+
+        Returns:
+            Formatted context string.
+        """
+        parts = [f"Initial Context: {prompt_safe_initial_context(state)}"]
+
+        for round_data in state.rounds:
+            if round_data.question == INITIAL_CONTEXT_SUMMARY_QUESTION:
+                continue
+            parts.append(f"\nQ: {round_data.question}")
+            if round_data.user_response:
+                parts.append(f"A: {round_data.user_response}")
+
+        return "\n".join(parts)
+
+    def _build_scoring_system_prompt(self, is_brownfield: bool = False) -> str:
+        """Build system prompt for scoring.
+
+        Args:
+            is_brownfield: Whether this is a brownfield project.
+
+        Returns:
+            System prompt string.
+        """
+        deferral_instruction = """
+
+IMPORTANT: If the additional context lists "decide-later" or "deferred" items, these are INTENTIONAL deferrals — the team has deliberately chosen to postpone those decisions. Do NOT penalise the clarity score for intentionally deferred items. Score only what is present and answerable."""
+
+        if is_brownfield:
+            return (
+                """You are an expert requirements analyst. Evaluate the clarity of software requirements.
+
+Evaluate four components:
+1. Goal Clarity (35%): Is the goal specific and well-defined?
+2. Constraint Clarity (25%): Are constraints and limitations specified?
+3. Success Criteria Clarity (25%): Are success criteria measurable?
+4. Context Clarity (15%): Is the existing codebase context clear? Are referenced codebases, patterns, and conventions well understood?
+
+Score each from 0.0 (unclear) to 1.0 (perfectly clear). Scores above 0.8 require very specific requirements.
+"""
+                + deferral_instruction
+                + """
+
+RESPOND ONLY WITH VALID JSON. No other text before or after.
+
+Required JSON format:
+{"goal_clarity_score": 0.0, "goal_clarity_justification": "string", "constraint_clarity_score": 0.0, "constraint_clarity_justification": "string", "success_criteria_clarity_score": 0.0, "success_criteria_clarity_justification": "string", "context_clarity_score": 0.0, "context_clarity_justification": "string"}"""
+            )
+
+        return (
+            """You are an expert requirements analyst. Evaluate the clarity of software requirements.
+
+Evaluate three components:
+1. Goal Clarity (40%): Is the goal specific and well-defined?
+2. Constraint Clarity (30%): Are constraints and limitations specified?
+3. Success Criteria Clarity (30%): Are success criteria measurable?
+
+Score each from 0.0 (unclear) to 1.0 (perfectly clear). Scores above 0.8 require very specific requirements.
+"""
+            + deferral_instruction
+            + """
+
+RESPOND ONLY WITH VALID JSON. No other text before or after.
+
+Required JSON format:
+{"goal_clarity_score": 0.0, "goal_clarity_justification": "string", "constraint_clarity_score": 0.0, "constraint_clarity_justification": "string", "success_criteria_clarity_score": 0.0, "success_criteria_clarity_justification": "string"}"""
+        )
+
+    def _build_scoring_user_prompt(
+        self,
+        context: str,
+        additional_context: str = "",
+    ) -> str:
+        """Build user prompt with interview context.
+
+        Args:
+            context: Formatted interview context.
+            additional_context: Extra context (e.g. decide-later items).
+
+        Returns:
+            User prompt string.
+        """
+        prompt = f"""Please evaluate the clarity of the following requirements conversation:
+
+---
+{context}
+---"""
+
+        if additional_context:
+            prompt += f"""
+
+Additional context (intentional deferrals — do not penalise):
+{additional_context}"""
+
+        prompt += "\n\nAnalyze each component and provide scores with justifications."
+
+        return prompt
+
+    def parse_score_response(
+        self,
+        response: str,
+        *,
+        is_brownfield: bool = False,
+    ) -> AmbiguityScore:
+        """Parse one scoring payload into the canonical ambiguity result.
+
+        Turn planners reuse this boundary when a single completion returns both
+        the next question and the ordinary scoring fields. Extra JSON fields are
+        ignored by the existing breakdown parser, so scoring semantics and
+        weights remain single-sourced here.
+        """
+        breakdown = self._parse_scoring_response(response, is_brownfield=is_brownfield)
+        return AmbiguityScore(
+            overall_score=self._calculate_overall_score(breakdown),
+            breakdown=breakdown,
+        )
+
+    def _parse_scoring_response(
+        self,
+        response: str,
+        is_brownfield: bool = False,
+    ) -> ScoreBreakdown:
+        """Parse LLM response into ScoreBreakdown.
+
+        Args:
+            response: Raw LLM response text.
+            is_brownfield: Whether to parse brownfield context_clarity dimension.
+
+        Returns:
+            Parsed ScoreBreakdown.
+
+        Raises:
+            ValueError: If response cannot be parsed.
+        """
+        # One authoritative payload or nothing: an echoed schema example
+        # must never outrank the real answer (#1838).
+        text = extract_json_payload(response.strip())
+        if text is None:
+            raise ValueError("Invalid JSON response: no unambiguous JSON payload")
+
+        try:
+            data = json.loads(text, parse_constant=_reject_non_finite_score)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON response: {e}") from e
+        if not isinstance(data, dict):
+            raise ValueError("Invalid JSON response: payload must be an object")
+
+        # Numeric score fields must be present. Missing justifications are recoverable.
+        required_score_fields = [
+            "goal_clarity_score",
+            "constraint_clarity_score",
+            "success_criteria_clarity_score",
+        ]
+
+        for field_name in required_score_fields:
+            if field_name not in data:
+                raise ValueError(f"Missing required field: {field_name}")
+
+        # Parse and clamp scores
+        def clamp_score(value: Any) -> float:
+            score = float(value)
+            if not math.isfinite(score):
+                raise ValueError(f"non-finite clarity score: {value!r}")
+            return max(0.0, min(1.0, score))
+
+        def justification_for(field_name: str, component_name: str) -> str:
+            value = data.get(field_name)
+            if value is None:
+                return f"{component_name} justification not provided by model."
+            text = str(value).strip()
+            if not text:
+                return f"{component_name} justification not provided by model."
+            return text
+
+        # Select weights based on project type
+        if is_brownfield:
+            goal_weight = BROWNFIELD_GOAL_CLARITY_WEIGHT
+            constraint_weight = BROWNFIELD_CONSTRAINT_CLARITY_WEIGHT
+            criteria_weight = BROWNFIELD_SUCCESS_CRITERIA_CLARITY_WEIGHT
+        else:
+            goal_weight = GOAL_CLARITY_WEIGHT
+            constraint_weight = CONSTRAINT_CLARITY_WEIGHT
+            criteria_weight = SUCCESS_CRITERIA_CLARITY_WEIGHT
+
+        # Parse context clarity for brownfield projects
+        context_clarity: ComponentScore | None = None
+        if is_brownfield and "context_clarity_score" in data:
+            context_clarity = ComponentScore(
+                name="Context Clarity",
+                clarity_score=clamp_score(data["context_clarity_score"]),
+                weight=BROWNFIELD_CONTEXT_CLARITY_WEIGHT,
+                justification=justification_for(
+                    "context_clarity_justification",
+                    "Context Clarity",
+                ),
+            )
+
+        return ScoreBreakdown(
+            goal_clarity=ComponentScore(
+                name="Goal Clarity",
+                clarity_score=clamp_score(data["goal_clarity_score"]),
+                weight=goal_weight,
+                justification=justification_for(
+                    "goal_clarity_justification",
+                    "Goal Clarity",
+                ),
+            ),
+            constraint_clarity=ComponentScore(
+                name="Constraint Clarity",
+                clarity_score=clamp_score(data["constraint_clarity_score"]),
+                weight=constraint_weight,
+                justification=justification_for(
+                    "constraint_clarity_justification",
+                    "Constraint Clarity",
+                ),
+            ),
+            success_criteria_clarity=ComponentScore(
+                name="Success Criteria Clarity",
+                clarity_score=clamp_score(data["success_criteria_clarity_score"]),
+                weight=criteria_weight,
+                justification=justification_for(
+                    "success_criteria_clarity_justification",
+                    "Success Criteria Clarity",
+                ),
+            ),
+            context_clarity=context_clarity,
+        )
+
+    def _calculate_overall_score(self, breakdown: ScoreBreakdown) -> float:
+        """Calculate overall ambiguity score from component clarity scores.
+
+        Ambiguity = 1 - (weighted average of clarity scores)
+
+        Args:
+            breakdown: Score breakdown with component clarity scores.
+
+        Returns:
+            Overall ambiguity score between 0.0 and 1.0.
+        """
+        weighted_clarity = sum(
+            component.clarity_score * component.weight for component in breakdown.components
+        )
+
+        # Ambiguity = 1 - clarity
+        return round(1.0 - weighted_clarity, 4)
+
+    # -- Per-dimension fan-out scoring (K1) --------------------------------
+
+    def _build_dimension_system_prompt(self, spec: _DimensionSpec) -> str:
+        """Build a focused single-dimension scoring system prompt.
+
+        The rubric line is the same one the combined prompt uses for this
+        dimension, so a dimension scored here matches how the combined prompt
+        would have scored it — only the packaging (one call, one field) differs.
+        """
+        deferral_instruction = (
+            'IMPORTANT: If the additional context lists "decide-later" or '
+            '"deferred" items, these are INTENTIONAL deferrals — do NOT penalise '
+            "the clarity score for intentionally deferred items. Score only what "
+            "is present and answerable."
+        )
+        return (
+            "You are an expert requirements analyst. Evaluate the clarity of a "
+            "single dimension of software requirements.\n\n"
+            f"Dimension to score:\n{spec.rubric}\n\n"
+            "Score from 0.0 (unclear) to 1.0 (perfectly clear). Scores above 0.8 "
+            "require very specific requirements.\n\n"
+            f"{deferral_instruction}\n\n"
+            "RESPOND ONLY WITH VALID JSON. No other text before or after.\n\n"
+            'Required JSON format:\n{"clarity_score": 0.0, "justification": "string"}'
+        )
+
+    def _parse_dimension_response(self, response: str, spec: _DimensionSpec) -> ComponentScore:
+        """Parse a single-dimension LLM response into a ComponentScore.
+
+        Raises:
+            ValueError: If the response cannot be parsed or omits ``clarity_score``.
+        """
+        text = extract_json_payload(response.strip())
+        if text is None:
+            raise ValueError("Invalid JSON response: no unambiguous JSON payload")
+
+        try:
+            data = json.loads(text, parse_constant=_reject_non_finite_score)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON response: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError("Invalid JSON response: payload must be an object")
+
+        if "clarity_score" not in data:
+            raise ValueError("Missing required field: clarity_score")
+
+        clarity_value = float(data["clarity_score"])
+        if not math.isfinite(clarity_value):
+            raise ValueError(f"non-finite clarity score: {data['clarity_score']!r}")
+        clarity = max(0.0, min(1.0, clarity_value))
+        raw_justification = data.get("justification")
+        justification = str(raw_justification).strip() if raw_justification is not None else ""
+        if not justification:
+            justification = f"{spec.name} justification not provided by model."
+
+        return ComponentScore(
+            name=spec.name,
+            clarity_score=clarity,
+            weight=spec.weight,
+            justification=justification,
+        )
+
+    async def _score_single_dimension(
+        self,
+        spec: _DimensionSpec,
+        context: str,
+        additional_context: str,
+    ) -> Result[ComponentScore, ProviderError]:
+        """Score one dimension with a focused LLM call and adaptive retry."""
+        system_prompt = self._build_dimension_system_prompt(spec)
+        user_prompt = self._build_scoring_user_prompt(
+            context,
+            additional_context=additional_context,
+        )
+        messages = [
+            Message(role=MessageRole.SYSTEM, content=system_prompt),
+            Message(role=MessageRole.USER, content=user_prompt),
+        ]
+
+        current_max_tokens = self.initial_max_tokens
+        last_error: Exception | ProviderError | None = None
+        attempt = 0
+        format_error_count = 0
+
+        while True:
+            if self.max_retries is not None and attempt >= self.max_retries:
+                break
+            attempt += 1
+
+            assert self.model is not None
+            config = CompletionConfig(
+                model=self.model,
+                role="ambiguity",
+                model_is_explicit=self.model_is_explicit,
+                temperature=self.temperature,
+                max_tokens=current_max_tokens,
+            )
+            result = await self.llm_adapter.complete(messages, config)
+            if result.is_err:
+                last_error = result.error
+                continue
+
+            try:
+                component = self._parse_dimension_response(result.value.content, spec)
+                return Result.ok(component)
+            except (ValueError, KeyError) as exc:
+                last_error = exc
+                if result.value.finish_reason == "length":
+                    next_tokens = current_max_tokens * 2
+                    if MAX_TOKEN_LIMIT is not None:
+                        next_tokens = min(next_tokens, MAX_TOKEN_LIMIT)
+                    current_max_tokens = next_tokens
+                else:
+                    format_error_count += 1
+                    if format_error_count >= self.max_format_error_retries:
+                        break
+
+        return Result.err(
+            ProviderError(
+                f"Failed to score dimension {spec.key!r}: {last_error}",
+                details={"dimension": spec.key},
+            )
+        )
+
+    async def score_per_dimension(
+        self,
+        state: InterviewState,
+        is_brownfield: bool = False,
+        additional_context: str = "",
+    ) -> Result[AmbiguityScore, ProviderError]:
+        """Score each ambiguity dimension in a separate concurrent LLM call.
+
+        This is the in-process fan-out path: one focused call per dimension, run
+        concurrently via :func:`asyncio.gather` (mirroring ``_refine_answer`` in
+        ``auto/interview_driver.py``), so wall-clock stays ~one scoring call.
+
+        Deterministic aggregation reuses :meth:`_calculate_overall_score` with
+        the SAME per-dimension weights as the combined path, so for identical
+        clarity values the overall score is byte-identical to
+        :meth:`score`. Any dimension failure is fail-safe: the first error is
+        returned so the caller falls back exactly as the combined path would.
+        """
+        is_brownfield = is_brownfield or getattr(state, "is_brownfield", False)
+
+        if initial_context_summary_missing(state):
+            return Result.err(
+                ProviderError(
+                    "Initial context summary required before ambiguity scoring",
+                    details={"interview_id": state.interview_id},
+                )
+            )
+
+        context = self._build_interview_context(state)
+        specs = dimension_specs(is_brownfield=is_brownfield)
+
+        results = await asyncio.gather(
+            *(self._score_single_dimension(spec, context, additional_context) for spec in specs)
+        )
+
+        components: dict[str, ComponentScore] = {}
+        for spec, result in zip(specs, results, strict=True):
+            if result.is_err:
+                log.warning(
+                    "ambiguity.scoring.dimension_failed",
+                    interview_id=state.interview_id,
+                    dimension=spec.key,
+                    error=str(result.error),
+                )
+                return Result.err(result.error)
+            components[spec.key] = result.value
+
+        breakdown = ScoreBreakdown(
+            goal_clarity=components["goal_clarity"],
+            constraint_clarity=components["constraint_clarity"],
+            success_criteria_clarity=components["success_criteria_clarity"],
+            context_clarity=components.get("context_clarity"),
+        )
+        overall_score = self._calculate_overall_score(breakdown)
+        ambiguity_score = AmbiguityScore(overall_score=overall_score, breakdown=breakdown)
+
+        log.info(
+            "ambiguity.scoring.completed",
+            interview_id=state.interview_id,
+            overall_score=overall_score,
+            is_ready_for_seed=ambiguity_score.is_ready_for_seed,
+            goal_clarity=breakdown.goal_clarity.clarity_score,
+            constraint_clarity=breakdown.constraint_clarity.clarity_score,
+            success_criteria_clarity=breakdown.success_criteria_clarity.clarity_score,
+            path="per_dimension",
+        )
+        return Result.ok(ambiguity_score)
+
+    def generate_clarification_questions(self, breakdown: ScoreBreakdown) -> list[str]:
+        """Generate clarification questions based on score breakdown.
+
+        Identifies which components need clarification and suggests questions.
+
+        Args:
+            breakdown: Score breakdown with component scores.
+
+        Returns:
+            List of clarification questions for low-scoring components.
+        """
+        questions: list[str] = []
+
+        # Threshold for "needs clarification"
+        clarification_threshold = 0.8
+
+        if breakdown.goal_clarity.clarity_score < clarification_threshold:
+            questions.append("Can you describe the specific problem this solution should solve?")
+            questions.append("What is the primary deliverable or output you expect?")
+
+        if breakdown.constraint_clarity.clarity_score < clarification_threshold:
+            questions.append("Are there any technical constraints or limitations to consider?")
+            questions.append("What should definitely be excluded from the scope?")
+
+        if breakdown.success_criteria_clarity.clarity_score < clarification_threshold:
+            questions.append("How will you know when this is successfully completed?")
+            questions.append("What specific features or behaviors are essential?")
+
+        if (
+            breakdown.context_clarity is not None
+            and breakdown.context_clarity.clarity_score < clarification_threshold
+        ):
+            questions.append("Can you point to the specific directories of the existing codebase?")
+            questions.append("What existing patterns or conventions must the new code follow?")
+
+        return questions
+
+
+def is_ready_for_seed(score: AmbiguityScore) -> bool:
+    """Helper function to check if score allows Seed generation.
+
+    Args:
+        score: The ambiguity score to check.
+
+    Returns:
+        True if score <= AMBIGUITY_THRESHOLD (0.2), allowing Seed generation.
+    """
+    return score.is_ready_for_seed
+
+
+def format_score_display(score: AmbiguityScore) -> str:
+    """Format ambiguity score for display after interview round.
+
+    Includes the current milestone label and, when the interview is not yet
+    Seed-ready, the next milestone target so users understand what remains.
+
+    Args:
+        score: The ambiguity score to format.
+
+    Returns:
+        Formatted string for display.
+    """
+    milestone, milestone_desc = get_milestone(score.overall_score)
+    next_ms = get_next_milestone(score.overall_score)
+
+    lines = [
+        f"Ambiguity Score: {score.overall_score:.2f} [{milestone.value.upper()}]",
+        f"  {milestone_desc}",
+    ]
+    if next_ms is not None:
+        lines.append(f"  Next: {next_ms[1].value} (<= {next_ms[0]:.1f})")
+    lines.append(f"Ready for Seed: {'Yes' if score.is_ready_for_seed else 'No'}")
+    lines.append("")
+    lines.append("Component Breakdown:")
+
+    for component in score.breakdown.components:
+        clarity_percent = component.clarity_score * 100
+        weight_percent = component.weight * 100
+        lines.append(
+            f"  {component.name} (weight: {weight_percent:.0f}%): {clarity_percent:.0f}% clear"
+        )
+        lines.append(f"    Justification: {component.justification}")
+
+    return "\n".join(lines)

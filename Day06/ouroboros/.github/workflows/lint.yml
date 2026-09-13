@@ -1,0 +1,109 @@
+name: Lint
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  ruff:
+    name: Ruff Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          uv sync --dev
+
+      - name: Run ruff
+        run: |
+          uv run ruff check src/ tests/
+
+      - name: Run ruff format check
+        run: |
+          uv run ruff format --check src/ tests/
+
+  mypy:
+    name: MyPy Type Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          uv sync --dev
+
+      - name: Run mypy
+        run: |
+          uv run mypy src/ouroboros
+
+  bridge-ts:
+    name: Bridge TypeScript
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+        working-directory: src/ouroboros/opencode/plugin
+
+      - name: Type check
+        run: bunx tsc --noEmit
+        working-directory: src/ouroboros/opencode/plugin
+
+      - name: Run tests
+        run: bun test
+        working-directory: src/ouroboros/opencode/plugin
+
+  native-tui:
+    name: Native TUI (Rust)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/ouroboros-tui
+
+      - name: Run tests
+        run: cargo test
+        working-directory: crates/ouroboros-tui

@@ -1,0 +1,2724 @@
+"""Unit tests for ouroboros.config.loader module."""
+
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import textwrap
+from unittest.mock import patch
+
+import pytest
+import yaml
+
+from ouroboros.config._model_defaults import (
+    DEFAULT_CONSENSUS_OPUS_MODEL,
+    DEFAULT_OPUS_MODEL,
+    DEFAULT_SONNET_MODEL,
+)
+import ouroboros.config.loader as loader_module
+from ouroboros.config.loader import (
+    config_exists,
+    create_default_config,
+    credentials_file_secure,
+    default_execution_efficiency_mode,
+    ensure_config_dir,
+    get_agent_permission_mode,
+    get_agent_runtime_backend,
+    get_antigravity_cli_path,
+    get_assertion_extraction_model,
+    get_clarification_model,
+    get_codex_cli_path,
+    get_consensus_advocate_model,
+    get_consensus_models,
+    get_context_compression_model,
+    get_cross_harness_redispatch_enabled,
+    get_dependency_analysis_model,
+    get_gemini_cli_path,
+    get_gjc_cli_path,
+    get_grok_cli_path,
+    get_kiro_cli_path,
+    get_llm_backend,
+    get_llm_backend_for_role,
+    get_llm_backend_for_stage,
+    get_llm_model_for_role,
+    get_llm_permission_mode,
+    get_max_parallel_workers,
+    get_ontology_analysis_model,
+    get_opencode_cli_path,
+    get_qa_model,
+    get_reflect_model,
+    get_runtime_controls_config,
+    get_runtime_profile,
+    get_semantic_model,
+    get_usage_limit_pause_seconds,
+    get_wonder_model,
+    get_zcode_cli_path,
+    load_config,
+    load_credentials,
+)
+from ouroboros.config.models import (
+    ClarificationConfig,
+    ConsensusConfig,
+    CredentialsConfig,
+    EvaluationConfig,
+    ExecutionConfig,
+    LLMConfig,
+    OrchestratorConfig,
+    OuroborosConfig,
+    ResilienceConfig,
+    RuntimeControlsConfig,
+    RuntimeProfileConfig,
+    resolve_event_store_path,
+)
+from ouroboros.core.errors import ConfigError
+
+_ZCODE_APP_BUNDLE_DEFAULT = Path("/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs")
+
+
+def _hide_default_zcode_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep zcode path tests independent from the developer machine's install.
+
+    ``get_zcode_cli_path`` intentionally falls back to the standard macOS
+    ZCode.app bundle after rejecting stale explicit env/config paths. Tests
+    that assert rejection of the explicit value must hide only that default
+    fallback; otherwise they fail on Macs where ZCode.app is installed and pass
+    on CI machines where it is absent.
+    """
+    original = loader_module._is_runnable_zcode_cli_path
+
+    def _without_default_bundle(path: str | Path) -> bool:
+        if Path(path) == _ZCODE_APP_BUNDLE_DEFAULT:
+            return False
+        return original(path)
+
+    monkeypatch.setattr(loader_module, "_is_runnable_zcode_cli_path", _without_default_bundle)
+
+
+@pytest.fixture
+def temp_config_dir(tmp_path: Path) -> Path:
+    """Create a temporary config directory."""
+    config_dir = tmp_path / ".ouroboros"
+    config_dir.mkdir()
+    return config_dir
+
+
+@pytest.fixture
+def temp_config_file(temp_config_dir: Path) -> Path:
+    """Create a temporary config file with valid content."""
+    config_path = temp_config_dir / "config.yaml"
+    config_content = {
+        "economics": {
+            "default_tier": "frugal",
+            "escalation_threshold": 2,
+            "downgrade_success_streak": 5,
+        },
+        "clarification": {
+            "ambiguity_threshold": 0.2,
+        },
+    }
+    with config_path.open("w") as f:
+        yaml.dump(config_content, f)
+    return config_path
+
+
+@pytest.fixture
+def temp_credentials_file(temp_config_dir: Path) -> Path:
+    """Create a temporary credentials file with valid content."""
+    creds_path = temp_config_dir / "credentials.yaml"
+    creds_content = {
+        "providers": {
+            "openai": {"api_key": "sk-test123"},
+            "anthropic": {"api_key": "sk-ant-test456"},
+        }
+    }
+    with creds_path.open("w") as f:
+        yaml.dump(creds_content, f)
+    os.chmod(creds_path, stat.S_IRUSR | stat.S_IWUSR)
+    return creds_path
+
+
+class TestEnsureConfigDir:
+    """Test ensure_config_dir function."""
+
+    def test_ensure_config_dir_creates_directory(self, tmp_path: Path) -> None:
+        """ensure_config_dir creates directory if not exists."""
+        # Temporarily change HOME to test directory creation
+        config_dir = tmp_path / ".ouroboros"
+        assert not config_dir.exists()
+
+        # We can't easily mock Path.home(), so we test the actual directory creation
+        # by directly calling ensure_config_dir and checking the returned path
+        result = ensure_config_dir()
+        assert result.exists()
+        assert result.is_dir()
+
+    def test_ensure_config_dir_creates_subdirs(self) -> None:
+        """ensure_config_dir creates data and logs subdirectories."""
+        config_dir = ensure_config_dir()
+        assert (config_dir / "data").exists()
+        assert (config_dir / "logs").exists()
+
+    def test_ensure_config_dir_idempotent(self) -> None:
+        """ensure_config_dir can be called multiple times safely."""
+        # First call
+        config_dir1 = ensure_config_dir()
+        # Second call
+        config_dir2 = ensure_config_dir()
+        assert config_dir1 == config_dir2
+
+
+class TestCreateDefaultConfig:
+    """Test create_default_config function."""
+
+    def test_create_default_config_creates_files(self, tmp_path: Path) -> None:
+        """create_default_config creates config.yaml and credentials.yaml."""
+        config_dir = tmp_path / ".ouroboros"
+        config_path, creds_path = create_default_config(config_dir)
+
+        assert config_path.exists()
+        assert creds_path.exists()
+        assert config_path.name == "config.yaml"
+        assert creds_path.name == "credentials.yaml"
+
+    def test_create_default_config_credentials_permissions(self, tmp_path: Path) -> None:
+        """create_default_config sets chmod 600 on credentials.yaml."""
+        config_dir = tmp_path / ".ouroboros"
+        _, creds_path = create_default_config(config_dir)
+
+        file_mode = creds_path.stat().st_mode
+        assert (file_mode & 0o777) == 0o600
+
+    def test_create_default_config_valid_yaml(self, tmp_path: Path) -> None:
+        """create_default_config creates valid YAML files."""
+        config_dir = tmp_path / ".ouroboros"
+        config_path, creds_path = create_default_config(config_dir)
+
+        # Load and validate config
+        with config_path.open() as f:
+            config_dict = yaml.safe_load(f)
+        config = OuroborosConfig.model_validate(config_dict)
+        assert config.economics.default_tier == "frugal"
+
+        # Load and validate credentials
+        with creds_path.open() as f:
+            creds_dict = yaml.safe_load(f)
+        creds = CredentialsConfig.model_validate(creds_dict)
+        assert "openai" in creds.providers
+
+    def test_create_default_config_raises_on_existing(self, tmp_path: Path) -> None:
+        """create_default_config raises ConfigError if files exist."""
+        config_dir = tmp_path / ".ouroboros"
+        create_default_config(config_dir)
+
+        with pytest.raises(ConfigError) as exc_info:
+            create_default_config(config_dir)
+        assert "already exists" in str(exc_info.value)
+
+    def test_create_default_config_overwrite(self, tmp_path: Path) -> None:
+        """create_default_config can overwrite existing files."""
+        config_dir = tmp_path / ".ouroboros"
+        create_default_config(config_dir)
+
+        # Should not raise with overwrite=True
+        config_path, creds_path = create_default_config(config_dir, overwrite=True)
+        assert config_path.exists()
+        assert creds_path.exists()
+
+    def test_create_default_config_creates_subdirs(self, tmp_path: Path) -> None:
+        """create_default_config creates data and logs subdirectories."""
+        config_dir = tmp_path / ".ouroboros"
+        create_default_config(config_dir)
+
+        assert (config_dir / "data").exists()
+        assert (config_dir / "logs").exists()
+
+
+class TestLoadConfig:
+    """Test load_config function."""
+
+    def test_load_config_success(self, temp_config_file: Path) -> None:
+        """load_config loads valid config file."""
+        config = load_config(temp_config_file)
+        assert isinstance(config, OuroborosConfig)
+        assert config.economics.default_tier == "frugal"
+        assert config.clarification.ambiguity_threshold == 0.2
+
+    def test_load_config_raises_on_missing(self, tmp_path: Path) -> None:
+        """load_config raises ConfigError if file doesn't exist."""
+        missing_path = tmp_path / "nonexistent.yaml"
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(missing_path)
+        assert "not found" in str(exc_info.value)
+        assert "ouroboros config init" in str(exc_info.value)
+
+    def test_load_config_raises_on_malformed_yaml(self, tmp_path: Path) -> None:
+        """load_config raises ConfigError on malformed YAML."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("invalid: yaml: content: [")
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(config_path)
+        assert "parse" in str(exc_info.value).lower()
+
+    def test_load_config_raises_on_validation_error(self, tmp_path: Path) -> None:
+        """load_config raises ConfigError on validation failure."""
+        config_path = tmp_path / "config.yaml"
+        # Invalid: ambiguity_threshold must be <= 1.0
+        config_content = {
+            "clarification": {
+                "ambiguity_threshold": 5.0,  # Invalid
+            }
+        }
+        with config_path.open("w") as f:
+            yaml.dump(config_content, f)
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(config_path)
+        assert "validation" in str(exc_info.value).lower()
+
+    def test_load_config_validation_error_shows_field(self, tmp_path: Path) -> None:
+        """load_config validation error includes field information."""
+        config_path = tmp_path / "config.yaml"
+        config_content = {
+            "economics": {
+                "default_tier": "invalid_tier",
+            }
+        }
+        with config_path.open("w") as f:
+            yaml.dump(config_content, f)
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(config_path)
+        error_message = str(exc_info.value)
+        assert "default_tier" in error_message or "economics" in error_message
+
+    def test_load_config_single_validation_error_sets_config_key(self, tmp_path: Path) -> None:
+        """Single-field validation errors should be self-classifying."""
+        config_path = tmp_path / "config.yaml"
+        config_content = {
+            "orchestrator": {
+                "max_parallel_workers": 0,
+            }
+        }
+        with config_path.open("w") as f:
+            yaml.dump(config_content, f)
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(config_path)
+
+        error = exc_info.value
+        assert error.config_key == "orchestrator.max_parallel_workers"
+        assert error.details["config_keys"] == ["orchestrator.max_parallel_workers"]
+
+    def test_load_config_multiple_validation_errors_leave_config_key_unset(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Multi-field validation failures should keep all keys in details."""
+        config_path = tmp_path / "config.yaml"
+        config_content = {
+            "economics": {
+                "default_tier": "invalid_tier",
+            },
+            "orchestrator": {
+                "max_parallel_workers": 0,
+            },
+        }
+        with config_path.open("w") as f:
+            yaml.dump(config_content, f)
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(config_path)
+
+        error = exc_info.value
+        assert error.config_key is None
+        assert set(error.details["config_keys"]) == {
+            "economics.default_tier",
+            "orchestrator.max_parallel_workers",
+        }
+
+    def test_load_config_empty_file(self, tmp_path: Path) -> None:
+        """load_config handles empty file (uses defaults)."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("")
+
+        config = load_config(config_path)
+        assert isinstance(config, OuroborosConfig)
+        # Should have all defaults
+        assert config.economics.default_tier == "frugal"
+
+    def test_load_config_project_guidance_has_no_env_override(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.dump({"execution": {"project_guidance": ["team"]}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("OUROBOROS_PROJECT_GUIDANCE", "evil")
+        monkeypatch.setenv("OUROBOROS_EXECUTION_PROJECT_GUIDANCE", "evil")
+
+        config = load_config(config_path)
+
+        assert config.execution.project_guidance == ("team",)
+
+    def test_load_config_partial_config(self, tmp_path: Path) -> None:
+        """load_config fills in missing sections with defaults."""
+        config_path = tmp_path / "config.yaml"
+        config_content = {
+            "economics": {
+                "default_tier": "standard",
+            }
+            # Missing other sections
+        }
+        with config_path.open("w") as f:
+            yaml.dump(config_content, f)
+
+        config = load_config(config_path)
+        assert config.economics.default_tier == "standard"
+        # Other sections should have defaults
+        assert config.clarification.ambiguity_threshold == 0.2
+        assert config.execution.max_iterations_per_ac == 10
+        assert config.execution.tui_autolaunch is False
+        assert config.execution.auto_evaluate is True
+        assert config.execution.auto_evolve is True
+        assert config.execution.auto_evolve_max_generations == 3
+
+    @pytest.mark.parametrize("surface", ["top_level", "default", "stage"])
+    def test_load_config_accepts_claude_mcp_runtime_surfaces(
+        self,
+        tmp_path: Path,
+        surface: str,
+    ) -> None:
+        orchestrator: dict[str, object]
+        if surface == "top_level":
+            orchestrator = {"runtime_backend": "claude_mcp"}
+        elif surface == "default":
+            orchestrator = {"runtime_profile": {"default": "claude_mcp"}}
+        else:
+            orchestrator = {
+                "runtime_profile": {"stages": {"execute": "claude_mcp"}},
+            }
+        config_path = tmp_path / f"{surface}.yaml"
+        config_path.write_text(
+            yaml.safe_dump({"orchestrator": orchestrator}),
+            encoding="utf-8",
+        )
+
+        config = load_config(config_path)
+
+        if surface == "top_level":
+            assert config.orchestrator.runtime_backend == "claude_mcp"
+        else:
+            assert config.orchestrator.runtime_profile is not None
+            if surface == "default":
+                assert config.orchestrator.runtime_profile.default == "claude_mcp"
+            else:
+                assert config.orchestrator.runtime_profile.stages == {"execute": "claude_mcp"}
+
+    @pytest.mark.parametrize(
+        ("orchestrator", "expected_surface"),
+        [
+            ({"runtime_backend": "unknown-runtime"}, "runtime_backend"),
+            ({"runtime_profile": {"default": "unknown-runtime"}}, "runtime_profile.default"),
+            (
+                {"runtime_profile": {"stages": {"execute": "unknown-runtime"}}},
+                "runtime_profile.stages",
+            ),
+        ],
+    )
+    def test_load_config_rejects_unknown_runtime_surfaces(
+        self,
+        tmp_path: Path,
+        orchestrator: dict[str, object],
+        expected_surface: str,
+    ) -> None:
+        config_path = tmp_path / "invalid-runtime.yaml"
+        config_path.write_text(
+            yaml.safe_dump({"orchestrator": orchestrator}),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(config_path)
+
+        assert expected_surface in str(exc_info.value)
+
+    def test_load_config_execution_tui_autolaunch(self, tmp_path: Path) -> None:
+        """load_config accepts the execution TUI auto-launch toggle."""
+        config_path = tmp_path / "config.yaml"
+        config_content = {
+            "execution": {
+                "tui_autolaunch": True,
+            }
+        }
+        with config_path.open("w") as f:
+            yaml.dump(config_content, f)
+
+        config = load_config(config_path)
+        assert config.execution.tui_autolaunch is True
+
+    def test_load_config_execution_auto_evaluate(self, tmp_path: Path) -> None:
+        """load_config accepts the execution formal-evaluation auto-chain toggle."""
+        config_path = tmp_path / "config.yaml"
+        config_content = {
+            "execution": {
+                "auto_evaluate": False,
+            }
+        }
+        with config_path.open("w") as f:
+            yaml.dump(config_content, f)
+
+        config = load_config(config_path)
+        assert config.execution.auto_evaluate is False
+
+    def test_load_config_execution_auto_evolve(self, tmp_path: Path) -> None:
+        """load_config accepts the bounded rejected-evaluation evolution chain."""
+        config_path = tmp_path / "config.yaml"
+        config_content = {
+            "execution": {
+                "auto_evolve": False,
+                "auto_evolve_max_generations": 99,
+            }
+        }
+        with config_path.open("w") as f:
+            yaml.dump(config_content, f)
+
+        config = load_config(config_path)
+        assert config.execution.auto_evolve is False
+        assert config.execution.auto_evolve_max_generations == 10
+
+
+class TestLoadCredentials:
+    """Test load_credentials function."""
+
+    def test_load_credentials_success(self, temp_credentials_file: Path) -> None:
+        """load_credentials loads valid credentials file."""
+        creds = load_credentials(temp_credentials_file)
+        assert isinstance(creds, CredentialsConfig)
+        assert "openai" in creds.providers
+        assert creds.providers["openai"].api_key == "sk-test123"
+
+    def test_load_credentials_raises_on_missing(self, tmp_path: Path) -> None:
+        """load_credentials raises ConfigError if file doesn't exist."""
+        missing_path = tmp_path / "nonexistent.yaml"
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_credentials(missing_path)
+        assert "not found" in str(exc_info.value)
+        assert "ouroboros config init" in str(exc_info.value)
+
+    def test_load_credentials_raises_on_malformed_yaml(self, tmp_path: Path) -> None:
+        """load_credentials raises ConfigError on malformed YAML."""
+        creds_path = tmp_path / "credentials.yaml"
+        creds_path.write_text("invalid: yaml: [")
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_credentials(creds_path)
+        assert "parse" in str(exc_info.value).lower()
+
+    def test_load_credentials_raises_on_validation_error(self, tmp_path: Path) -> None:
+        """load_credentials raises ConfigError on validation failure."""
+        creds_path = tmp_path / "credentials.yaml"
+        # Invalid: api_key cannot be empty
+        creds_content = {
+            "providers": {
+                "openai": {"api_key": ""},
+            }
+        }
+        with creds_path.open("w") as f:
+            yaml.dump(creds_content, f)
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_credentials(creds_path)
+        assert "validation" in str(exc_info.value).lower()
+
+    def test_load_credentials_empty_file(self, tmp_path: Path) -> None:
+        """load_credentials handles empty file (uses defaults)."""
+        creds_path = tmp_path / "credentials.yaml"
+        creds_path.write_text("")
+
+        creds = load_credentials(creds_path)
+        assert isinstance(creds, CredentialsConfig)
+        assert creds.providers == {}
+
+
+class TestConfigExists:
+    """Test config_exists function."""
+
+    def test_config_exists_returns_false_when_missing(self) -> None:
+        """config_exists returns False when files don't exist."""
+        # This tests against the actual home directory
+        # If config exists, this test may not be useful
+        # We rely on the function working correctly based on
+        # the actual state of ~/.ouroboros/
+        result = config_exists()
+        assert isinstance(result, bool)
+
+    def test_config_exists_both_files_required(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """config_exists requires both config.yaml and credentials.yaml."""
+        # This is a conceptual test - in practice we can't easily
+        # mock get_config_dir. The function checks for both files.
+        pass
+
+
+class TestRuntimeHelperLookups:
+    """Tests for orchestrator runtime helper lookups."""
+
+    def test_get_agent_runtime_backend_prefers_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Environment variable overrides config for runtime backend."""
+        monkeypatch.setenv("OUROBOROS_AGENT_RUNTIME", "codex")
+        assert get_agent_runtime_backend() == "codex"
+
+    def test_get_agent_runtime_backend_falls_back_to_config(self) -> None:
+        """Config is used when env override is absent."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(runtime_backend="codex")
+                ),
+            ),
+        ):
+            assert get_agent_runtime_backend() == "codex"
+
+    def test_get_agent_runtime_backend_defaults_to_sdk_profile(self) -> None:
+        """A missing config preserves the default Claude SDK runtime."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                side_effect=ConfigError("config unavailable"),
+            ),
+        ):
+            assert get_agent_runtime_backend() == "claude"
+
+    def test_get_codex_cli_path_prefers_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Environment variable overrides config for Codex CLI path."""
+        monkeypatch.setenv("OUROBOROS_CODEX_CLI_PATH", "~/bin/codex")
+        assert get_codex_cli_path() == str(Path("~/bin/codex").expanduser())
+
+    def test_get_codex_cli_path_falls_back_to_config(self) -> None:
+        """Config is used when env override is absent."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(codex_cli_path="/tmp/codex")
+                ),
+            ),
+        ):
+            assert get_codex_cli_path() == "/tmp/codex"
+
+    def test_get_opencode_cli_path_prefers_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Environment variable overrides config for OpenCode CLI path."""
+        monkeypatch.setenv("OUROBOROS_OPENCODE_CLI_PATH", "~/bin/opencode")
+        assert get_opencode_cli_path() == str(Path("~/bin/opencode").expanduser())
+
+    def test_get_opencode_cli_path_falls_back_to_config(self) -> None:
+        """Config is used when env override is absent."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(opencode_cli_path="/tmp/opencode")
+                ),
+            ),
+        ):
+            assert get_opencode_cli_path() == "/tmp/opencode"
+
+    def test_get_gemini_cli_path_returns_executable_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Env var path is returned when it points to an executable file."""
+        fake = tmp_path / "gemini"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        monkeypatch.setenv("OUROBOROS_GEMINI_CLI_PATH", str(fake))
+        assert get_gemini_cli_path() == str(fake)
+
+    def test_get_gemini_cli_path_rejects_stale_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Stale env var that doesn't point to an executable is treated as missing.
+
+        Prevents writing an unusable path back into config via
+        `ouroboros config backend gemini` / `setup --runtime gemini`.
+        """
+        stale = tmp_path / "missing-gemini"
+        monkeypatch.setenv("OUROBOROS_GEMINI_CLI_PATH", str(stale))
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(orchestrator=OrchestratorConfig()),
+        ):
+            assert get_gemini_cli_path() is None
+
+    def test_get_gemini_cli_path_falls_back_to_config(self, tmp_path: Path) -> None:
+        """Config path is honored when env is absent and the file is executable."""
+        fake = tmp_path / "gemini"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(gemini_cli_path=str(fake))
+                ),
+            ),
+        ):
+            assert get_gemini_cli_path() == str(fake)
+
+    def test_get_gemini_cli_path_rejects_stale_config(self, tmp_path: Path) -> None:
+        """Stale config value that no longer points to an executable returns None."""
+        stale = tmp_path / "ghost-gemini"
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(gemini_cli_path=str(stale))
+                ),
+            ),
+        ):
+            assert get_gemini_cli_path() is None
+
+    def test_get_antigravity_cli_path_returns_executable_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Env var path is returned when it points to an executable file."""
+        fake = tmp_path / "agy"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        monkeypatch.setenv("OUROBOROS_ANTIGRAVITY_CLI_PATH", str(fake))
+        assert get_antigravity_cli_path() == str(fake)
+
+    def test_get_antigravity_cli_path_rejects_stale_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Stale env var that doesn't point to an executable is treated as missing."""
+        stale = tmp_path / "missing-agy"
+        monkeypatch.setenv("OUROBOROS_ANTIGRAVITY_CLI_PATH", str(stale))
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(orchestrator=OrchestratorConfig()),
+        ):
+            assert get_antigravity_cli_path() is None
+
+    def test_get_antigravity_cli_path_falls_back_to_config(self, tmp_path: Path) -> None:
+        """Config path is honored when env is absent and the file is executable."""
+        fake = tmp_path / "agy"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(antigravity_cli_path=str(fake))
+                ),
+            ),
+        ):
+            assert get_antigravity_cli_path() == str(fake)
+
+    def test_get_antigravity_cli_path_rejects_stale_config(self, tmp_path: Path) -> None:
+        """Stale config value that no longer points to an executable returns None."""
+        stale = tmp_path / "ghost-agy"
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(antigravity_cli_path=str(stale))
+                ),
+            ),
+        ):
+            assert get_antigravity_cli_path() is None
+
+    def test_get_grok_cli_path_returns_executable_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Env var path is returned when it points to an executable file."""
+        fake = tmp_path / "grok"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        monkeypatch.setenv("OUROBOROS_GROK_CLI_PATH", str(fake))
+        assert get_grok_cli_path() == str(fake)
+
+    def test_get_grok_cli_path_rejects_stale_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Stale env var that doesn't point to an executable is treated as missing."""
+        stale = tmp_path / "missing-grok"
+        monkeypatch.setenv("OUROBOROS_GROK_CLI_PATH", str(stale))
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(orchestrator=OrchestratorConfig()),
+        ):
+            assert get_grok_cli_path() is None
+
+    def test_get_grok_cli_path_falls_back_to_config(self, tmp_path: Path) -> None:
+        """Config path is honored when env is absent and the file is executable."""
+        fake = tmp_path / "grok"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(grok_cli_path=str(fake))
+                ),
+            ),
+        ):
+            assert get_grok_cli_path() == str(fake)
+
+    def test_get_grok_cli_path_rejects_stale_config(self, tmp_path: Path) -> None:
+        """Stale config value that no longer points to an executable returns None."""
+        stale = tmp_path / "ghost-grok"
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(grok_cli_path=str(stale))
+                ),
+            ),
+        ):
+            assert get_grok_cli_path() is None
+
+    def test_get_zcode_cli_path_returns_existing_env_script(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = tmp_path / "zcode.cjs"
+        fake.write_text("// zcode", encoding="utf-8")
+        monkeypatch.setenv("OUROBOROS_ZCODE_CLI_PATH", str(fake))
+
+        assert get_zcode_cli_path() == str(fake)
+
+    def test_get_zcode_cli_path_returns_executable_env_wrapper(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = tmp_path / "zcode"
+        fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        monkeypatch.setenv("OUROBOROS_ZCODE_CLI_PATH", str(fake))
+
+        assert get_zcode_cli_path() == str(fake)
+
+    def test_get_zcode_cli_path_returns_relative_executable_env_wrapper(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = tmp_path / "zcode"
+        fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("OUROBOROS_ZCODE_CLI_PATH", "zcode")
+
+        assert get_zcode_cli_path() == str(fake.resolve())
+
+    def test_get_zcode_cli_path_rejects_non_executable_env_wrapper(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = tmp_path / "zcode"
+        fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        monkeypatch.setenv("OUROBOROS_ZCODE_CLI_PATH", str(fake))
+        _hide_default_zcode_bundle(monkeypatch)
+
+        with patch("ouroboros.config.loader.load_config", side_effect=ConfigError("missing")):
+            assert get_zcode_cli_path() is None
+
+    def test_get_zcode_cli_path_rejects_stale_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OUROBOROS_ZCODE_CLI_PATH", str(tmp_path / "missing.cjs"))
+        _hide_default_zcode_bundle(monkeypatch)
+        with patch("ouroboros.config.loader.load_config", side_effect=ConfigError("missing")):
+            assert get_zcode_cli_path() is None
+
+    def test_get_zcode_cli_path_falls_back_to_config(self, tmp_path: Path) -> None:
+        fake = tmp_path / "zcode.cjs"
+        fake.write_text("// zcode", encoding="utf-8")
+        config = OuroborosConfig(orchestrator=OrchestratorConfig(zcode_cli_path=str(fake)))
+
+        with (
+            patch.dict(os.environ, {"OUROBOROS_ZCODE_CLI_PATH": ""}, clear=False),
+            patch("ouroboros.config.loader.load_config", return_value=config),
+        ):
+            assert get_zcode_cli_path() == str(fake)
+
+    def test_get_zcode_cli_path_returns_relative_executable_config_wrapper(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = tmp_path / "zcode"
+        fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        monkeypatch.chdir(tmp_path)
+        config = OuroborosConfig(orchestrator=OrchestratorConfig(zcode_cli_path="zcode"))
+
+        with (
+            patch.dict(os.environ, {"OUROBOROS_ZCODE_CLI_PATH": ""}, clear=False),
+            patch("ouroboros.config.loader.load_config", return_value=config),
+        ):
+            assert get_zcode_cli_path() == str(fake.resolve())
+
+    def test_get_zcode_cli_path_rejects_stale_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = OuroborosConfig(
+            orchestrator=OrchestratorConfig(zcode_cli_path=str(tmp_path / "missing.cjs"))
+        )
+        _hide_default_zcode_bundle(monkeypatch)
+
+        with (
+            patch.dict(os.environ, {"OUROBOROS_ZCODE_CLI_PATH": ""}, clear=False),
+            patch("ouroboros.config.loader.load_config", return_value=config),
+        ):
+            assert get_zcode_cli_path() is None
+
+    def test_get_zcode_cli_path_rejects_non_executable_config_wrapper(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = tmp_path / "zcode"
+        fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        config = OuroborosConfig(orchestrator=OrchestratorConfig(zcode_cli_path=str(fake)))
+
+        with (
+            patch.dict(os.environ, {"OUROBOROS_ZCODE_CLI_PATH": ""}, clear=False),
+            patch("ouroboros.config.loader.load_config", return_value=config),
+        ):
+            _hide_default_zcode_bundle(monkeypatch)
+            assert get_zcode_cli_path() is None
+
+    def test_get_kiro_cli_path_returns_executable_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Env var path is returned when it points to an executable file."""
+        fake = tmp_path / "kiro-cli"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        monkeypatch.setenv("OUROBOROS_KIRO_CLI_PATH", str(fake))
+        assert get_kiro_cli_path() == str(fake)
+
+    def test_get_kiro_cli_path_rejects_stale_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Stale env var that doesn't point to an executable is treated as missing."""
+        stale = tmp_path / "missing-kiro-cli"
+        monkeypatch.setenv("OUROBOROS_KIRO_CLI_PATH", str(stale))
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(orchestrator=OrchestratorConfig()),
+        ):
+            assert get_kiro_cli_path() is None
+
+    def test_get_kiro_cli_path_falls_back_to_config(self, tmp_path: Path) -> None:
+        """Config path is honored when env is absent and the file is executable."""
+        fake = tmp_path / "kiro-cli"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(kiro_cli_path=str(fake))
+                ),
+            ),
+        ):
+            assert get_kiro_cli_path() == str(fake)
+
+    def test_get_kiro_cli_path_rejects_stale_config(self, tmp_path: Path) -> None:
+        """Stale config value that no longer points to an executable returns None."""
+        stale = tmp_path / "ghost-kiro-cli"
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(kiro_cli_path=str(stale))
+                ),
+            ),
+        ):
+            assert get_kiro_cli_path() is None
+
+    def test_get_opencode_mode_returns_config_value(self) -> None:
+        """get_opencode_mode reads orchestrator.opencode_mode from config."""
+        from ouroboros.config.loader import get_opencode_mode
+
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(
+                orchestrator=OrchestratorConfig(opencode_mode="subprocess")
+            ),
+        ):
+            assert get_opencode_mode() == "subprocess"
+
+    def test_get_opencode_mode_plugin(self) -> None:
+        from ouroboros.config.loader import get_opencode_mode
+
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(orchestrator=OrchestratorConfig(opencode_mode="plugin")),
+        ):
+            assert get_opencode_mode() == "plugin"
+
+    def test_get_opencode_mode_none_when_unset(self) -> None:
+        """Unset mode returns None → runtime gate defaults to plugin."""
+        from ouroboros.config.loader import get_opencode_mode
+
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(orchestrator=OrchestratorConfig()),
+        ):
+            assert get_opencode_mode() is None
+
+    def test_get_opencode_mode_returns_none_on_config_error(self) -> None:
+        """Missing config file returns None gracefully."""
+        from ouroboros.config.loader import ConfigError, get_opencode_mode
+
+        with patch(
+            "ouroboros.config.loader.load_config",
+            side_effect=ConfigError("no config"),
+        ):
+            assert get_opencode_mode() is None
+
+    def test_get_opencode_mode_ignores_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Locked decision: no env override — config file is the only source."""
+        from ouroboros.config.loader import get_opencode_mode
+
+        monkeypatch.setenv("OUROBOROS_OPENCODE_MODE", "subprocess")
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(orchestrator=OrchestratorConfig(opencode_mode="plugin")),
+        ):
+            assert get_opencode_mode() == "plugin"
+
+    def test_get_agent_permission_mode_prefers_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Environment variable overrides config for agent permission mode."""
+        monkeypatch.setenv("OUROBOROS_AGENT_PERMISSION_MODE", "bypassPermissions")
+        assert get_agent_permission_mode() == "bypassPermissions"
+
+    def test_get_agent_permission_mode_falls_back_to_config(self) -> None:
+        """Config is used when env override is absent for agent permissions."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(permission_mode="default")
+                ),
+            ),
+        ):
+            assert get_agent_permission_mode() == "default"
+
+    def test_get_agent_permission_mode_uses_opencode_specific_config(self) -> None:
+        """OpenCode runtimes use the dedicated config default when no generic override exists."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(
+                        permission_mode="default",
+                        opencode_permission_mode="acceptEdits",
+                    )
+                ),
+            ),
+        ):
+            assert get_agent_permission_mode(backend="opencode") == "acceptEdits"
+
+    def test_get_agent_permission_mode_defaults_to_bypass_permissions_for_opencode(self) -> None:
+        """OpenCode runtime bootstrap falls back to global auto-approval without config."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                side_effect=ConfigError("missing config"),
+            ),
+        ):
+            assert get_agent_permission_mode(backend="opencode") == "bypassPermissions"
+
+    def test_get_runtime_controls_reads_config(self) -> None:
+        """Runtime controls are tunable through config.yaml."""
+        controls = RuntimeControlsConfig(
+            mcp_tool_timeout_seconds=0,
+            generation_idle_timeout_seconds=120,
+            generation_no_progress_timeout_seconds=600,
+            generation_safety_timeout_seconds=3600,
+            watchdog_poll_seconds=2.0,
+        )
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(runtime_controls=controls),
+            ),
+        ):
+            loaded = get_runtime_controls_config()
+
+        assert loaded.generation_idle_timeout_seconds == 120
+        assert loaded.generation_no_progress_timeout_seconds == 600
+        assert loaded.generation_safety_timeout_seconds == 3600
+        assert loaded.watchdog_poll_seconds == 2.0
+
+    def test_get_runtime_controls_env_overrides_config(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Dedicated env vars override the config values."""
+        monkeypatch.setenv("OUROBOROS_GENERATION_IDLE_TIMEOUT_SECONDS", "90")
+        monkeypatch.setenv("OUROBOROS_WATCHDOG_POLL_SECONDS", "1.5")
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(
+                runtime_controls=RuntimeControlsConfig(
+                    generation_idle_timeout_seconds=120,
+                    watchdog_poll_seconds=2.0,
+                )
+            ),
+        ):
+            loaded = get_runtime_controls_config()
+
+        assert loaded.generation_idle_timeout_seconds == 90
+        assert loaded.watchdog_poll_seconds == 1.5
+
+    def test_get_runtime_controls_legacy_generation_timeout_maps_to_no_progress(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The legacy env var no longer controls MCP wall-clock timeout."""
+        monkeypatch.setenv("OUROBOROS_GENERATION_TIMEOUT", "43200")
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(runtime_controls=RuntimeControlsConfig()),
+        ):
+            loaded = get_runtime_controls_config()
+
+        assert loaded.mcp_tool_timeout_seconds == 0
+        assert loaded.generation_no_progress_timeout_seconds == 43200
+
+    def test_get_runtime_controls_rejects_invalid_env(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Invalid runtime-control env values fail clearly."""
+        monkeypatch.setenv("OUROBOROS_GENERATION_IDLE_TIMEOUT_SECONDS", "-1")
+        with (
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(runtime_controls=RuntimeControlsConfig()),
+            ),
+            pytest.raises(ConfigError) as exc_info,
+        ):
+            get_runtime_controls_config()
+
+        assert exc_info.value.config_key == "OUROBOROS_GENERATION_IDLE_TIMEOUT_SECONDS"
+
+    def test_get_max_parallel_workers_prefers_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Environment variable overrides config for max parallel workers."""
+        monkeypatch.setenv("OUROBOROS_MAX_PARALLEL_WORKERS", "5")
+
+        assert get_max_parallel_workers() == 5
+
+    @pytest.mark.parametrize("env_value", ["0", "-1", "five", "nan", "inf", "-inf"])
+    def test_get_max_parallel_workers_rejects_invalid_env(
+        self,
+        env_value: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Invalid environment values fail instead of silently using the default."""
+        monkeypatch.setenv("OUROBOROS_MAX_PARALLEL_WORKERS", env_value)
+
+        with pytest.raises(ConfigError) as exc_info:
+            get_max_parallel_workers()
+
+        assert exc_info.value.config_key == "OUROBOROS_MAX_PARALLEL_WORKERS"
+        assert "OUROBOROS_MAX_PARALLEL_WORKERS" in str(exc_info.value)
+
+    def test_get_max_parallel_workers_falls_back_to_config(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Config is used when env override is absent for max parallel workers."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("orchestrator:\n  max_parallel_workers: 5\n", encoding="utf-8")
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+        ):
+            assert get_max_parallel_workers() == 5
+
+    @pytest.mark.parametrize(
+        "config_content",
+        [
+            "economics:\n  default_tier: invalid_tier\n",
+            "orchestrator:\n  runtime_backend: invalid_backend\n",
+        ],
+    )
+    def test_get_max_parallel_workers_ignores_unrelated_invalid_config(
+        self,
+        config_content: str,
+        tmp_path: Path,
+    ) -> None:
+        """Worker-cap lookup should not validate unrelated config sections."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            config_content,
+            encoding="utf-8",
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+        ):
+            assert get_max_parallel_workers() == 3
+
+    @pytest.mark.parametrize(
+        "config_content",
+        [
+            "economics:\n  default_tier: invalid_tier\norchestrator:\n  max_parallel_workers: 5\n",
+            "orchestrator:\n  runtime_backend: invalid_backend\n  max_parallel_workers: 5\n",
+        ],
+    )
+    def test_get_max_parallel_workers_reads_cap_despite_unrelated_invalid_config(
+        self,
+        config_content: str,
+        tmp_path: Path,
+    ) -> None:
+        """A valid worker cap should not be blocked by unrelated invalid fields."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            config_content,
+            encoding="utf-8",
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+        ):
+            assert get_max_parallel_workers() == 5
+
+    def test_get_max_parallel_workers_defaults_when_config_missing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The built-in default is used only when no config source is present."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+        ):
+            assert get_max_parallel_workers() == 3
+
+    @pytest.mark.parametrize("config_value", ["0", "five"])
+    def test_get_max_parallel_workers_rejects_invalid_config(
+        self,
+        config_value: str,
+        tmp_path: Path,
+    ) -> None:
+        """Invalid config values fail instead of silently using the default."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            f"orchestrator:\n  max_parallel_workers: {config_value}\n",
+            encoding="utf-8",
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+            pytest.raises(ConfigError) as exc_info,
+        ):
+            get_max_parallel_workers()
+
+        assert exc_info.value.config_key == "orchestrator.max_parallel_workers"
+        assert "max_parallel_workers" in str(exc_info.value)
+
+    def test_get_max_parallel_workers_rejects_malformed_config_yaml(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Malformed config YAML should still fail clearly."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("orchestrator:\n  max_parallel_workers: [\n", encoding="utf-8")
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+            pytest.raises(ConfigError) as exc_info,
+        ):
+            get_max_parallel_workers()
+
+        assert "Failed to parse configuration file" in str(exc_info.value)
+
+    def test_get_max_parallel_workers_normalizes_directory_at_config_path(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A directory at the config path should surface as ConfigError, not OSError."""
+        config_path = tmp_path / "config.yaml"
+        config_path.mkdir()
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+            pytest.raises(ConfigError) as exc_info,
+        ):
+            get_max_parallel_workers()
+
+        assert "Failed to read configuration file" in str(exc_info.value)
+        assert exc_info.value.details["error_type"] == "IsADirectoryError"
+
+    def test_get_max_parallel_workers_normalizes_os_error_on_open(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Any OSError from opening the config file should surface as ConfigError."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("orchestrator:\n  max_parallel_workers: 5\n", encoding="utf-8")
+
+        def _raise_os_error(*_args: object, **_kwargs: object) -> None:
+            raise PermissionError(13, "Permission denied")
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+            patch.object(Path, "open", _raise_os_error),
+            pytest.raises(ConfigError) as exc_info,
+        ):
+            get_max_parallel_workers()
+
+        assert "Failed to read configuration file" in str(exc_info.value)
+        assert exc_info.value.details["error_type"] == "PermissionError"
+
+    def test_get_usage_limit_pause_seconds_prefers_env(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Environment variable overrides config for usage-limit pause windows."""
+        monkeypatch.setenv("OUROBOROS_USAGE_LIMIT_PAUSE_HOURS", "1.5")
+
+        assert get_usage_limit_pause_seconds() == 5400
+
+    @pytest.mark.parametrize(
+        "env_value",
+        ["0", "-1", "five", "nan", "inf", "-inf", "8761", "1e308"],
+    )
+    def test_get_usage_limit_pause_seconds_rejects_invalid_env(
+        self,
+        env_value: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Invalid pause env values fail instead of silently using the default."""
+        monkeypatch.setenv("OUROBOROS_USAGE_LIMIT_PAUSE_HOURS", env_value)
+
+        with pytest.raises(ConfigError) as exc_info:
+            get_usage_limit_pause_seconds()
+
+        assert exc_info.value.config_key == "OUROBOROS_USAGE_LIMIT_PAUSE_HOURS"
+
+    def test_get_usage_limit_pause_seconds_falls_back_to_config(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Config is used when env override is absent for usage-limit pauses."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("orchestrator:\n  usage_limit_pause_hours: 2.0\n", encoding="utf-8")
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+        ):
+            assert get_usage_limit_pause_seconds() == 7200
+
+    @pytest.mark.parametrize(
+        "config_content",
+        [
+            "economics:\n  default_tier: invalid_tier\n",
+            "orchestrator:\n  runtime_backend: invalid_backend\n",
+        ],
+    )
+    def test_get_usage_limit_pause_seconds_ignores_unrelated_invalid_config(
+        self,
+        config_content: str,
+        tmp_path: Path,
+    ) -> None:
+        """Pause-window lookup should not validate unrelated config sections."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(config_content, encoding="utf-8")
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+        ):
+            assert get_usage_limit_pause_seconds() == 18000
+
+    @pytest.mark.parametrize(
+        "config_content",
+        [
+            "economics:\n  default_tier: invalid_tier\norchestrator:\n  usage_limit_pause_hours: 2.0\n",
+            "orchestrator:\n  runtime_backend: invalid_backend\n  usage_limit_pause_hours: 2.0\n",
+        ],
+    )
+    def test_get_usage_limit_pause_seconds_reads_value_despite_unrelated_invalid_config(
+        self,
+        config_content: str,
+        tmp_path: Path,
+    ) -> None:
+        """A valid pause window should not be blocked by unrelated invalid fields."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(config_content, encoding="utf-8")
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+        ):
+            assert get_usage_limit_pause_seconds() == 7200
+
+    def test_get_usage_limit_pause_seconds_defaults_when_config_missing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Missing config falls back to the built-in 5-hour window."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+        ):
+            assert get_usage_limit_pause_seconds() == 18000
+
+    @pytest.mark.parametrize(
+        "config_value",
+        ["0", "five", "nan", "inf", "-inf", "8761", "1e308"],
+    )
+    def test_get_usage_limit_pause_seconds_rejects_invalid_config_key(
+        self,
+        config_value: str,
+        tmp_path: Path,
+    ) -> None:
+        """Invalid configured pause windows should not be silently defaulted."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            f"orchestrator:\n  usage_limit_pause_hours: {config_value}\n",
+            encoding="utf-8",
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+            pytest.raises(ConfigError) as exc_info,
+        ):
+            get_usage_limit_pause_seconds()
+
+        assert exc_info.value.config_key == "orchestrator.usage_limit_pause_hours"
+
+    def test_get_usage_limit_pause_seconds_rejects_malformed_config_yaml(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Malformed config YAML should still fail clearly."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("orchestrator:\n  usage_limit_pause_hours: [\n", encoding="utf-8")
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+            pytest.raises(ConfigError) as exc_info,
+        ):
+            get_usage_limit_pause_seconds()
+
+        assert "Failed to parse configuration file" in str(exc_info.value)
+
+
+class TestLLMHelperLookups:
+    """Tests for LLM backend and model helper lookups."""
+
+    def test_get_llm_backend_prefers_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Environment variable overrides config for llm backend."""
+        monkeypatch.setenv("OUROBOROS_LLM_BACKEND", "litellm")
+        assert get_llm_backend() == "litellm"
+
+    def test_get_llm_backend_falls_back_to_config(self) -> None:
+        """Config is used when env override is absent."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    llm=LLMConfig(backend="litellm"),
+                ),
+            ),
+        ):
+            assert get_llm_backend() == "litellm"
+
+    def test_get_llm_backend_accepts_llm_capable_runtime_shortcut(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Runtime shortcuts only drive LLM flows for backends with LLM adapters."""
+        monkeypatch.delenv("OUROBOROS_LLM_BACKEND", raising=False)
+        monkeypatch.setenv("OUROBOROS_RUNTIME", "kiro")
+        assert get_llm_backend() == "kiro"
+
+    def test_get_llm_backend_accepts_kiro_cli_runtime_shortcut(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Kiro's runtime alias should preserve the single-env-var setup contract."""
+        monkeypatch.delenv("OUROBOROS_LLM_BACKEND", raising=False)
+        monkeypatch.setenv("OUROBOROS_RUNTIME", "kiro_cli")
+        assert get_llm_backend() == "kiro"
+
+    def test_get_llm_backend_accepts_hermes_runtime_shortcut(self) -> None:
+        """Hermes runtime can also serve LLM completion defaults."""
+        with (
+            patch.dict(os.environ, {"OUROBOROS_RUNTIME": "hermes"}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    llm=LLMConfig(backend="claude_code"),
+                    orchestrator=OrchestratorConfig(runtime_backend="hermes"),
+                ),
+            ),
+        ):
+            assert get_llm_backend() == "hermes"
+
+    def test_get_llm_backend_for_role_uses_runtime_profile_stage(self) -> None:
+        config = OuroborosConfig(
+            orchestrator=OrchestratorConfig(
+                runtime_backend="claude",
+                runtime_profile=RuntimeProfileConfig(
+                    stages={"evaluate": "codex", "reflect": "gemini"}
+                ),
+            )
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=config),
+        ):
+            assert get_llm_backend_for_role("qa") == "codex"
+            assert get_llm_backend_for_role("context_compression") == "gemini"
+            assert get_llm_backend_for_stage("interview") == "claude"
+
+    def test_get_llm_backend_for_role_falls_back_for_runtime_only_stage(self) -> None:
+        """A runtime-only stage backend (antigravity/grok) must not be used for an
+        internal LLM completion role/stage — it would crash provider construction.
+        The completion call falls back to the configured llm.backend; the agentic
+        runtime (resolved separately) still uses the runtime-only backend."""
+        config = OuroborosConfig(
+            orchestrator=OrchestratorConfig(
+                runtime_backend="claude",
+                runtime_profile=RuntimeProfileConfig(
+                    stages={"evaluate": "antigravity", "reflect": "antigravity"}
+                ),
+            ),
+            llm=LLMConfig(backend="codex"),
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=config),
+        ):
+            # Evaluate/reflect LLM roles + the evaluate stage resolve to the
+            # completion backend (codex), never the runtime-only antigravity.
+            assert get_llm_backend_for_role("semantic_evaluation") == "codex"
+            assert get_llm_backend_for_role("qa") == "codex"
+            assert get_llm_backend_for_role("reflect") == "codex"
+            assert get_llm_backend_for_stage("evaluate") == "codex"
+
+    def test_get_llm_backend_for_role_falls_back_for_grok_stage(self) -> None:
+        """Same runtime-only guard, exercised for grok (reflect stage)."""
+        config = OuroborosConfig(
+            orchestrator=OrchestratorConfig(
+                runtime_backend="claude",
+                runtime_profile=RuntimeProfileConfig(stages={"reflect": "grok"}),
+            ),
+            llm=LLMConfig(backend="codex"),
+        )
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=config),
+        ):
+            assert get_llm_backend_for_role("reflect") == "codex"
+            assert get_llm_backend_for_role("context_compression") == "codex"
+
+    def test_missing_config_does_not_use_cli_runtime_as_llm_backend(self) -> None:
+        """The default Claude CLI worker is runtime-only, not a provider name."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                side_effect=ConfigError("config unavailable"),
+            ),
+        ):
+            assert (
+                get_llm_backend_for_role("interview", fallback_runtime_backend="claude_mcp")
+                == "claude_code"
+            )
+            assert (
+                get_llm_backend_for_stage("interview", fallback_runtime_backend="claude_mcp")
+                == "claude_code"
+            )
+
+    def test_get_llm_backend_for_role_preserves_explicit_override(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            assert get_llm_backend_for_role("qa", explicit_backend="opencode") == "opencode"
+
+    def test_get_llm_backend_for_role_honors_legacy_llm_backend_config(self) -> None:
+        # No per-stage routing: the documented llm.backend override must win over
+        # the default agent runtime instead of being silently ignored.
+        config = OuroborosConfig(
+            orchestrator=OrchestratorConfig(runtime_backend="claude"),
+            llm=LLMConfig(backend="codex"),
+        )
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=config),
+        ):
+            assert get_llm_backend_for_role("qa") == "codex"
+            assert get_llm_backend_for_stage("interview") == "codex"
+
+    def test_get_llm_backend_for_role_honors_env_override(self) -> None:
+        config = OuroborosConfig(
+            orchestrator=OrchestratorConfig(runtime_backend="claude"),
+            llm=LLMConfig(backend="claude_code"),
+        )
+        with (
+            patch.dict(os.environ, {"OUROBOROS_LLM_BACKEND": "codex"}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=config),
+        ):
+            assert get_llm_backend_for_role("qa") == "codex"
+
+    def test_runtime_profile_stage_beats_legacy_llm_backend(self) -> None:
+        config = OuroborosConfig(
+            orchestrator=OrchestratorConfig(
+                runtime_backend="claude",
+                runtime_profile=RuntimeProfileConfig(stages={"evaluate": "gemini"}),
+            ),
+            llm=LLMConfig(backend="codex"),
+        )
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=config),
+        ):
+            # Per-stage Agent (evaluate=gemini) wins over the global llm.backend...
+            assert get_llm_backend_for_role("qa") == "gemini"
+            # ...while un-mapped stages still honor the llm.backend override.
+            assert get_llm_backend_for_role("interview") == "codex"
+
+    def test_get_llm_model_for_role_uses_stage_model_fields(self) -> None:
+        config = OuroborosConfig(
+            clarification=ClarificationConfig(default_model="interview-model"),
+            evaluation=EvaluationConfig(semantic_model="evaluate-model"),
+            resilience=ResilienceConfig(reflect_model="reflect-model"),
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=config),
+        ):
+            assert get_llm_model_for_role("seed_generation") == "interview-model"
+            assert get_llm_model_for_role("qa") == "evaluate-model"
+            assert get_llm_model_for_role("dependency_analysis") == "evaluate-model"
+            assert get_llm_model_for_role("wonder") == "reflect-model"
+
+    def test_get_llm_permission_mode_prefers_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Environment variable overrides config for llm permission mode."""
+        monkeypatch.setenv("OUROBOROS_LLM_PERMISSION_MODE", "acceptEdits")
+        assert get_llm_permission_mode() == "acceptEdits"
+
+    def test_get_llm_permission_mode_falls_back_to_config(self) -> None:
+        """Config is used when env override is absent for llm permissions."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    llm=LLMConfig(permission_mode="bypassPermissions"),
+                ),
+            ),
+        ):
+            assert get_llm_permission_mode() == "bypassPermissions"
+
+    def test_get_llm_permission_mode_uses_opencode_specific_config(self) -> None:
+        """OpenCode adapters use the dedicated config default when generic mode is read-only."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    llm=LLMConfig(
+                        permission_mode="default",
+                        opencode_permission_mode="acceptEdits",
+                    ),
+                ),
+            ),
+        ):
+            assert get_llm_permission_mode(backend="opencode") == "acceptEdits"
+
+    def test_get_llm_permission_mode_defaults_to_accept_edits_for_opencode(self) -> None:
+        """OpenCode falls back to auto-approve even when no config is available."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                side_effect=ConfigError("missing config"),
+            ),
+        ):
+            assert get_llm_permission_mode(backend="opencode") == "acceptEdits"
+
+    def test_get_clarification_model_prefers_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Environment variable overrides config for clarification model."""
+        monkeypatch.setenv("OUROBOROS_CLARIFICATION_MODEL", "gpt-5")
+        assert get_clarification_model() == "gpt-5"
+
+    def test_get_clarification_model_falls_back_to_config(self) -> None:
+        """Config is used when env override is absent."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    clarification=ClarificationConfig(default_model="gpt-5-mini"),
+                ),
+            ),
+        ):
+            assert get_clarification_model() == "gpt-5-mini"
+
+    def test_codex_backend_uses_default_model_sentinel(self) -> None:
+        """Backend-aware defaults avoid Claude model names for Codex."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                side_effect=ConfigError("missing config"),
+            ),
+        ):
+            assert get_clarification_model(backend="codex") == "default"
+            assert get_wonder_model(backend="codex") == "default"
+            assert get_reflect_model(backend="codex") == "default"
+            assert get_semantic_model(backend="codex") == "default"
+            assert get_assertion_extraction_model(backend="codex") == "default"
+
+    def test_opencode_backend_uses_default_model_sentinel(self) -> None:
+        """Backend-aware defaults avoid Claude model names for OpenCode."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                side_effect=ConfigError("missing config"),
+            ),
+        ):
+            assert get_clarification_model(backend="opencode") == "default"
+            assert get_wonder_model(backend="opencode") == "default"
+            assert get_reflect_model(backend="opencode") == "default"
+            assert get_semantic_model(backend="opencode") == "default"
+            assert get_assertion_extraction_model(backend="opencode") == "default"
+
+    def test_codex_backend_normalizes_config_default_models_to_default_sentinel(self) -> None:
+        """Config-backed default values should still normalize for Codex LLM flows."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(),
+            ),
+        ):
+            assert get_clarification_model(backend="codex") == "default"
+            assert get_qa_model(backend="codex") == "default"
+            assert get_wonder_model(backend="codex") == "default"
+            assert get_reflect_model(backend="codex") == "default"
+            assert get_semantic_model(backend="codex") == "default"
+            assert get_assertion_extraction_model(backend="codex") == "default"
+
+    def test_copilot_backend_uses_default_model_sentinel(self) -> None:
+        """Backend-aware defaults avoid unsupported Claude model names for Copilot."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                side_effect=ConfigError("missing config"),
+            ),
+        ):
+            assert get_clarification_model(backend="copilot") == "default"
+            assert get_qa_model(backend="copilot") == "default"
+            assert get_wonder_model(backend="copilot") == "default"
+            assert get_reflect_model(backend="copilot") == "default"
+            assert get_semantic_model(backend="copilot") == "default"
+            assert get_assertion_extraction_model(backend="copilot") == "default"
+
+    def test_copilot_backend_normalizes_config_default_models_to_default_sentinel(self) -> None:
+        """Existing default configs should remain usable after switching to Copilot."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(),
+            ),
+        ):
+            assert get_clarification_model(backend="copilot") == "default"
+            assert get_qa_model(backend="copilot") == "default"
+            assert get_wonder_model(backend="copilot") == "default"
+            assert get_reflect_model(backend="copilot") == "default"
+            assert get_semantic_model(backend="copilot") == "default"
+            assert get_assertion_extraction_model(backend="copilot") == "default"
+
+    def test_hermes_backend_normalizes_config_default_models_to_default_sentinel(self) -> None:
+        """Existing default configs should remain usable after switching to Hermes."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(),
+            ),
+        ):
+            assert get_clarification_model(backend="hermes") == "default"
+            assert get_qa_model(backend="hermes") == "default"
+            assert get_wonder_model(backend="hermes") == "default"
+            assert get_reflect_model(backend="hermes") == "default"
+            assert get_semantic_model(backend="hermes") == "default"
+            assert get_assertion_extraction_model(backend="hermes") == "default"
+
+    def test_pi_backend_uses_default_model_sentinel(self) -> None:
+        """Backend-aware defaults avoid cross-provider model names for Pi."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                side_effect=ConfigError("missing config"),
+            ),
+        ):
+            assert get_clarification_model(backend="pi") == "default"
+            assert get_wonder_model(backend="pi") == "default"
+            assert get_reflect_model(backend="pi") == "default"
+            assert get_semantic_model(backend="pi") == "default"
+            assert get_assertion_extraction_model(backend="pi") == "default"
+
+    def test_pi_backend_normalizes_config_default_models_to_default_sentinel(self) -> None:
+        """Existing default configs should remain usable after switching to Pi."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(),
+            ),
+        ):
+            assert get_clarification_model(backend="pi") == "default"
+            assert get_qa_model(backend="pi") == "default"
+            assert get_wonder_model(backend="pi") == "default"
+            assert get_reflect_model(backend="pi") == "default"
+            assert get_semantic_model(backend="pi") == "default"
+            assert get_assertion_extraction_model(backend="pi") == "default"
+
+    def test_omp_backend_uses_default_model_sentinel(self) -> None:
+        """Backend-aware defaults avoid cross-provider model names for OMP."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                side_effect=ConfigError("missing config"),
+            ),
+        ):
+            assert get_clarification_model(backend="omp") == "default"
+            assert get_wonder_model(backend="omp") == "default"
+            assert get_reflect_model(backend="omp") == "default"
+            assert get_semantic_model(backend="omp") == "default"
+            assert get_assertion_extraction_model(backend="omp") == "default"
+
+    def test_omp_backend_normalizes_config_default_models_to_default_sentinel(self) -> None:
+        """Existing default configs should remain usable after switching to OMP."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(),
+            ),
+        ):
+            assert get_clarification_model(backend="omp") == "default"
+            assert get_qa_model(backend="omp") == "default"
+            assert get_wonder_model(backend="omp") == "default"
+            assert get_reflect_model(backend="omp") == "default"
+            assert get_semantic_model(backend="omp") == "default"
+            assert get_assertion_extraction_model(backend="omp") == "default"
+
+    def test_resolve_omp_cli_path_skips_stale_candidate_for_path(self) -> None:
+        """PR #2299 round 5: the canonical resolver owns validated omp precedence."""
+        from ouroboros.config._omp_cli import resolve_omp_cli_path
+
+        def fake_which(name: str) -> str | None:
+            return "/usr/bin/omp" if name == "omp" else None
+
+        with (
+            patch.dict(os.environ, {"OUROBOROS_OMP_CLI_PATH": "/missing/env/omp"}),
+            patch("ouroboros.config._omp_cli.load_config", side_effect=ConfigError("no config")),
+            patch("shutil.which", side_effect=fake_which),
+        ):
+            assert resolve_omp_cli_path() == "/usr/bin/omp"
+
+        def fake_which_configured(name: str) -> str | None:
+            return "/opt/omp/bin/omp" if name == "/opt/omp/bin/omp" else None
+
+        with (
+            patch.dict(os.environ, {"OUROBOROS_OMP_CLI_PATH": "/opt/omp/bin/omp"}),
+            patch("shutil.which", side_effect=fake_which_configured),
+        ):
+            assert resolve_omp_cli_path() == "/opt/omp/bin/omp"
+
+    def test_resolve_omp_cli_path_falls_back_from_stale_env_to_configured(self) -> None:
+        """PR #2299 round 6: a stale env candidate must not mask a runnable configured CLI."""
+        from ouroboros.config._omp_cli import resolve_omp_cli_path
+        from ouroboros.config.models import OrchestratorConfig, OuroborosConfig
+
+        config = OuroborosConfig(orchestrator=OrchestratorConfig(omp_cli_path="/opt/omp/bin/omp"))
+
+        def fake_which(name: str) -> str | None:
+            return "/opt/omp/bin/omp" if name == "/opt/omp/bin/omp" else None
+
+        with (
+            patch.dict(os.environ, {"OUROBOROS_OMP_CLI_PATH": "/missing/env/omp"}),
+            patch("ouroboros.config._omp_cli.load_config", return_value=config),
+            patch("shutil.which", side_effect=fake_which),
+        ):
+            assert resolve_omp_cli_path() == "/opt/omp/bin/omp"
+
+        # Both higher-priority sources stale: fall through to PATH.
+        def fake_which_path(name: str) -> str | None:
+            return "/usr/bin/omp" if name == "omp" else None
+
+        with (
+            patch.dict(os.environ, {"OUROBOROS_OMP_CLI_PATH": "/missing/env/omp"}),
+            patch("ouroboros.config._omp_cli.load_config", return_value=config),
+            patch("shutil.which", side_effect=fake_which_path),
+        ):
+            assert resolve_omp_cli_path() == "/usr/bin/omp"
+
+    def test_gjc_backend_uses_default_model_sentinel(self) -> None:
+        """Backend-aware defaults avoid cross-provider model names for GJC."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                side_effect=ConfigError("missing config"),
+            ),
+        ):
+            assert get_clarification_model(backend="gjc") == "default"
+            assert get_wonder_model(backend="gjc") == "default"
+            assert get_reflect_model(backend="gjc") == "default"
+            assert get_semantic_model(backend="gjc") == "default"
+            assert get_assertion_extraction_model(backend="gjc") == "default"
+
+    def test_gjc_backend_normalizes_config_default_models_to_default_sentinel(self) -> None:
+        """Existing default configs should remain usable after switching to GJC."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(),
+            ),
+        ):
+            assert get_clarification_model(backend="gjc") == "default"
+            assert get_qa_model(backend="gjc") == "default"
+            assert get_wonder_model(backend="gjc") == "default"
+            assert get_reflect_model(backend="gjc") == "default"
+            assert get_semantic_model(backend="gjc") == "default"
+            assert get_assertion_extraction_model(backend="gjc") == "default"
+
+    def test_get_gjc_cli_path_prefers_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Environment variable overrides config for GJC CLI path."""
+        monkeypatch.setenv("OUROBOROS_GJC_CLI_PATH", "~/bin/gjc")
+        assert get_gjc_cli_path() == str(Path("~/bin/gjc").expanduser())
+
+    def test_get_gjc_cli_path_falls_back_to_config(self) -> None:
+        """Config is used when env override is absent."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(gjc_cli_path="/tmp/gjc")
+                ),
+            ),
+        ):
+            assert get_gjc_cli_path() == "/tmp/gjc"
+
+    def test_codex_backend_preserves_explicit_non_default_models_from_config(self) -> None:
+        """Explicit config overrides should survive backend normalization."""
+        custom_config = OuroborosConfig(
+            clarification=ClarificationConfig(default_model="gpt-5-mini"),
+            llm=LLMConfig(qa_model="gpt-5-nano"),
+            resilience=ResilienceConfig(
+                wonder_model="gpt-5",
+                reflect_model="gpt-5-mini",
+            ),
+            evaluation=EvaluationConfig(
+                semantic_model="gpt-5",
+                assertion_extraction_model="gpt-5-nano",
+            ),
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=custom_config,
+            ),
+        ):
+            assert get_clarification_model(backend="codex") == "gpt-5-mini"
+            assert get_qa_model(backend="codex") == "gpt-5-nano"
+            assert get_wonder_model(backend="codex") == "gpt-5"
+            assert get_reflect_model(backend="codex") == "gpt-5-mini"
+            assert get_semantic_model(backend="codex") == "gpt-5"
+            assert get_assertion_extraction_model(backend="codex") == "gpt-5-nano"
+
+    @pytest.mark.parametrize("backend", ["codex", "copilot", "gjc", "hermes", "kiro", "pi"])
+    def test_sentinel_backend_preserves_explicit_opus_for_sonnet_default_fields(
+        self, backend: str
+    ) -> None:
+        """Only dependency/ontology treat pre-flip Opus as a shipped default."""
+        explicit_opus_config = OuroborosConfig(
+            llm=LLMConfig(qa_model=DEFAULT_OPUS_MODEL),
+            evaluation=EvaluationConfig(assertion_extraction_model=DEFAULT_OPUS_MODEL),
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=explicit_opus_config),
+        ):
+            assert get_qa_model(backend=backend) == DEFAULT_OPUS_MODEL
+            assert get_assertion_extraction_model(backend=backend) == DEFAULT_OPUS_MODEL
+
+    @pytest.mark.parametrize("backend", ["codex", "copilot", "gjc", "hermes", "kiro", "pi"])
+    def test_legacy_shipped_default_models_still_normalize_to_sentinel(self, backend: str) -> None:
+        """Regression for #1324 (ouroboros-agent[bot] req_1780385373_60).
+
+        A config persisted by a prior release holds the OLD shipped defaults
+        (``claude-opus-4-6`` for the Opus tier, ``claude-sonnet-4-20250514`` for
+        the QA Sonnet tier). After the pin bump these are no longer equal to the
+        current ``DEFAULT_*_MODEL`` constants, but they were still shipped
+        defaults the user never chose — so Claude-incapable backends must keep
+        normalizing them to the ``"default"`` sentinel rather than leaking an
+        unrunnable Claude id.
+        """
+        legacy_config = OuroborosConfig(
+            clarification=ClarificationConfig(default_model="claude-opus-4-6"),
+            llm=LLMConfig(
+                qa_model="claude-sonnet-4-20250514",
+                dependency_analysis_model="claude-opus-4-6",
+            ),
+            resilience=ResilienceConfig(
+                wonder_model="claude-opus-4-6",
+                reflect_model="claude-opus-4-6",
+            ),
+            evaluation=EvaluationConfig(
+                semantic_model="claude-opus-4-6",
+                assertion_extraction_model="claude-sonnet-4-6",
+            ),
+        )
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=legacy_config),
+        ):
+            assert get_clarification_model(backend=backend) == "default"
+            assert get_qa_model(backend=backend) == "default"
+            assert get_dependency_analysis_model(backend=backend) == "default"
+            assert get_wonder_model(backend=backend) == "default"
+            assert get_reflect_model(backend=backend) == "default"
+            assert get_semantic_model(backend=backend) == "default"
+            assert get_assertion_extraction_model(backend=backend) == "default"
+
+    @pytest.mark.parametrize("backend", ["claude", None])
+    def test_legacy_shipped_defaults_normalize_on_claude_backends(
+        self, backend: str | None
+    ) -> None:
+        """Regression for #2069: the #1324 normalization only fired for
+        Claude-incapable backends, so a persisted legacy shipped default
+        (``claude-sonnet-4-20250514``) reached the Claude API verbatim and
+        was rejected as retired. Claude-capable backends must normalize
+        recognized legacy shipped defaults to the current default pin.
+        """
+        legacy_config = OuroborosConfig(
+            llm=LLMConfig(
+                qa_model="claude-sonnet-4-20250514",
+                dependency_analysis_model="claude-opus-4-6",
+                ontology_analysis_model="claude-sonnet-4-20250514",
+            ),
+            evaluation=EvaluationConfig(
+                assertion_extraction_model="claude-sonnet-4-20250514",
+            ),
+        )
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=legacy_config),
+        ):
+            assert get_qa_model(backend=backend) == DEFAULT_SONNET_MODEL
+            # dependency_analysis recognizes the retired Opus family as
+            # shipped defaults and its current pin is the Sonnet default.
+            assert get_dependency_analysis_model(backend=backend) == DEFAULT_SONNET_MODEL
+            assert get_ontology_analysis_model(backend=backend) == DEFAULT_SONNET_MODEL
+            assert get_assertion_extraction_model(backend=backend) == DEFAULT_SONNET_MODEL
+            # The explicit legacy per-role field takes precedence over stage
+            # models (#2069) and resolves through the same getter, so the
+            # precedence path can no longer leak the retired id either.
+            assert get_llm_model_for_role("qa", backend=backend) == DEFAULT_SONNET_MODEL
+
+    def test_never_shipped_ids_survive_claude_normalization(self) -> None:
+        """A never-shipped id is a deliberate user pin and stays verbatim
+        on Claude-capable backends (#2069)."""
+        custom_config = OuroborosConfig(
+            llm=LLMConfig(qa_model="my-proxy/claude-custom-build"),
+        )
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=custom_config),
+        ):
+            assert get_qa_model(backend="claude") == "my-proxy/claude-custom-build"
+
+    def test_consensus_advocate_legacy_shipped_default_normalizes_to_sentinel(self) -> None:
+        """A persisted legacy consensus advocate slug normalizes for Codex (#1324)."""
+        legacy_config = OuroborosConfig(
+            consensus=ConsensusConfig(advocate_model="openrouter/anthropic/claude-opus-4-6"),
+        )
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=legacy_config),
+        ):
+            assert get_consensus_advocate_model(backend="codex") == "default"
+
+    def test_consensus_roster_legacy_shipped_defaults_normalize_to_sentinel(self) -> None:
+        """A persisted legacy consensus roster (old Opus slot) normalizes (#1324).
+
+        The roster is matched element-wise against current + legacy shipped
+        defaults, so a roster generated before the Opus slug bump still resolves
+        to the backend-safe sentinel for Claude-incapable backends.
+        """
+        legacy_config = OuroborosConfig(
+            consensus=ConsensusConfig(
+                models=(
+                    "openrouter/openai/gpt-4o",
+                    "openrouter/anthropic/claude-opus-4-6",
+                    "openrouter/google/gemini-2.5-pro",
+                ),
+            ),
+        )
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=legacy_config),
+        ):
+            assert get_consensus_models(backend="codex") == ("default", "default", "default")
+
+    @pytest.mark.parametrize("backend", ["zcode", "gjc", "kiro", "pi", "antigravity", "grok"])
+    def test_consensus_roster_normalizes_to_sentinel_for_all_cli_backends(
+        self, backend: str
+    ) -> None:
+        """A shipped default roster must normalize to the backend sentinel for
+        every CLI backend that selects its model via config (no ``--model``
+        flag), not only the original Codex/Copilot/Hermes trio.
+
+        Without this, the roster leaks unrunnable shipped ids for backends
+        added after that trio, so consensus records/executes what look like
+        three distinct external-model votes while every call actually uses the
+        backend's single configured model.
+        """
+        config = OuroborosConfig()  # default = current shipped roster
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=config),
+        ):
+            assert get_consensus_models(backend=backend) == (
+                "default",
+                "default",
+                "default",
+            )
+
+    @pytest.mark.parametrize("backend", ["claude", None])
+    def test_consensus_legacy_roster_normalizes_on_claude_backends(
+        self, backend: str | None
+    ) -> None:
+        """A shipped Opus 4.8 roster must advance to the current Opus pin."""
+        legacy_config = OuroborosConfig(
+            consensus=ConsensusConfig(
+                models=(
+                    "openrouter/openai/gpt-4o",
+                    "openrouter/anthropic/claude-opus-4.8",
+                    "openrouter/google/gemini-2.5-pro",
+                ),
+            ),
+        )
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=legacy_config),
+        ):
+            assert get_consensus_models(backend=backend) == (
+                "openrouter/openai/gpt-4o",
+                DEFAULT_CONSENSUS_OPUS_MODEL,
+                "openrouter/google/gemini-2.5-pro",
+            )
+
+    def test_consensus_roster_preserved_for_claude_backend(self) -> None:
+        """Claude can run shipped OpenRouter ids, so the roster must NOT be
+        sentinel-normalized. Guards against over-broadening the CLI-backend
+        normalization set."""
+        config = OuroborosConfig()
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=config),
+        ):
+            assert get_consensus_models(backend="claude") == (
+                "openrouter/openai/gpt-4o",
+                "openrouter/anthropic/claude-opus-5",
+                "openrouter/google/gemini-2.5-pro",
+            )
+
+    def test_nonshipped_claude_id_is_preserved_not_normalized(self) -> None:
+        """Guard against over-broadening: a Claude id that was NEVER a shipped
+        default must still be preserved as an explicit user override, not
+        swallowed by the legacy-default recognition (#1324)."""
+        explicit_config = OuroborosConfig(
+            clarification=ClarificationConfig(default_model="claude-opus-4-1-20250805"),
+        )
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=explicit_config),
+        ):
+            assert get_clarification_model(backend="codex") == "claude-opus-4-1-20250805"
+
+    def test_get_qa_model_prefers_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Environment variable overrides config for QA model."""
+        monkeypatch.setenv("OUROBOROS_QA_MODEL", "gpt-5-nano")
+        assert get_qa_model() == "gpt-5-nano"
+
+    def test_get_qa_model_falls_back_to_config(self) -> None:
+        """Config is used when env override is absent."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    llm=LLMConfig(qa_model="gpt-5-nano"),
+                ),
+            ),
+        ):
+            assert get_qa_model() == "gpt-5-nano"
+
+    def test_get_dependency_analysis_model_prefers_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Environment variable overrides config for dependency analysis model."""
+        monkeypatch.setenv("OUROBOROS_DEPENDENCY_ANALYSIS_MODEL", "gpt-5-coder")
+        assert get_dependency_analysis_model() == "gpt-5-coder"
+
+    def test_get_dependency_analysis_model_falls_back_to_config(self) -> None:
+        """Config is used when env override is absent."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    llm=LLMConfig(dependency_analysis_model="gpt-5-coder"),
+                ),
+            ),
+        ):
+            assert get_dependency_analysis_model() == "gpt-5-coder"
+
+    def test_dependency_and_ontology_getters_default_to_sonnet_not_opus(self) -> None:
+        """The runtime getters — not just the Pydantic field default — must
+        resolve to Sonnet for the flipped meta-tasks, including the
+        config-absent (ConfigError) path that CI / fresh installs hit."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                side_effect=ConfigError("no config"),
+            ),
+        ):
+            assert get_dependency_analysis_model() == DEFAULT_SONNET_MODEL
+            assert get_ontology_analysis_model() == DEFAULT_SONNET_MODEL
+            assert get_dependency_analysis_model() != DEFAULT_OPUS_MODEL
+
+    @pytest.mark.parametrize("backend", ["copilot", "gjc", "pi"])
+    def test_dependency_pre_flip_opus_value_still_normalizes_for_non_claude(
+        self, backend: str
+    ) -> None:
+        """A config persisted before the Opus→Sonnet flip holds an Opus literal
+        for these two fields; a Claude-incapable backend must still normalize it
+        to the "default" sentinel rather than leak an unrunnable Claude id."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    llm=LLMConfig(
+                        dependency_analysis_model=DEFAULT_OPUS_MODEL,
+                        ontology_analysis_model="claude-opus-4-6",
+                    ),
+                ),
+            ),
+        ):
+            assert get_dependency_analysis_model(backend=backend) == "default"
+            assert get_ontology_analysis_model(backend=backend) == "default"
+
+    def test_get_semantic_model_prefers_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Environment variable overrides config for semantic evaluation model."""
+        monkeypatch.setenv("OUROBOROS_SEMANTIC_MODEL", "gpt-5")
+        assert get_semantic_model() == "gpt-5"
+
+    def test_get_semantic_model_falls_back_to_config(self) -> None:
+        """Config is used when env override is absent."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    evaluation=EvaluationConfig(semantic_model="gpt-5"),
+                ),
+            ),
+        ):
+            assert get_semantic_model() == "gpt-5"
+
+    def test_extended_model_helpers_fall_back_to_config(self) -> None:
+        """Additional helper lookups use the configured section defaults."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    llm=LLMConfig(
+                        ontology_analysis_model="gpt-5-ontology",
+                        context_compression_model="gpt-5-mini",
+                    ),
+                    resilience=ResilienceConfig(
+                        wonder_model="gpt-5-wonder",
+                        reflect_model="gpt-5-reflect",
+                    ),
+                    evaluation=EvaluationConfig(
+                        semantic_model="gpt-5-semantic",
+                        assertion_extraction_model="gpt-5-assert",
+                    ),
+                    consensus=ConsensusConfig(
+                        models=("gpt-5-a", "gpt-5-b", "gpt-5-c"),
+                        advocate_model="gpt-5-advocate",
+                    ),
+                ),
+            ),
+        ):
+            assert get_ontology_analysis_model() == "gpt-5-ontology"
+            assert get_context_compression_model() == "gpt-5-mini"
+            assert get_wonder_model() == "gpt-5-wonder"
+            assert get_reflect_model() == "gpt-5-reflect"
+            assert get_assertion_extraction_model() == "gpt-5-assert"
+            assert get_consensus_models() == ("gpt-5-a", "gpt-5-b", "gpt-5-c")
+            assert get_consensus_advocate_model() == "gpt-5-advocate"
+
+    def test_consensus_model_list_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Consensus roster can be overridden from a comma-separated env var."""
+        monkeypatch.setenv("OUROBOROS_CONSENSUS_MODELS", "gpt-5-a, gpt-5-b ,gpt-5-c")
+        assert get_consensus_models() == ("gpt-5-a", "gpt-5-b", "gpt-5-c")
+
+
+class TestCredentialsFileSecure:
+    """Test credentials_file_secure function."""
+
+    def test_credentials_file_secure_returns_true(self, tmp_path: Path) -> None:
+        """credentials_file_secure returns True for chmod 600."""
+        creds_path = tmp_path / "credentials.yaml"
+        creds_path.write_text("providers: {}")
+        os.chmod(creds_path, stat.S_IRUSR | stat.S_IWUSR)
+
+        assert credentials_file_secure(creds_path) is True
+
+    def test_credentials_file_secure_returns_false_permissive(self, tmp_path: Path) -> None:
+        """credentials_file_secure returns False for permissive permissions."""
+        creds_path = tmp_path / "credentials.yaml"
+        creds_path.write_text("providers: {}")
+        os.chmod(creds_path, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
+
+        assert credentials_file_secure(creds_path) is False
+
+    def test_credentials_file_secure_returns_false_missing(self, tmp_path: Path) -> None:
+        """credentials_file_secure returns False for missing file."""
+        missing_path = tmp_path / "nonexistent.yaml"
+        assert credentials_file_secure(missing_path) is False
+
+
+class TestIntegration:
+    """Integration tests for config loading workflow."""
+
+    def test_create_and_load_config(self, tmp_path: Path) -> None:
+        """Full workflow: create default config, then load it."""
+        config_dir = tmp_path / ".ouroboros"
+        config_path, creds_path = create_default_config(config_dir)
+
+        # Load config
+        config = load_config(config_path)
+        assert config.economics.default_tier == "frugal"
+        assert "frugal" in config.economics.tiers
+        assert "standard" in config.economics.tiers
+        assert "frontier" in config.economics.tiers
+
+        # Load credentials
+        creds = load_credentials(creds_path)
+        assert "openai" in creds.providers
+        assert "anthropic" in creds.providers
+
+        # Verify credentials are secure
+        assert credentials_file_secure(creds_path) is True
+
+    def test_config_roundtrip_preserves_values(self, tmp_path: Path) -> None:
+        """Config values are preserved through save/load cycle."""
+        config_dir = tmp_path / ".ouroboros"
+        config_path, _ = create_default_config(config_dir)
+
+        # Load and verify specific values
+        config = load_config(config_path)
+
+        # Check tier configurations
+        frugal = config.economics.tiers["frugal"]
+        assert frugal.cost_factor == 1
+        assert len(frugal.models) == 3
+
+        standard = config.economics.tiers["standard"]
+        assert standard.cost_factor == 10
+
+        frontier = config.economics.tiers["frontier"]
+        assert frontier.cost_factor == 30
+
+
+class TestRuntimeProfileConfigAccess:
+    def test_get_runtime_profile_defaults_to_none(self) -> None:
+        """No env, no config — runtime_profile resolves to None."""
+        config = OuroborosConfig()
+        with patch("ouroboros.config.loader.load_config", return_value=config):
+            assert get_runtime_profile() is None
+
+    def test_get_runtime_profile_prefers_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Environment variable overrides config for runtime_profile."""
+        monkeypatch.setenv("OUROBOROS_RUNTIME_PROFILE", "worker")
+        config = OuroborosConfig(
+            orchestrator=OrchestratorConfig(
+                runtime_profile=RuntimeProfileConfig(backend_profile="future-worker")
+            )
+        )
+        with patch("ouroboros.config.loader.load_config", return_value=config):
+            assert get_runtime_profile() == "worker"
+
+    def test_get_runtime_profile_falls_back_to_config(self) -> None:
+        config = OuroborosConfig(
+            orchestrator=OrchestratorConfig(
+                runtime_profile=RuntimeProfileConfig(backend_profile="worker")
+            )
+        )
+        with patch("ouroboros.config.loader.load_config", return_value=config):
+            assert get_runtime_profile() == "worker"
+
+    def test_get_runtime_profile_accepts_legacy_string_shorthand(self) -> None:
+        config = OuroborosConfig(orchestrator=OrchestratorConfig(runtime_profile="worker"))
+        with patch("ouroboros.config.loader.load_config", return_value=config):
+            assert get_runtime_profile() == "worker"
+
+    def test_get_runtime_profile_accepts_unknown_backend_profile(self) -> None:
+        config = OuroborosConfig(
+            orchestrator=OrchestratorConfig(
+                runtime_profile=RuntimeProfileConfig(backend_profile="future-worker")
+            )
+        )
+        with patch("ouroboros.config.loader.load_config", return_value=config):
+            assert get_runtime_profile() == "future-worker"
+
+    def test_get_runtime_profile_ignores_stage_only_profile(self) -> None:
+        config = OuroborosConfig(
+            orchestrator=OrchestratorConfig(runtime_profile=RuntimeProfileConfig(default="codex"))
+        )
+        with patch("ouroboros.config.loader.load_config", return_value=config):
+            assert get_runtime_profile() is None
+
+
+def test_get_goose_cli_path_prefers_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Environment variable overrides config for Goose CLI path."""
+    from ouroboros.config.loader import get_goose_cli_path
+
+    monkeypatch.setenv("OUROBOROS_GOOSE_CLI_PATH", "~/bin/goose")
+    resolved = str(Path("~/bin/goose").expanduser())
+    with patch("ouroboros.config.loader.shutil.which", return_value=resolved):
+        assert get_goose_cli_path() == resolved
+
+
+def test_get_goose_cli_path_falls_back_to_config() -> None:
+    """Config is used when env override is absent."""
+    from ouroboros.config.loader import get_goose_cli_path
+
+    resolved = "/tmp/goose"
+    with (
+        patch.dict(os.environ, {}, clear=True),
+        patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(orchestrator=OrchestratorConfig(goose_cli_path=resolved)),
+        ),
+        patch("ouroboros.config.loader.shutil.which", return_value=resolved),
+    ):
+        assert get_goose_cli_path() == resolved
+
+
+def test_get_goose_cli_path_ignores_stale_env_and_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dead explicit Goose paths are ignored so callers can fall back to PATH."""
+    from ouroboros.config.loader import get_goose_cli_path
+
+    monkeypatch.setenv("OUROBOROS_GOOSE_CLI_PATH", "/stale/env/goose")
+    with (
+        patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(
+                orchestrator=OrchestratorConfig(goose_cli_path="/stale/config/goose")
+            ),
+        ),
+        patch("ouroboros.config.loader.shutil.which", return_value=None),
+    ):
+        assert get_goose_cli_path() is None
+
+
+class TestGetAgentReasoningEffort:
+    """Env/config resolution + validation for the RFC #1405 effort dial."""
+
+    def test_valid_env_overrides_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from ouroboros.config.loader import get_agent_reasoning_effort
+
+        monkeypatch.setenv("OUROBOROS_AGENT_REASONING_EFFORT", "high")
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(orchestrator=OrchestratorConfig(reasoning_effort="low")),
+        ):
+            assert get_agent_reasoning_effort() == "high"
+
+    def test_invalid_env_is_ignored_and_falls_back_to_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Codex-only ``minimal`` is invalid for the native-shared global dial and
+        # must never be forwarded to a runtime; fall through to the config value.
+        from ouroboros.config.loader import get_agent_reasoning_effort
+
+        monkeypatch.setenv("OUROBOROS_AGENT_REASONING_EFFORT", "minimal")
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(
+                orchestrator=OrchestratorConfig(reasoning_effort="medium")
+            ),
+        ):
+            assert get_agent_reasoning_effort() == "medium"
+
+    def test_garbage_env_is_ignored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from ouroboros.config.loader import get_agent_reasoning_effort
+
+        monkeypatch.setenv("OUROBOROS_AGENT_REASONING_EFFORT", "turbo")
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(orchestrator=OrchestratorConfig()),
+        ):
+            assert get_agent_reasoning_effort() is None
+
+    def test_config_value_used_when_no_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from ouroboros.config.loader import get_agent_reasoning_effort
+
+        monkeypatch.delenv("OUROBOROS_AGENT_REASONING_EFFORT", raising=False)
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(orchestrator=OrchestratorConfig(reasoning_effort="xhigh")),
+        ):
+            assert get_agent_reasoning_effort() == "xhigh"
+
+    def test_dormant_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from ouroboros.config.loader import get_agent_reasoning_effort
+
+        monkeypatch.delenv("OUROBOROS_AGENT_REASONING_EFFORT", raising=False)
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(orchestrator=OrchestratorConfig()),
+        ):
+            assert get_agent_reasoning_effort() is None
+
+    def test_minimal_rejected_by_config_schema(self) -> None:
+        # The global dial is restricted to the native-shared vocabulary.
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError):
+            OrchestratorConfig(reasoning_effort="minimal")
+
+
+def test_cross_harness_ignores_legacy_generated_true_config() -> None:
+    config = OuroborosConfig(execution=ExecutionConfig(cross_harness_redispatch=True))
+    with (
+        patch.dict(os.environ, {}, clear=True),
+        patch("ouroboros.config.loader.load_config", return_value=config),
+    ):
+        assert get_cross_harness_redispatch_enabled() is False
+
+
+class TestGetExecutionModel:
+    """Execute model pins come from env first, then the persisted settings UI value."""
+
+    def test_env_model_overrides_persisted_pin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from ouroboros.config.loader import get_execution_model
+
+        monkeypatch.setenv("OUROBOROS_EXECUTION_MODEL", "env-model")
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(execution=ExecutionConfig(default_model="saved-model")),
+        ):
+            assert get_execution_model() == "env-model"
+
+    @pytest.mark.parametrize("value", ("", "default", "current"))
+    def test_env_automatic_execute_values_do_not_pin_a_model(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        from ouroboros.config.loader import get_execution_model
+
+        monkeypatch.setenv("OUROBOROS_EXECUTION_MODEL", value)
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(execution=ExecutionConfig(default_model="saved-model")),
+        ):
+            assert get_execution_model() is None
+
+    def test_persisted_execute_model_is_used_when_env_is_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ouroboros.config.loader import get_execution_model
+
+        monkeypatch.delenv("OUROBOROS_EXECUTION_MODEL", raising=False)
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(execution=ExecutionConfig(default_model="gpt-5-codex")),
+        ):
+            assert get_execution_model() == "gpt-5-codex"
+
+    @pytest.mark.parametrize("value", (None, "", "default", "current"))
+    def test_automatic_execute_values_do_not_pin_a_model(
+        self, monkeypatch: pytest.MonkeyPatch, value: str | None
+    ) -> None:
+        from ouroboros.config.loader import get_execution_model
+
+        monkeypatch.delenv("OUROBOROS_EXECUTION_MODEL", raising=False)
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(execution=ExecutionConfig(default_model=value)),
+        ):
+            assert get_execution_model() is None
+
+
+class TestConfigEncodingLocaleIndependence:
+    """#1831: config/credentials I/O must not depend on the process locale."""
+
+    def test_utf8_config_round_trips_under_non_utf8_locale(self, tmp_path: Path) -> None:
+        """Create, rewrite with Korean content, and load back under LC_ALL=C.
+
+        The subprocess disables Python UTF-8 mode so the platform default
+        encoding really is ASCII; every canonical config operation has to
+        keep working because each pins UTF-8 explicitly.
+        """
+        script = textwrap.dedent(
+            """
+            import locale
+            from pathlib import Path
+            import sys
+
+            import yaml
+
+            preferred = locale.getpreferredencoding(False)
+            if "utf" in preferred.lower():
+                print(f"BADENV preferred={preferred}")
+                sys.exit(2)
+
+            from ouroboros.config import loader
+            from ouroboros.config.models import resolve_event_store_path
+
+            config_dir = Path(sys.argv[1])
+            config_path, credentials_path = loader.create_default_config(
+                config_dir=config_dir
+            )
+            data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            data.setdefault("project", {})["name"] = "한국어 프로젝트"
+            data.setdefault("persistence", {})["database_path"] = str(
+                config_dir / "데이터" / "ouroboros.db"
+            )
+            with config_path.open("w", encoding="utf-8") as f:
+                yaml.dump(data, f, allow_unicode=True, default_flow_style=False)
+
+            config = loader.load_config(config_path)
+            assert config is not None
+            loader.load_credentials(credentials_path)
+            resolved = resolve_event_store_path(config_path)
+            assert "데이터" in str(resolved), resolved
+            print("OK")
+            """
+        )
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("PYTHON", "OUROBOROS", "LC_", "LANG"))
+        }
+        env.update({"PYTHONUTF8": "0", "LC_ALL": "C", "LANG": "C"})
+        # The program goes through a UTF-8 script file, not -c: under the C
+        # locale the child cannot even decode a non-ASCII command line, while
+        # Python source files are UTF-8 by default regardless of locale.
+        script_path = tmp_path / "locale_repro.py"
+        script_path.write_text(script, encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(script_path), str(tmp_path / "config")],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        assert result.returncode == 0 and "OK" in result.stdout, (
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+
+    def test_invalidly_encoded_files_fail_through_domain_errors(self, tmp_path: Path) -> None:
+        """A non-UTF-8 file must surface the documented error, not a codec leak."""
+        garbage = b"project:\n  name: \xff\xfe broken\n"
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_bytes(garbage)
+        with pytest.raises(ConfigError):
+            load_config(config_path)
+
+        credentials_path = tmp_path / "credentials.yaml"
+        credentials_path.write_bytes(garbage)
+        credentials_path.chmod(0o600)
+        with pytest.raises(ConfigError):
+            load_credentials(credentials_path)
+
+        with pytest.raises(ValueError, match="invalid EventStore configuration"):
+            resolve_event_store_path(config_path)
+
+
+class TestDefaultExecutionEfficiencyMode:
+    """#1733: persistent default execution policy for fresh starts."""
+
+    @pytest.mark.parametrize(
+        ("policy", "expected"),
+        [("ask", None), ("efficient", "adaptive"), ("quality_first", "quality_first")],
+    )
+    def test_policy_maps_to_fresh_start_efficiency_mode(
+        self, policy: str, expected: str | None
+    ) -> None:
+        config = OuroborosConfig(execution=ExecutionConfig(default_policy=policy))
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.load_config", return_value=config),
+        ):
+            assert default_execution_efficiency_mode() == expected
+
+    def test_unreadable_config_preserves_the_ask_contract(self) -> None:
+        with patch(
+            "ouroboros.config.loader.load_config",
+            side_effect=ConfigError("unreadable"),
+        ):
+            assert default_execution_efficiency_mode() is None

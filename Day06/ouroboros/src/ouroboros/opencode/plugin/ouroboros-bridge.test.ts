@@ -1,0 +1,1817 @@
+// Bun tests for pure helpers in ouroboros-bridge.ts.
+// Run: bun test  (from this directory)
+//
+// Covers: cfg, rand62, id, fnv, build, parse, readText, stamp, stampBridge,
+//         notify, dupe, base, childOutput.
+// I/O + runtime-orchestration (patch/resolveMid/attempt/run/bridge) are
+// covered by Python installer tests and live integration; untested here
+// because they require a live client.
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import {
+  B62,
+  DEDUPE_MS,
+  ID_LEN,
+  MAX_BYTES,
+  MAX_FANOUT,
+  MAX_SEEN,
+  _resetDedupe,
+  base,
+  build,
+  buildEnvelope,
+  childTimeout,
+  cfg,
+  childOutput,
+  deriveSubagentSessionPermission,
+  dupe,
+  fnv,
+  id,
+  isRalphOwnedSession,
+  isNestedRalphDispatch,
+  markRalphChild,
+  notify,
+  num,
+  BRIDGE_NOTICE_OPENING,
+  OUROBOROS_DISPATCH_MARKER,
+  OuroborosBridge,
+  parse,
+  parseMetadata,
+  parseChildTimeout,
+  rand62,
+  readText,
+  stamp,
+  stampBridge,
+  timeoutMessage,
+} from "./ouroboros-bridge.ts"
+import {
+  _resolveMid,
+  _dispatch,
+  _authoritySnapshot,
+  _patch,
+  _PATCH_RETRIES,
+  _RESOLVE_RETRIES,
+  _sleep,
+} from "./ouroboros-bridge.ts"
+
+const ENV_BACKUP = { ...process.env }
+const PLATFORM_BACKUP = process.platform
+const restoreEnv = () => {
+  for (const k of Object.keys(process.env)) if (!(k in ENV_BACKUP)) delete process.env[k]
+  for (const k of Object.keys(ENV_BACKUP)) process.env[k] = ENV_BACKUP[k]
+  Object.defineProperty(process, "platform", { value: PLATFORM_BACKUP })
+}
+
+afterEach(restoreEnv)
+
+describe("cfg — platform config dir", () => {
+  test("linux prefers XDG_CONFIG_HOME", () => {
+    process.env.HOME = "/home/u"
+    process.env.XDG_CONFIG_HOME = "/custom/xdg"
+    delete process.env.APPDATA
+    Object.defineProperty(process, "platform", { value: "linux" })
+    expect(cfg()).toBe("/custom/xdg/opencode")
+  })
+
+  test("linux falls back to $HOME/.config when XDG_CONFIG_HOME unset", () => {
+    process.env.HOME = "/home/u"
+    delete process.env.XDG_CONFIG_HOME
+    Object.defineProperty(process, "platform", { value: "linux" })
+    expect(cfg()).toBe("/home/u/.config/opencode")
+  })
+
+  test("darwin uses XDG-style config path", () => {
+    process.env.HOME = "/Users/u"
+    delete process.env.XDG_CONFIG_HOME
+    Object.defineProperty(process, "platform", { value: "darwin" })
+    expect(cfg()).toBe("/Users/u/.config/opencode")
+  })
+
+  test("OPENCODE_CONFIG_DIR overrides platform defaults", () => {
+    process.env.HOME = "/Users/u"
+    process.env.OPENCODE_CONFIG_DIR = "/custom/opencode"
+    Object.defineProperty(process, "platform", { value: "darwin" })
+    expect(cfg()).toBe("/custom/opencode")
+  })
+
+  test("win32 uses APPDATA when present", () => {
+    process.env.APPDATA = "C:\\Users\\u\\AppData\\Roaming"
+    process.env.USERPROFILE = "C:\\Users\\u"
+    delete process.env.HOME
+    Object.defineProperty(process, "platform", { value: "win32" })
+    expect(cfg()).toContain("OpenCode")
+    expect(cfg()).toContain("Roaming")
+  })
+
+  test("win32 falls back to USERPROFILE/AppData/Roaming when APPDATA unset", () => {
+    delete process.env.APPDATA
+    process.env.USERPROFILE = "C:\\Users\\u"
+    delete process.env.HOME
+    Object.defineProperty(process, "platform", { value: "win32" })
+    const r = cfg()
+    expect(r).toContain("AppData")
+    expect(r).toContain("Roaming")
+    expect(r).toContain("OpenCode")
+  })
+})
+
+describe("num — env parse guard", () => {
+  test("returns default when undefined", () => {
+    expect(num(undefined, 42)).toBe(42)
+  })
+  test("parses valid integer string", () => {
+    expect(num("1500", 42)).toBe(1500)
+  })
+  test("parses valid float", () => {
+    expect(num("3.14", 0)).toBeCloseTo(3.14)
+  })
+  test("rejects NaN string, returns default", () => {
+    expect(num("abc", 99)).toBe(99)
+  })
+  test("rejects empty string, returns default", () => {
+    expect(num("", 7)).toBe(7)
+  })
+  test("rejects negative, returns default", () => {
+    expect(num("-5", 10)).toBe(10)
+  })
+  test("accepts zero", () => {
+    expect(num("0", 99)).toBe(0)
+  })
+  test("rejects Infinity, returns default", () => {
+    expect(num("Infinity", 5)).toBe(5)
+  })
+})
+
+describe("rand62", () => {
+  test("length matches n", () => {
+    for (const n of [1, 8, 14, 26]) expect(rand62(n).length).toBe(n)
+  })
+
+  test("only uses B62 alphabet", () => {
+    const s = rand62(200)
+    for (const ch of s) expect(B62.includes(ch)).toBe(true)
+  })
+
+  test("distribution is not degenerate (100 samples all different)", () => {
+    const set = new Set<string>()
+    for (let i = 0; i < 100; i++) set.add(rand62(14))
+    expect(set.size).toBeGreaterThan(95) // allow rare collisions
+  })
+})
+
+describe("id", () => {
+  test("prt_ prefix + correct length", () => {
+    const v = id("prt")
+    expect(v.startsWith("prt_")).toBe(true)
+    expect(v.length).toBe(4 + ID_LEN)
+  })
+
+  test("tool_ prefix", () => {
+    expect(id("tool").startsWith("tool_")).toBe(true)
+  })
+
+  test("hex prefix + b62 suffix structure", () => {
+    const v = id("prt").slice(4)
+    expect(v.slice(0, 12)).toMatch(/^[0-9a-f]{12}$/)
+    expect(v.slice(12)).toMatch(/^[0-9A-Za-z]{14}$/)
+  })
+
+  test("monotonically ascending across rapid calls", () => {
+    const a = id("prt")
+    const b = id("prt")
+    const c = id("prt")
+    expect(b > a).toBe(true)
+    expect(c > b).toBe(true)
+  })
+
+  test("1000 calls remain strictly ascending", () => {
+    const ids = Array.from({ length: 1000 }, () => id("tool"))
+    for (let i = 1; i < ids.length; i++) expect(ids[i] > ids[i - 1]).toBe(true)
+  })
+})
+
+describe("fnv", () => {
+  test("deterministic for same input", () => {
+    expect(fnv("hello")).toBe(fnv("hello"))
+  })
+
+  test("distinct inputs → distinct hashes (high probability)", () => {
+    expect(fnv("hello")).not.toBe(fnv("world"))
+  })
+
+  test("empty string", () => {
+    expect(fnv("")).toBe("811c9dc5")
+  })
+
+  test("hex lowercase output", () => {
+    expect(fnv("anything goes here 12345")).toMatch(/^[0-9a-f]+$/)
+  })
+})
+
+describe("build", () => {
+  test("valid minimal payload", () => {
+    const s = build({ tool_name: "hacker", prompt: "think" }, 0)
+    expect(s).not.toBeNull()
+    expect(s!.tool).toBe("hacker")
+    expect(s!.title).toBe("hacker") // defaults to tool_name
+    expect(s!.agent).toBe("general") // default agent
+    expect(s!.prompt).toBe("think")
+    expect(s!.truncated).toBe(false)
+    expect(s!.hash).toBe(fnv("think"))
+  })
+
+  test("uses custom title and agent when provided", () => {
+    const s = build({ tool_name: "t", title: "My Title", agent: "hacker", prompt: "p" }, 0)
+    expect(s!.title).toBe("My Title")
+    expect(s!.agent).toBe("hacker")
+  })
+
+  test("parses Ralph session-ceiling timeout metadata", () => {
+    // #790 review-3: Python only emits wall_clock_exhausted /
+    // session_ceiling_only for Ralph because the bridge cannot reset its
+    // timer per iteration. per_iteration_timeout_seconds rides along as
+    // advisory metadata for the child to self-enforce.
+    const s = build({
+      tool_name: "ouroboros_ralph",
+      title: "Ralph",
+      agent: "general",
+      prompt: "run",
+      timeout: {
+        timeout_ms: 1_800_000,
+        stop_reason: "wall_clock_exhausted",
+        source: "max_total_seconds",
+        behavior: "session_ceiling_only",
+        per_iteration_timeout_seconds: 300,
+        max_total_seconds: 1800,
+      },
+    }, 0)
+    expect(s!.timeout).toEqual({
+      timeoutMs: 1_800_000,
+      stopReason: "wall_clock_exhausted",
+      source: "max_total_seconds",
+      behavior: "session_ceiling_only",
+      perIterationTimeoutSeconds: 300,
+      maxTotalSeconds: 1800,
+    })
+  })
+
+  test("multi-iteration Ralph: per_iteration < max_total stays uncapped at per_iteration", () => {
+    // Regression guard for #790 review-3: a healthy multi-iteration plugin
+    // run was being aborted at the per-iteration budget because the bridge
+    // timer used min(per_iteration, max_total). Per-iteration must NOT
+    // shorten the bridge's session-wide timer; only max_total drives it.
+    const s = build({
+      tool_name: "ouroboros_ralph",
+      title: "Ralph",
+      agent: "general",
+      prompt: "run",
+      timeout: {
+        timeout_ms: 1_800_000,
+        stop_reason: "wall_clock_exhausted",
+        source: "max_total_seconds",
+        behavior: "session_ceiling_only",
+        per_iteration_timeout_seconds: 300,
+        max_total_seconds: 1800,
+      },
+    }, 0)
+    expect(s!.timeout!.timeoutMs).toBe(1_800_000)
+    expect(s!.timeout!.timeoutMs).toBeGreaterThan(300_000)
+    expect(s!.timeout!.stopReason).toBe("wall_clock_exhausted")
+  })
+
+  test("parseChildTimeout still accepts iteration_timeout (non-Ralph paths)", () => {
+    // The bridge keeps iteration_timeout as a valid stop reason for any
+    // future caller that owns its own per-iteration enforcement. Ralph
+    // itself stops emitting it, but the parser must still recognize it.
+    expect(parseChildTimeout({
+      timeout_ms: 60_000,
+      stop_reason: "iteration_timeout",
+      source: "per_iteration_timeout_seconds",
+    })).toMatchObject({
+      timeoutMs: 60_000,
+      stopReason: "iteration_timeout",
+    })
+  })
+
+  test("ignores malformed timeout metadata", () => {
+    const s = build({
+      tool_name: "ouroboros_ralph",
+      prompt: "run",
+      timeout: { timeout_ms: 0, stop_reason: "wall_clock_exhausted" },
+    }, 0)
+    expect(s!.timeout).toBeUndefined()
+  })
+
+  test("rejects non-object", () => {
+    expect(build(null, 0)).toBeNull()
+    expect(build(42, 0)).toBeNull()
+    expect(build("str", 0)).toBeNull()
+  })
+
+  test("rejects missing tool_name", () => {
+    expect(build({ prompt: "p" }, 0)).toBeNull()
+    expect(build({ tool_name: "", prompt: "p" }, 0)).toBeNull()
+  })
+
+  test("rejects missing prompt", () => {
+    expect(build({ tool_name: "t" }, 0)).toBeNull()
+    expect(build({ tool_name: "t", prompt: "" }, 0)).toBeNull()
+  })
+
+  test("truncates prompt over MAX_BYTES", () => {
+    const big = "x".repeat(MAX_BYTES + 100)
+    const s = build({ tool_name: "t", prompt: big }, 0)
+    expect(s).not.toBeNull()
+    expect(s!.truncated).toBe(true)
+    expect(s!.prompt.length).toBeLessThan(big.length)
+    expect(s!.prompt).toContain("[...truncated")
+  })
+
+  test("byte-safe truncation for CJK/emoji (blocker #2)", () => {
+    // Each CJK char = 3 UTF-8 bytes. MAX_BYTES/3 chars = MAX_BYTES bytes exactly.
+    // Adding one more char pushes over the limit.
+    const cjk = "漢".repeat(Math.floor(MAX_BYTES / 3) + 100)
+    expect(Buffer.byteLength(cjk, "utf8")).toBeGreaterThan(MAX_BYTES)
+    const s = build({ tool_name: "t", prompt: cjk }, 0)
+    expect(s).not.toBeNull()
+    expect(s!.truncated).toBe(true)
+    // The truncated prompt (minus the trailer) must fit within MAX_BYTES
+    const body = s!.prompt.split("\n\n[...truncated")[0]
+    expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(MAX_BYTES)
+  })
+
+  test("does not truncate exactly at MAX_BYTES", () => {
+    const exact = "x".repeat(MAX_BYTES)
+    const s = build({ tool_name: "t", prompt: exact }, 0)
+    expect(s!.truncated).toBe(false)
+    expect(s!.prompt).toBe(exact)
+  })
+})
+
+describe("parse", () => {
+  const empty = { subs: [], responseShape: {} }
+
+  test("empty / garbage returns empty", () => {
+    expect(parse("")).toEqual(empty)
+    expect(parse("x")).toEqual(empty)
+    expect(parse("not json")).toEqual(empty)
+    expect(parse("null")).toEqual(empty)
+    expect(parse("42")).toEqual(empty)
+  })
+
+  test("_subagent single object → 1 Sub", () => {
+    const raw = JSON.stringify({ _subagent: { tool_name: "t", prompt: "p" } })
+    const out = parse(raw)
+    expect(out.subs.length).toBe(1)
+    expect(out.subs[0].tool).toBe("t")
+    expect(out.responseShape).toEqual({})
+  })
+
+  test("_subagents array → N Subs", () => {
+    const raw = JSON.stringify({
+      _subagents: [
+        { tool_name: "a", prompt: "pa" },
+        { tool_name: "b", prompt: "pb" },
+        { tool_name: "c", prompt: "pc" },
+      ],
+    })
+    const out = parse(raw)
+    expect(out.subs.length).toBe(3)
+    expect(out.subs.map((s) => s.tool)).toEqual(["a", "b", "c"])
+  })
+
+  test("_subagents empty array rejected", () => {
+    expect(parse(JSON.stringify({ _subagents: [] }))).toEqual(empty)
+  })
+
+  test("_subagents capped at MAX_FANOUT", () => {
+    const many = Array.from({ length: MAX_FANOUT + 5 }, (_, i) => ({ tool_name: `t${i}`, prompt: `p${i}` }))
+    const out = parse(JSON.stringify({ _subagents: many }))
+    expect(out.subs.length).toBe(MAX_FANOUT)
+  })
+
+  test("invalid children skipped in array", () => {
+    const raw = JSON.stringify({
+      _subagents: [
+        { tool_name: "good", prompt: "p" },
+        { prompt: "no tool name" },
+        { tool_name: "also-good", prompt: "p2" },
+      ],
+    })
+    const out = parse(raw)
+    expect(out.subs.length).toBe(2)
+    expect(out.subs.map((s) => s.tool)).toEqual(["good", "also-good"])
+  })
+
+  test("neither _subagent nor _subagents → empty", () => {
+    expect(parse(JSON.stringify({ other: "key" }))).toEqual(empty)
+  })
+
+  test("response_shape preserved alongside _subagent", () => {
+    const raw = JSON.stringify({
+      job_id: "job_123",
+      session_id: "ses_456",
+      status: "completed",
+      _subagent: { tool_name: "exec", prompt: "do stuff" },
+    })
+    const out = parse(raw)
+    expect(out.subs.length).toBe(1)
+    expect(out.subs[0].tool).toBe("exec")
+    expect(out.responseShape).toEqual({ job_id: "job_123", session_id: "ses_456", status: "completed" })
+  })
+
+  test("response_shape preserved alongside _subagents", () => {
+    const raw = JSON.stringify({
+      job_id: "job_789",
+      _subagents: [{ tool_name: "a", prompt: "pa" }],
+    })
+    const out = parse(raw)
+    expect(out.subs.length).toBe(1)
+    expect(out.responseShape).toEqual({ job_id: "job_789" })
+  })
+})
+
+describe("parseMetadata", () => {
+  const empty = { subs: [], responseShape: {}, preserveContent: false }
+
+  test("empty metadata returns empty", () => {
+    expect(parseMetadata(undefined)).toEqual(empty)
+    expect(parseMetadata({})).toEqual(empty)
+  })
+
+  test("question advisory metadata produces subs and preserves content flag", () => {
+    const out = parseMetadata({
+      session_id: "sess-1",
+      ambiguity_score: 0.35,
+      milestone: "progress",
+      seed_ready: false,
+      question_advisory_recommended: true,
+      question_advisory_preserve_content: true,
+      question_advisory_subagents: [
+        { tool_name: "ouroboros_interview", title: "Code", agent: "researcher", prompt: "inspect" },
+        { tool_name: "ouroboros_interview", title: "Simplify", agent: "simplifier", prompt: "simplify" },
+      ],
+    })
+
+    expect(out.subs.length).toBe(2)
+    expect(out.subs.map((s) => s.title)).toEqual(["Code", "Simplify"])
+    expect(out.subs.map((s) => s.agent)).toEqual(["researcher", "simplifier"])
+    expect(out.preserveContent).toBe(true)
+    expect(out.responseShape).toEqual({
+      session_id: "sess-1",
+      ambiguity_score: 0.35,
+      milestone: "progress",
+      seed_ready: false,
+      question_advisory_recommended: true,
+    })
+  })
+
+  test("fan-out identity survives into the response shape", () => {
+    // Children run in the background here, so the parent redeems the fan-out
+    // itself once the Task widgets finish. It can only do that if the id and
+    // correlation key reach a response it can see — without them the data
+    // lane's measurement never reaches re-entry.
+    const out = parseMetadata({
+      session_id: "sess-2",
+      question_advisory_fanout_id: "fanout_abc123",
+      question_advisory_result_correlation_key: "context.lane_id",
+      question_advisory_subagents: [
+        { tool_name: "ouroboros_interview", title: "Data", agent: "researcher", prompt: "propose" },
+      ],
+    })
+
+    expect(out.responseShape.question_advisory_fanout_id).toBe("fanout_abc123")
+    expect(out.responseShape.question_advisory_result_correlation_key).toBe("context.lane_id")
+  })
+
+  test("no lane is singled out by its capability any more", () => {
+    // `read_data` used to mark a child proposal-only and strip its permissions.
+    // The lane executes now (#1825), so capability carries no permission
+    // meaning here and the field it was read from is gone. Pinned because a
+    // reintroduced special case would be invisible: the child would simply
+    // return less, and return it in a valid shape.
+    const out = parseMetadata({
+      question_advisory_subagents: [
+        {
+          tool_name: "ouroboros_interview",
+          title: "Data",
+          prompt: "measure",
+          context: { lane_id: "data_context", capability: "read_data" },
+        },
+        {
+          tool_name: "ouroboros_interview",
+          title: "Code",
+          prompt: "inspect",
+          context: { lane_id: "code_context", capability: "inspect_code" },
+        },
+      ],
+    })
+
+    expect(out.subs.map((s) => "proposalOnly" in s)).toEqual([false, false])
+  })
+
+  test("invalid advisory children are skipped", () => {
+    const out = parseMetadata({
+      question_advisory_subagents: [
+        { prompt: "missing tool" },
+        { tool_name: "ouroboros_interview", prompt: "ok" },
+      ],
+    })
+
+    expect(out.subs.length).toBe(1)
+    expect(out.subs[0].tool).toBe("ouroboros_interview")
+  })
+})
+
+describe("child timeout helpers", () => {
+  test("parseChildTimeout accepts Ralph stop reasons", () => {
+    expect(parseChildTimeout({
+      timeout_ms: 1_000,
+      stop_reason: "wall_clock_exhausted",
+      source: "max_total_seconds",
+    })).toEqual({
+      timeoutMs: 1_000,
+      stopReason: "wall_clock_exhausted",
+      source: "max_total_seconds",
+      behavior: undefined,
+      perIterationTimeoutSeconds: undefined,
+      maxTotalSeconds: undefined,
+    })
+  })
+
+  test("parseChildTimeout rejects unknown stop reasons", () => {
+    expect(parseChildTimeout({
+      timeout_ms: 1_000,
+      stop_reason: "timeout",
+      source: "x",
+    })).toBeUndefined()
+  })
+
+  test("childTimeout falls back to global default", () => {
+    const timeout = childTimeout({
+      tool: "ouroboros_qa",
+      title: "QA",
+      agent: "general",
+      prompt: "p",
+      truncated: false,
+      hash: "h",
+    })
+    expect(timeout.timeoutMs).toBeGreaterThan(0)
+    expect(timeout.stopReason).toBe("child_timeout")
+  })
+
+  test("timeoutMessage distinguishes public Ralph stop reasons", () => {
+    expect(timeoutMessage({
+      timeoutMs: 10,
+      stopReason: "iteration_timeout",
+      source: "per_iteration_timeout_seconds",
+    })).toContain("stop_reason=iteration_timeout")
+    expect(timeoutMessage({
+      timeoutMs: 10,
+      stopReason: "wall_clock_exhausted",
+      source: "max_total_seconds",
+    })).toContain("stop_reason=wall_clock_exhausted")
+  })
+})
+
+describe("readText", () => {
+  test("joins text parts from content[]", () => {
+    expect(readText({ content: [{ type: "text", text: "A" }, { type: "text", text: "B" }] })).toBe("A\n\nB")
+  })
+
+  test("skips non-text parts", () => {
+    expect(readText({ content: [{ type: "image" }, { type: "text", text: "only" }] as any })).toBe("only")
+  })
+
+  test("falls back to output string when content empty", () => {
+    expect(readText({ output: "fallback" })).toBe("fallback")
+  })
+
+  test("returns empty when nothing", () => {
+    expect(readText({})).toBe("")
+  })
+
+  test("prefers content over output", () => {
+    expect(readText({ content: [{ type: "text", text: "C" }], output: "O" })).toBe("C")
+  })
+})
+
+describe("stamp", () => {
+  test("replaces existing content array in-place", () => {
+    const r: any = { content: [{ type: "text", text: "old" }] }
+    const ref = r.content
+    stamp(r, "new")
+    expect(ref).toBe(r.content) // same reference — in-place mutation
+    expect(r.content).toEqual([{ type: "text", text: "new" }])
+    expect(r.output).toBe("new")
+  })
+
+  test("creates content when missing", () => {
+    const r: any = {}
+    stamp(r, "hi")
+    expect(r.content).toEqual([{ type: "text", text: "hi" }])
+    expect(r.output).toBe("hi")
+  })
+})
+
+describe("notify", () => {
+  const sub = (title: string, truncated = false) => ({
+    tool: "t", title, agent: "general", prompt: "p", truncated, hash: "h",
+  })
+  const okR = (title: string, childID = "ses_child", truncated = false) => ({
+    sub: sub(title, truncated), childID,
+  })
+
+  test("ok-only — plural grammar + fire-and-forget phrasing", () => {
+    const msg = notify([okR("a"), okR("b")], [], [])
+    expect(msg).toContain("Dispatched 2 subagents")
+    expect(msg).toContain("Task widgets will update as they complete")
+    expect(msg).toContain("• a")
+    expect(msg).toContain("• b")
+  })
+
+  test("ok-only singular grammar", () => {
+    const msg = notify([okR("only")], [], [])
+    expect(msg).toContain("Dispatched 1 subagent.")
+    expect(msg).toContain("Task widget will update as it completes")
+  })
+
+  test("failed-only", () => {
+    const msg = notify([], [sub("x"), sub("y")], [])
+    expect(msg).toContain("Failed 2 subagents")
+  })
+
+  test("skipped-only mentions dedupe window", () => {
+    const msg = notify([], [], [sub("dup")])
+    expect(msg).toContain("Skipped 1 duplicate")
+    expect(msg).toContain(`within ${Math.round(DEDUPE_MS / 1000)}s`)
+  })
+
+  test("mixed", () => {
+    const msg = notify([okR("ok")], [sub("bad")], [sub("dup")])
+    expect(msg).toContain("Dispatched 1")
+    expect(msg).toContain("Failed 1")
+    expect(msg).toContain("Skipped 1")
+  })
+
+  test("truncated note appears", () => {
+    expect(notify([okR("big", "ses_big", true)], [], [])).toContain("truncated")
+  })
+
+  test("empty everything → fallback", () => {
+    expect(notify([], [], [])).toContain("Nothing dispatched")
+  })
+
+  test("child session id appears in banner (for UI correlation)", () => {
+    const msg = notify([okR("alpha", "ses_aaa"), okR("beta", "ses_bbb")], [], [])
+    expect(msg).toContain("ses_aaa")
+    expect(msg).toContain("ses_bbb")
+  })
+
+  test("no Results section in fire-and-forget model", () => {
+    // Post-FF model: plugin doesn't await child output. Widget drives
+    // completion. Banner must NOT promise results.
+    const msg = notify([okR("x")], [], [])
+    expect(msg).not.toContain("--- Results ---")
+  })
+})
+
+describe("dupe", () => {
+  beforeEach(() => _resetDedupe())
+
+  test("first call returns false", () => {
+    expect(dupe("p", "call_1")).toBe(false)
+  })
+
+  test("same pid+callID within window returns true (hook re-fire)", () => {
+    dupe("p", "call_1")
+    expect(dupe("p", "call_1")).toBe(true)
+  })
+
+  test("different callID — legit re-runs pass", () => {
+    dupe("p", "call_1")
+    expect(dupe("p", "call_2")).toBe(false)
+  })
+
+  test("different pid — cross-session isolation", () => {
+    dupe("p1", "call_1")
+    expect(dupe("p2", "call_1")).toBe(false)
+  })
+
+  test("eviction after MAX_SEEN entries", () => {
+    for (let i = 0; i < MAX_SEEN + 5; i++) dupe("p", `call_${i}`)
+    // earliest entries should be evicted → false again on insert
+    expect(dupe("p", "call_0")).toBe(false)
+  })
+})
+
+describe("ralph recursion guard", () => {
+  beforeEach(() => _resetDedupe())
+
+  const sub = (tool: string) => ({
+    tool,
+    title: "t",
+    agent: "general",
+    prompt: "p",
+    truncated: false,
+    hash: "h",
+  })
+
+  test("blocks ouroboros_ralph from a Ralph child session", () => {
+    markRalphChild("ses_child")
+
+    expect(isNestedRalphDispatch("ses_child", [sub("ouroboros_ralph")])).toBe(true)
+  })
+
+  test("allows non-Ralph tools from a Ralph child session", () => {
+    markRalphChild("ses_child")
+
+    expect(isNestedRalphDispatch("ses_child", [sub("ouroboros_evolve_step")])).toBe(false)
+  })
+
+  test("allows top-level Ralph dispatch from ordinary sessions", () => {
+    expect(isNestedRalphDispatch("ses_parent", [sub("ouroboros_ralph")])).toBe(false)
+  })
+
+  test("propagates Ralph ownership to descendants", () => {
+    markRalphChild("ses_child")
+    markRalphChild("ses_grandchild")
+
+    expect(isRalphOwnedSession("ses_child")).toBe(true)
+    expect(isRalphOwnedSession("ses_grandchild")).toBe(true)
+    expect(isNestedRalphDispatch("ses_grandchild", [sub("ouroboros_ralph")])).toBe(true)
+  })
+})
+
+describe("base", () => {
+  test("returns inner client when session._client.patch present", () => {
+    const fake = { session: { _client: { patch: () => Promise.resolve({}) } } }
+    expect(base(fake)).toBe(fake.session._client)
+  })
+
+  test("null when missing", () => {
+    expect(base(null)).toBeNull()
+    expect(base({})).toBeNull()
+    expect(base({ session: {} })).toBeNull()
+    expect(base({ session: { _client: {} } })).toBeNull()
+    expect(base({ session: { _client: { patch: "not a function" } } })).toBeNull()
+  })
+})
+
+describe("childOutput", () => {
+  test("extracts last text part wrapped in task_result", () => {
+    const data = { parts: [{ type: "text", text: "early" }, { type: "tool" }, { type: "text", text: "final" }] }
+    const out = childOutput("ses_abc", data)
+    expect(out).toContain("task_id: ses_abc")
+    expect(out).toContain("<task_result>")
+    expect(out).toContain("final")
+    expect(out).toContain("</task_result>")
+    expect(out).not.toContain("early")
+  })
+
+  test("empty when no text part", () => {
+    const out = childOutput("ses_abc", { parts: [{ type: "tool" }] })
+    expect(out).toContain("<task_result>\n\n</task_result>")
+  })
+
+  test("empty when parts missing", () => {
+    const out = childOutput("ses_x", {})
+    expect(out).toContain("task_id: ses_x")
+    expect(out).toContain("<task_result>")
+  })
+
+  test("handles null/undefined data", () => {
+    expect(childOutput("ses_y", null)).toContain("task_id: ses_y")
+    expect(childOutput("ses_z", undefined)).toContain("task_id: ses_z")
+  })
+})
+
+describe("buildEnvelope — dispatch schema", () => {
+  const mkSub = (tool: string, title = tool) =>
+    ({ tool, title, agent: "general", prompt: "p", truncated: false, hash: "h" }) as unknown as Parameters<
+      typeof buildEnvelope
+    >[0][0]["sub"]
+  const okR = (tool: string, childID = "ses_" + tool) => ({ sub: mkSub(tool), childID })
+
+  test("status=dispatched when any ok", () => {
+    const env = buildEnvelope([okR("a")], [], [])
+    expect(env.status).toBe("dispatched")
+  })
+
+  test("status=dispatch_failed when only failures", () => {
+    const env = buildEnvelope([], [{ sub: mkSub("a"), reason: "boom" }], [])
+    expect(env.status).toBe("dispatch_failed")
+  })
+
+  test("status=skipped when only skipped", () => {
+    const env = buildEnvelope([], [], [mkSub("a")])
+    expect(env.status).toBe("skipped")
+  })
+
+  test("status=nothing when empty", () => {
+    const env = buildEnvelope([], [], [])
+    expect(env.status).toBe("nothing")
+  })
+
+  test("status=dispatched wins over failed + skipped", () => {
+    const env = buildEnvelope([okR("a")], [{ sub: mkSub("b") }], [mkSub("c")])
+    expect(env.status).toBe("dispatched")
+  })
+
+  test("mode always plugin_subagent", () => {
+    expect(buildEnvelope([], [], []).mode).toBe("plugin_subagent")
+  })
+
+  test("dispatched_at is ISO 8601 UTC", () => {
+    const env = buildEnvelope([], [], [])
+    expect(env.dispatched_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/)
+  })
+
+  test("children carry title + childID + agent + tool + truncated", () => {
+    const env = buildEnvelope([okR("explore", "ses_42")], [], [])
+    expect(env.children).toEqual([
+      { title: "explore", childID: "ses_42", agent: "general", tool: "explore", truncated: false },
+    ])
+  })
+
+  test("failed carries reason when provided", () => {
+    const env = buildEnvelope([], [{ sub: mkSub("x"), reason: "create_failed" }], [])
+    expect(env.failed[0]).toEqual({ title: "x", tool: "x", reason: "create_failed" })
+  })
+
+  test("skipped is shape {title,tool} only", () => {
+    const env = buildEnvelope([], [], [mkSub("y", "Y-Title")])
+    expect(env.skipped).toEqual([{ title: "Y-Title", tool: "y" }])
+  })
+
+  test("arrays default to [] when nothing of that kind", () => {
+    const env = buildEnvelope([okR("a")], [], [])
+    expect(env.failed).toEqual([])
+    expect(env.skipped).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Runtime function tests (mocked client)
+// ---------------------------------------------------------------------------
+
+function mockCli(overrides: Partial<{
+  create: (...a: unknown[]) => Promise<unknown>
+  get: (...a: unknown[]) => Promise<unknown>
+  agents: (...a: unknown[]) => Promise<unknown>
+  prompt: (...a: unknown[]) => Promise<unknown>
+  abort: (...a: unknown[]) => Promise<unknown>
+  messages: (...a: unknown[]) => Promise<unknown>
+}> = {}) {
+  const authority = mockAuthority()
+  return {
+    app: {
+      agents: overrides.agents ?? authority.app.agents,
+    },
+    session: {
+      create: overrides.create ?? (async () => ({ data: { id: "child_abc" } })),
+      get: overrides.get ?? authority.session.get,
+      prompt: overrides.prompt ?? (async () => ({ data: { parts: [{ type: "text", text: "done" }] } })),
+      abort: overrides.abort ?? (async () => ({})),
+      messages: overrides.messages ?? (async () => ({ data: [] })),
+    },
+  }
+}
+
+const TEST_CHILD_PERMISSION = [
+  { permission: "external_directory", pattern: "/workspace/*", action: "ask" },
+  { permission: "task", pattern: "*", action: "deny" },
+] as const
+
+function mockAuthority(
+  agents: ReadonlyArray<{ name: string; permission: ReadonlyArray<unknown> }> = [
+    { name: "general", permission: [] },
+    { name: "researcher", permission: [] },
+    { name: "simplifier", permission: [] },
+    { name: "contrarian", permission: [] },
+  ],
+) {
+  return {
+    session: {
+      get: async ({ path }: { path: { id: string } }) => ({
+        data: { id: path.id, permission: [] },
+      }),
+    },
+    app: {
+      agents: async () => ({ data: agents }),
+    },
+  }
+}
+
+function mockBase(patchFn?: (...a: unknown[]) => Promise<unknown>) {
+  return {
+    patch: patchFn ?? (async () => ({})),
+  }
+}
+
+describe("_resolveMid — message ID resolution with retry", () => {
+  test("finds message matching callID", async () => {
+    const cli = mockCli({
+      messages: async () => ({
+        data: [
+          { info: { id: "m1", role: "user" }, parts: [{ type: "text" }] },
+          { info: { id: "m2", role: "assistant" }, parts: [{ type: "tool", callID: "call_xyz" }] },
+        ],
+      }),
+    })
+    const mid = await _resolveMid(cli as never, "pid", "call_xyz")
+    expect(mid).toBe("m2")
+  })
+
+  test("returns null when no callID match (fail closed, no fallback)", async () => {
+    const cli = mockCli({
+      messages: async () => ({
+        data: [
+          { info: { id: "m1", role: "assistant" }, parts: [{ type: "text" }] },
+          { info: { id: "m2", role: "user" }, parts: [{ type: "text" }] },
+        ],
+      }),
+    })
+    const mid = await _resolveMid(cli as never, "pid", "no_match")
+    expect(mid).toBeNull()
+  })
+
+  test("returns null after retries when no messages", async () => {
+    const cli = mockCli({
+      messages: async () => ({ data: [] }),
+    })
+    const mid = await _resolveMid(cli as never, "pid", "call_xyz")
+    expect(mid).toBeNull()
+  })
+
+  test("returns null when messages call throws", async () => {
+    const cli = mockCli({
+      messages: async () => { throw new Error("network") },
+    })
+    const mid = await _resolveMid(cli as never, "pid", "call_xyz")
+    expect(mid).toBeNull()
+  })
+})
+
+describe("_patch — PATCH with retry", () => {
+  test("succeeds on first attempt", async () => {
+    const b = mockBase(async () => ({}))
+    await expect(_patch(b as never, "pid", "mid", "part1", {}, "test")).resolves.toBeUndefined()
+  })
+
+  test("retries on error then succeeds", async () => {
+    let calls = 0
+    const b = mockBase(async () => {
+      calls++
+      if (calls < 3) return { error: "transient" }
+      return {}
+    })
+    await expect(_patch(b as never, "pid", "mid", "part1", {}, "test")).resolves.toBeUndefined()
+    expect(calls).toBe(3)
+  })
+
+  test("throws after max retries", async () => {
+    const b = mockBase(async () => ({ error: "permanent" }))
+    await expect(_patch(b as never, "pid", "mid", "part1", {}, "test")).rejects.toThrow(
+      /PATCH failed after/,
+    )
+  })
+})
+
+describe("OpenCode authority snapshot", () => {
+  test("inherits parent denies and every external_directory action in original order", () => {
+    const parent = [
+      { permission: "bash", pattern: "safe", action: "allow" },
+      { permission: "edit", pattern: "secret", action: "deny" },
+      { permission: "external_directory", pattern: "/ask/*", action: "ask" },
+      { permission: "read", pattern: "later", action: "ask" },
+      { permission: "external_directory", pattern: "/allow/*", action: "allow" },
+      { permission: "external_directory", pattern: "/deny/*", action: "deny" },
+      { permission: "webfetch", pattern: "blocked", action: "deny" },
+    ] as const
+    const derived = deriveSubagentSessionPermission(parent, [])
+
+    expect(derived).toEqual([
+      { permission: "edit", pattern: "secret", action: "deny" },
+      { permission: "external_directory", pattern: "/ask/*", action: "ask" },
+      { permission: "external_directory", pattern: "/allow/*", action: "allow" },
+      { permission: "external_directory", pattern: "/deny/*", action: "deny" },
+      { permission: "webfetch", pattern: "blocked", action: "deny" },
+      { permission: "todowrite", pattern: "*", action: "deny" },
+      { permission: "task", pattern: "*", action: "deny" },
+    ])
+  })
+
+  test.each([
+    { exactTask: false, exactTodo: false, expected: ["todowrite", "task"] },
+    { exactTask: true, exactTodo: false, expected: ["todowrite"] },
+    { exactTask: false, exactTodo: true, expected: ["task"] },
+    { exactTask: true, exactTodo: true, expected: [] },
+  ])("exact recursive rules control defaults: $exactTask/$exactTodo", ({ exactTask, exactTodo, expected }) => {
+    const agent = [
+      { permission: "*", pattern: "*", action: "allow" as const },
+      ...(exactTask ? [{ permission: "task", pattern: "worker", action: "ask" as const }] : []),
+      ...(exactTodo ? [{ permission: "todowrite", pattern: "*", action: "deny" as const }] : []),
+    ]
+    const derived = deriveSubagentSessionPermission([], agent)
+    expect(derived.map((rule) => rule.permission)).toEqual([...expected])
+  })
+
+  test("does not copy target-agent rules into the session snapshot", () => {
+    const agent = [
+      { permission: "bash", pattern: "*", action: "deny" as const },
+      { permission: "task", pattern: "worker", action: "allow" as const },
+      { permission: "todowrite", pattern: "*", action: "ask" as const },
+    ]
+    expect(deriveSubagentSessionPermission([], agent)).toEqual([])
+  })
+
+  test("loads parent and catalog once and derives all target agents from one snapshot", async () => {
+    let parentCalls = 0
+    let agentCalls = 0
+    const cli = {
+      session: {
+        get: async () => {
+          parentCalls++
+          return { data: { id: "parent", permission: [
+            { permission: "bash", pattern: "danger", action: "deny" },
+          ] } }
+        },
+      },
+      app: {
+        agents: async () => {
+          agentCalls++
+          return { data: [
+            { name: "general", permission: [] },
+            { name: "researcher", permission: [
+              { permission: "task", pattern: "researcher", action: "ask" },
+            ] },
+          ] }
+        },
+      },
+    }
+
+    const snapshot = await _authoritySnapshot(cli as never, "parent", ["general", "researcher", "general"])
+    expect(parentCalls).toBe(1)
+    expect(agentCalls).toBe(1)
+    expect(snapshot.get("general")).toEqual([
+      { permission: "bash", pattern: "danger", action: "deny" },
+      { permission: "todowrite", pattern: "*", action: "deny" },
+      { permission: "task", pattern: "*", action: "deny" },
+    ])
+    expect(snapshot.get("researcher")).toEqual([
+      { permission: "bash", pattern: "danger", action: "deny" },
+      { permission: "todowrite", pattern: "*", action: "deny" },
+    ])
+    expect(Object.isFrozen(snapshot.get("general"))).toBe(true)
+  })
+
+  test("uses OpenCode's native empty-session default when permission is absent", async () => {
+    const authority = mockAuthority()
+    const cli = {
+      ...authority,
+      session: { get: async () => ({ data: { id: "parent" } }) },
+    }
+    const snapshot = await _authoritySnapshot(cli as never, "parent", ["general"])
+    expect(snapshot.get("general")).toEqual([
+      { permission: "todowrite", pattern: "*", action: "deny" },
+      { permission: "task", pattern: "*", action: "deny" },
+    ])
+  })
+
+  test.each([
+    ["missing APIs", {}],
+    ["missing parent", { session: { get: async () => ({}) }, app: { agents: async () => ({ data: [] }) } }],
+    ["parent mismatch", { session: { get: async () => ({ data: { id: "other", permission: [] } }) }, app: { agents: async () => ({ data: [] }) } }],
+    ["malformed parent ruleset", { session: { get: async () => ({ data: { id: "parent", permission: {} } }) }, app: { agents: async () => ({ data: [] }) } }],
+    ["missing catalog", { session: { get: async () => ({ data: { id: "parent", permission: [] } }) }, app: { agents: async () => ({}) } }],
+    ["malformed catalog", { session: { get: async () => ({ data: { id: "parent", permission: [] } }) }, app: { agents: async () => ({ data: [{}] }) } }],
+    ["missing agent ruleset", { session: { get: async () => ({ data: { id: "parent", permission: [] } }) }, app: { agents: async () => ({ data: [{ name: "general" }] }) } }],
+    ["malformed agent rule", { session: { get: async () => ({ data: { id: "parent", permission: [] } }) }, app: { agents: async () => ({ data: [{ name: "general", permission: [{ permission: "task", pattern: "*", action: "sometimes" }] }] }) } }],
+    ["missing target", { session: { get: async () => ({ data: { id: "parent", permission: [] } }) }, app: { agents: async () => ({ data: [{ name: "other", permission: [] }] }) } }],
+    ["duplicate target", { session: { get: async () => ({ data: { id: "parent", permission: [] } }) }, app: { agents: async () => ({ data: [{ name: "general", permission: [] }, { name: "general", permission: [] }] }) } }],
+  ])("fails closed for %s", async (_label, cli) => {
+    await expect(_authoritySnapshot(cli as never, "parent", ["general"])).rejects.toThrow(
+      /^authority snapshot unavailable:/,
+    )
+  })
+
+  test.each([
+    ["parent lookup", true, false],
+    ["agent catalog lookup", false, true],
+    ["both authority lookups", true, true],
+  ])("fails closed when %s stalls", async (_label, stallParent, stallAgents) => {
+    const never = new Promise<never>(() => {})
+    const cli = {
+      session: {
+        get: stallParent
+          ? () => never
+          : async () => ({ data: { id: "parent", permission: [] } }),
+      },
+      app: {
+        agents: stallAgents
+          ? () => never
+          : async () => ({ data: [{ name: "general", permission: [] }] }),
+      },
+    }
+    const started = Date.now()
+
+    await expect(_authoritySnapshot(cli as never, "parent", ["general"], 20)).rejects.toThrow(
+      "authority snapshot unavailable: lookup timed out",
+    )
+    expect(Date.now() - started).toBeLessThan(500)
+  })
+
+  test.each([
+    [{ permission: 7, pattern: "*", action: "deny" }, "permission"],
+    [{ permission: "bash", pattern: null, action: "deny" }, "pattern"],
+    [{ permission: "bash", pattern: "TOP-SECRET-PATTERN", action: "later" }, "action"],
+    [null, "rule"],
+  ])("rejects malformed rules without echoing their payload: %o", async (rule, reason) => {
+    const cli = {
+      session: { get: async () => ({ data: { id: "parent", permission: [rule] } }) },
+      app: { agents: async () => ({ data: [{ name: "general", permission: [] }] }) },
+    }
+    let message = ""
+    try {
+      await _authoritySnapshot(cli as never, "parent", ["general"])
+    } catch (error) {
+      message = String(error)
+    }
+    expect(message).toContain(String(reason))
+    expect(message).not.toContain("TOP-SECRET-PATTERN")
+  })
+})
+
+describe("_dispatch — child session lifecycle", () => {
+  test("success: creates child, patches running, fires prompt", async () => {
+    const patchCalls: string[] = []
+    const createCalls: unknown[] = []
+    const cli = mockCli({
+      create: async (args: unknown) => {
+        createCalls.push(args)
+        return { data: { id: "child_123" } }
+      },
+      prompt: async () => ({ data: { parts: [{ type: "text", text: "result" }] } }),
+    })
+    const b = mockBase(async (_a: unknown) => {
+      patchCalls.push("patched")
+      return {}
+    })
+    const sub = { tool: "ouroboros_qa", title: "QA", prompt: "check it", agent: "general" }
+    const result = await _dispatch(cli as never, b as never, "pid", "mid", sub as never, TEST_CHILD_PERMISSION)
+    expect(result.childID).toBe("child_123")
+    expect(createCalls).toEqual([
+      {
+        body: {
+          parentID: "pid",
+          title: "QA",
+          permission: TEST_CHILD_PERMISSION,
+        },
+      },
+    ])
+    // At least the PATCH-running call should have fired (awaited phase)
+    expect(patchCalls.length).toBeGreaterThanOrEqual(1)
+  })
+
+  test("the data lane receives the supplied OpenCode-derived permission", async () => {
+    const createCalls: unknown[] = []
+    const cli = mockCli({
+      create: async (args: unknown) => {
+        createCalls.push(args)
+        return { data: { id: "child_data" } }
+      },
+      prompt: async () => ({ data: { parts: [{ type: "text", text: "measured" }] } }),
+    })
+    const b = mockBase(async () => ({}))
+    const sub = {
+      tool: "ouroboros_interview",
+      title: "Interview advisory: data_context",
+      prompt: "take the measurement",
+      agent: "general",
+    }
+
+    await _dispatch(cli as never, b as never, "pid", "mid", sub as never, TEST_CHILD_PERMISSION)
+
+    expect(createCalls).toEqual([
+      {
+        body: {
+          parentID: "pid",
+          title: "Interview advisory: data_context",
+          permission: TEST_CHILD_PERMISSION,
+        },
+      },
+    ])
+  })
+
+  test("returns after create and running patch while an ask remains unresolved", async () => {
+    const patchBodies: any[] = []
+    let resolvePrompt: ((value: unknown) => void) | undefined
+    const cli = mockCli({
+      create: async () => ({ data: { id: "child_ask" } }),
+      prompt: async () => new Promise((resolve) => { resolvePrompt = resolve }),
+    })
+    const b = mockBase(async (a: unknown) => {
+      patchBodies.push((a as { body: unknown }).body)
+      return {}
+    })
+    const sub = { tool: "ouroboros_qa", title: "QA", prompt: "ask", agent: "general" }
+
+    await expect(_dispatch(
+      cli as never, b as never, "pid", "mid", sub as never, TEST_CHILD_PERMISSION,
+    )).resolves.toEqual({ childID: "child_ask" })
+    expect(patchBodies.map((body) => body.state.status)).toEqual(["running"])
+
+    resolvePrompt?.({ data: { parts: [{ type: "text", text: "allowed" }] } })
+    for (let i = 0; i < 20 && patchBodies.length < 2; i++) await _sleep(5)
+    expect(patchBodies.map((body) => body.state.status)).toEqual(["running", "completed"])
+  })
+
+  test("a rejected ask follows the existing error-widget path", async () => {
+    const patchBodies: any[] = []
+    const cli = mockCli({
+      create: async () => ({ data: { id: "child_rejected" } }),
+      prompt: async () => { throw new Error("permission rejected") },
+    })
+    const b = mockBase(async (a: unknown) => {
+      patchBodies.push((a as { body: unknown }).body)
+      return {}
+    })
+    const sub = { tool: "ouroboros_qa", title: "QA", prompt: "ask", agent: "general" }
+
+    await _dispatch(cli as never, b as never, "pid", "mid", sub as never, TEST_CHILD_PERMISSION)
+    for (let i = 0; i < 20 && patchBodies.length < 2; i++) await _sleep(5)
+    const errorPatch = patchBodies.find((body) => body?.state?.status === "error")
+    expect(errorPatch.state.error).toContain("permission rejected")
+  })
+
+  test("does not infer a blocked result from child prose", async () => {
+    const patchBodies: any[] = []
+    const cli = mockCli({
+      create: async () => ({ data: { id: "child_prose" } }),
+      prompt: async () => ({ data: { parts: [{ type: "text", text: "I was blocked" }] } }),
+    })
+    const b = mockBase(async (a: unknown) => {
+      patchBodies.push((a as { body: unknown }).body)
+      return {}
+    })
+    const sub = { tool: "ouroboros_qa", title: "QA", prompt: "run", agent: "general" }
+
+    await _dispatch(cli as never, b as never, "pid", "mid", sub as never, TEST_CHILD_PERMISSION)
+    for (let i = 0; i < 20 && patchBodies.length < 2; i++) await _sleep(5)
+    const finalPatch = patchBodies.at(-1)
+    expect(finalPatch.state.status).toBe("completed")
+    expect(finalPatch.state.output).toContain("I was blocked")
+  })
+
+  test("throws when child session create returns no id", async () => {
+    const cli = mockCli({ create: async () => ({ data: {} }) })
+    const b = mockBase()
+    const sub = { tool: "ouroboros_qa", title: "QA", prompt: "check", agent: "general" }
+    await expect(
+      _dispatch(cli as never, b as never, "pid", "mid", sub as never, TEST_CHILD_PERMISSION),
+    ).rejects.toThrow(/child session create returned no id/)
+  })
+
+  test("throws when PATCH-running fails", async () => {
+    const cli = mockCli({ create: async () => ({ data: { id: "child_456" } }) })
+    const b = mockBase(async () => ({ error: "server error" }))
+    const sub = { tool: "ouroboros_qa", title: "QA", prompt: "check", agent: "general" }
+    await expect(
+      _dispatch(cli as never, b as never, "pid", "mid", sub as never, TEST_CHILD_PERMISSION),
+    ).rejects.toThrow(/PATCH failed/)
+  })
+
+  test("marks descendants created from Ralph-owned sessions", async () => {
+    _resetDedupe()
+    markRalphChild("ralph_child")
+    const cli = mockCli({ create: async () => ({ data: { id: "grandchild_123" } }) })
+    const b = mockBase()
+    const sub = {
+      tool: "ouroboros_evolve_step",
+      title: "Evolve",
+      prompt: "next",
+      agent: "general",
+      truncated: false,
+      hash: "h",
+    }
+
+    await _dispatch(cli as never, b as never, "ralph_child", "mid", sub as never, TEST_CHILD_PERMISSION)
+
+    expect(isRalphOwnedSession("grandchild_123")).toBe(true)
+    expect(isNestedRalphDispatch("grandchild_123", [{ ...sub, tool: "ouroboros_ralph" }])).toBe(true)
+  })
+
+  test("aborts child and patches semantic Ralph iteration timeout", async () => {
+    const patchBodies: any[] = []
+    let abortCalled = false
+    const cli = mockCli({
+      create: async () => ({ data: { id: "child_timeout" } }),
+      prompt: async (_a: unknown) => {
+        const signal = (_a as { signal: AbortSignal }).signal
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true })
+        })
+      },
+      abort: async () => {
+        abortCalled = true
+        return {}
+      },
+    })
+    const b = mockBase(async (a: unknown) => {
+      patchBodies.push((a as { body: unknown }).body)
+      return {}
+    })
+    const sub = {
+      tool: "ouroboros_ralph",
+      title: "Ralph",
+      prompt: "run",
+      agent: "general",
+      truncated: false,
+      hash: "h",
+      timeout: {
+        timeoutMs: 1,
+        stopReason: "iteration_timeout",
+        source: "per_iteration_timeout_seconds",
+      },
+    }
+
+    await _dispatch(cli as never, b as never, "pid", "mid", sub as never, TEST_CHILD_PERMISSION)
+    for (let i = 0; i < 20 && patchBodies.length < 2; i++) await _sleep(5)
+
+    expect(abortCalled).toBe(true)
+    const errorPatch = patchBodies.find((body) => body?.state?.status === "error")
+    expect(errorPatch.state.error).toContain("stop_reason=iteration_timeout")
+    expect(errorPatch.state.metadata.stop_reason).toBe("iteration_timeout")
+    expect(errorPatch.state.metadata.timeout_source).toBe("per_iteration_timeout_seconds")
+  })
+})
+
+describe("OuroborosBridge hook — metadata advisory fanout", () => {
+  test("preserves interview question text while dispatching metadata subagents", async () => {
+    _resetDedupe()
+    let created = 0
+    let parentFetches = 0
+    let agentFetches = 0
+    const promptCalls: unknown[] = []
+    const createCalls: any[] = []
+    const patchBodies: unknown[] = []
+    const authority = {
+      session: {
+        get: async () => {
+          parentFetches++
+          return { data: { id: "parent_1", permission: [
+            { permission: "bash", pattern: "danger", action: "deny" },
+            { permission: "external_directory", pattern: "/shared/*", action: "ask" },
+          ] } }
+        },
+      },
+      app: {
+        agents: async () => {
+          agentFetches++
+          return { data: [
+            { name: "researcher", permission: [{ permission: "task", pattern: "researcher", action: "ask" }] },
+            { name: "simplifier", permission: [{ permission: "todowrite", pattern: "*", action: "deny" }] },
+          ] }
+        },
+      },
+    }
+    const cli = {
+      app: authority.app,
+      session: {
+        ...authority.session,
+        _client: {
+          patch: async (a: unknown) => {
+            patchBodies.push((a as { body?: unknown }).body)
+            return {}
+          },
+        },
+        create: async (args: unknown) => {
+          createCalls.push(args)
+          return { data: { id: `child_${++created}` } }
+        },
+        prompt: async (a: unknown) => {
+          promptCalls.push(a)
+          return { data: { parts: [{ type: "text", text: "done" }] } }
+        },
+        abort: async () => ({}),
+        messages: async () => ({
+          data: [
+            {
+              info: { id: "msg_1", role: "assistant" },
+              parts: [{ type: "tool", callID: "call_advisory" }],
+            },
+          ],
+        }),
+      },
+    }
+    const plugin = await OuroborosBridge({ client: cli, directory: "/tmp/ouroboros-test" } as never)
+    const hook = (plugin as Record<string, (...args: unknown[]) => Promise<void>>)["tool.execute.after"]
+    const originalQuestion = "Session sess-1\n\nWhich users need this first?"
+    const output = {
+      content: [{ type: "text", text: originalQuestion }],
+      metadata: {
+        session_id: "sess-1",
+        ambiguity_score: 0.35,
+        milestone: "progress",
+        seed_ready: false,
+        question_advisory_recommended: true,
+        question_advisory_preserve_content: true,
+        question_advisory_subagents: [
+          {
+            tool_name: "ouroboros_interview",
+            title: "Interview advisory: code_context",
+            agent: "researcher",
+            prompt: "Inspect code facts.",
+          },
+          {
+            tool_name: "ouroboros_interview",
+            title: "Interview advisory: answer_simplifier",
+            agent: "simplifier",
+            prompt: "Suggest answer options.",
+          },
+        ],
+      },
+    }
+
+    await hook(
+      { tool: "ouroboros_interview", sessionID: "parent_1", callID: "call_advisory" },
+      output,
+    )
+
+    const text = readText(output)
+    expect(text.startsWith(originalQuestion)).toBe(true)
+    expect(text).toContain("[Ouroboros] Dispatched 2 subagents.")
+    expect(text).toContain('"question_advisory_recommended": true')
+    const metadata = output.metadata as Record<string, any>
+    expect(metadata.ouroboros_dispatch.status).toBe("dispatched")
+    expect(metadata.ouroboros_children).toEqual([
+      { title: "Interview advisory: code_context", childID: "child_1" },
+      { title: "Interview advisory: answer_simplifier", childID: "child_2" },
+    ])
+    expect(promptCalls.length).toBe(2)
+    expect(parentFetches).toBe(1)
+    expect(agentFetches).toBe(1)
+    expect(createCalls.map((call) => call.body.permission)).toEqual([
+      [
+        { permission: "bash", pattern: "danger", action: "deny" },
+        { permission: "external_directory", pattern: "/shared/*", action: "ask" },
+        { permission: "todowrite", pattern: "*", action: "deny" },
+      ],
+      [
+        { permission: "bash", pattern: "danger", action: "deny" },
+        { permission: "external_directory", pattern: "/shared/*", action: "ask" },
+        { permission: "task", pattern: "*", action: "deny" },
+      ],
+    ])
+    const runningPatches = patchBodies.filter(
+      (body) => (body as { state?: { status?: string } })?.state?.status === "running",
+    )
+    expect(runningPatches).toHaveLength(2)
+  })
+
+  test("authority failure is dispatch_failed before create and does not echo policy", async () => {
+    _resetDedupe()
+    let created = 0
+    const secretPattern = "/private/customer-secret/*"
+    const cli = {
+      app: { agents: async () => ({ data: [{ name: "general", permission: [] }] }) },
+      session: {
+        _client: { patch: async () => ({}) },
+        get: async () => ({ data: { id: "parent_1", permission: [
+          { permission: "bash", pattern: secretPattern, action: "invalid" },
+        ] } }),
+        create: async () => {
+          created++
+          return { data: { id: "child_forbidden" } }
+        },
+        prompt: async () => ({ data: { parts: [] } }),
+        abort: async () => ({}),
+        messages: async () => ({ data: [{
+          info: { id: "msg_1", role: "assistant" },
+          parts: [{ type: "tool", callID: "call_authority" }],
+        }] }),
+      },
+    }
+    const plugin = await OuroborosBridge({ client: cli, directory: "/tmp/ouroboros-test" } as never)
+    const hook = (plugin as Record<string, (...args: unknown[]) => Promise<void>>)["tool.execute.after"]
+    const output = {
+      content: [{ type: "text", text: JSON.stringify({
+        _subagent: { tool_name: "ouroboros_qa", title: "QA", agent: "general", prompt: "review" },
+      }) }],
+      metadata: {},
+    }
+
+    await hook({ tool: "ouroboros_qa", sessionID: "parent_1", callID: "call_authority" }, output)
+
+    const metadata = output.metadata as Record<string, any>
+    expect(created).toBe(0)
+    expect(metadata.ouroboros_dispatch.status).toBe("dispatch_failed")
+    expect(metadata.ouroboros_dispatch.failed).toHaveLength(1)
+    expect(metadata.ouroboros_dispatch.failed[0].reason).toContain("invalid parent action")
+    expect(JSON.stringify(output)).not.toContain(secretPattern)
+  })
+
+  test("preserves interview question text when metadata advisory dispatch fails early", async () => {
+    _resetDedupe()
+    const cli = {
+      session: {
+        _client: { patch: async () => ({}) },
+        create: async () => ({ data: { id: "child_unused" } }),
+        prompt: async () => ({ data: { parts: [{ type: "text", text: "unused" }] } }),
+        abort: async () => ({}),
+        messages: async () => ({ data: [] }),
+      },
+    }
+    const plugin = await OuroborosBridge({ client: cli, directory: "/tmp/ouroboros-test" } as never)
+    const hook = (plugin as Record<string, (...args: unknown[]) => Promise<void>>)["tool.execute.after"]
+    const originalQuestion = "Session sess-1\n\nWhich risk should we resolve first?"
+    const output = {
+      content: [{ type: "text", text: originalQuestion }],
+      metadata: {
+        question_advisory_preserve_content: true,
+        question_advisory_subagents: [
+          {
+            tool_name: "ouroboros_interview",
+            title: "Interview advisory: ambiguity_contrarian",
+            agent: "contrarian",
+            prompt: "Find ambiguity.",
+          },
+        ],
+      },
+    }
+
+    await hook({ tool: "ouroboros_interview", callID: "call_missing_session" }, output)
+
+    const text = readText(output)
+    expect(text.startsWith(originalQuestion)).toBe(true)
+    expect(text).toContain("Dispatch failed")
+    expect(text).toContain("empty sessionID")
+  })
+})
+
+describe("bridge appends declare themselves", () => {
+  // The bridge is a second producer writing into a question the server
+  // rendered. On PLUGIN_PASSIVE the server appends no directive of its own, so
+  // an undeclared bridge append is text a host cannot tell from the question —
+  // it echoes the whole thing back as `last_question` and the server records
+  // the banner, fan-out id included, as what it asked.
+  //
+  // Three paths append: dispatch, dedupe, and pre-dispatch failure. Only the
+  // first was declared when this was found, which is why the declaration now
+  // lives in `stampBridge` rather than at each call site. These tests pin all
+  // three, so a fourth path that bypasses the helper is a failing test.
+  const DECLARATION = `\n\n${OUROBOROS_DISPATCH_MARKER}\n\n${BRIDGE_NOTICE_OPENING}\n`
+
+  function expectDeclaredAfter(text: string, question: string): void {
+    expect(text.startsWith(question)).toBe(true)
+    expect(text.slice(question.length).startsWith(DECLARATION)).toBe(true)
+  }
+
+  function liveCli() {
+    let created = 0
+    const authority = mockAuthority()
+    return {
+      app: authority.app,
+      session: {
+        ...authority.session,
+        _client: { patch: async () => ({}) },
+        create: async () => ({ data: { id: `child_${++created}` } }),
+        prompt: async () => ({ data: { parts: [{ type: "text", text: "done" }] } }),
+        abort: async () => ({}),
+        messages: async () => ({
+          data: [
+            {
+              info: { id: "msg_1", role: "assistant" },
+              parts: [{ type: "tool", callID: "call_declared" }],
+            },
+          ],
+        }),
+      },
+    }
+  }
+
+  function questionOutput(question: string) {
+    return {
+      content: [{ type: "text", text: question }],
+      metadata: {
+        session_id: "sess-1",
+        question_advisory_preserve_content: true,
+        question_advisory_subagents: [
+          {
+            tool_name: "ouroboros_interview",
+            title: "Interview advisory: data_context",
+            agent: "general",
+            prompt: "Measure it.",
+          },
+        ],
+      },
+    }
+  }
+
+  const QUESTION = "Session sess-1\n\nHow do you define completion?"
+
+  test("stampBridge declares, with or without a question in front", () => {
+    const withQuestion = { content: [{ type: "text", text: "x" }] }
+    stampBridge(withQuestion, QUESTION, "banner")
+    expectDeclaredAfter(readText(withQuestion), QUESTION)
+
+    // Content replaced outright is entirely ours; it is declared too, so a host
+    // echoing it back is still recognisable rather than recorded as a question.
+    const replaced = { content: [{ type: "text", text: "x" }] }
+    stampBridge(replaced, undefined, "banner")
+    expect(readText(replaced).startsWith(`${OUROBOROS_DISPATCH_MARKER}\n\n`)).toBe(true)
+  })
+
+  test("the dispatch path declares", async () => {
+    _resetDedupe()
+    const plugin = await OuroborosBridge({ client: liveCli(), directory: "/tmp/ouroboros-test" } as never)
+    const hook = (plugin as Record<string, (...args: unknown[]) => Promise<void>>)["tool.execute.after"]
+    const output = questionOutput(QUESTION)
+
+    await hook({ tool: "ouroboros_interview", sessionID: "parent_1", callID: "call_declared" }, output)
+
+    const text = readText(output)
+    expectDeclaredAfter(text, QUESTION)
+    expect(text).toContain("[Ouroboros] Dispatched 1 subagent.")
+  })
+
+  test("the dedupe path declares", async () => {
+    _resetDedupe()
+    const plugin = await OuroborosBridge({ client: liveCli(), directory: "/tmp/ouroboros-test" } as never)
+    const hook = (plugin as Record<string, (...args: unknown[]) => Promise<void>>)["tool.execute.after"]
+    const args = { tool: "ouroboros_interview", sessionID: "parent_1", callID: "call_declared" }
+
+    await hook(args, questionOutput(QUESTION))
+    const second = questionOutput(QUESTION)
+    await hook(args, second)
+
+    const text = readText(second)
+    expectDeclaredAfter(text, QUESTION)
+    expect(text).toContain("Skipped 1 duplicate")
+  })
+
+  test("the pre-dispatch failure path declares", async () => {
+    _resetDedupe()
+    const plugin = await OuroborosBridge({ client: liveCli(), directory: "/tmp/ouroboros-test" } as never)
+    const hook = (plugin as Record<string, (...args: unknown[]) => Promise<void>>)["tool.execute.after"]
+    const output = questionOutput(QUESTION)
+
+    // No sessionID — rejected before any child is created.
+    await hook({ tool: "ouroboros_interview", callID: "call_declared" }, output)
+
+    const text = readText(output)
+    expectDeclaredAfter(text, QUESTION)
+    expect(text).toContain("Dispatch failed")
+  })
+})
+
+describe("a pre-dispatch failure still carries the fan-out identity", () => {
+  // The identity is what lets the parent declare the lanes `undispatched` when
+  // no child ever ran. It lives in `_meta`, which the host model does not read;
+  // the response shape is the channel it does. A failure that renders only the
+  // failure message therefore does not degrade re-entry, it removes it — and a
+  // required lane with no way to be declared pins the fan-out at `partial`.
+  function questionOutput() {
+    return {
+      content: [{ type: "text", text: "Session sess-1\n\nHow do you define completion?" }],
+      metadata: {
+        session_id: "sess-1",
+        question_advisory_preserve_content: true,
+        question_advisory_fanout_id: "fanout_probe",
+        question_advisory_result_correlation_key: "context.lane_id",
+        question_advisory_subagents: [
+          {
+            tool_name: "ouroboros_interview",
+            title: "Interview advisory: data_context",
+            agent: "general",
+            prompt: "Measure it.",
+          },
+        ],
+      },
+    }
+  }
+
+  async function hookWith(client: unknown) {
+    const plugin = await OuroborosBridge({ client, directory: "/tmp/ouroboros-test" } as never)
+    return (plugin as Record<string, (...args: unknown[]) => Promise<void>>)["tool.execute.after"]
+  }
+
+  const readyCli = {
+    session: {
+      _client: { patch: async () => ({}) },
+      create: async () => ({ data: { id: "child_1" } }),
+      prompt: async () => ({ data: { parts: [] } }),
+      abort: async () => ({}),
+      messages: async () => ({ data: [] }),
+    },
+  }
+
+  test("a rejection before dispatch keeps the id and correlation key visible", async () => {
+    _resetDedupe()
+    const hook = await hookWith(readyCli)
+    const output = questionOutput()
+
+    // No sessionID — rejected before any child is created.
+    await hook({ tool: "ouroboros_interview", callID: "call_fail" }, output)
+
+    const text = readText(output)
+    expect(text).toContain("Dispatch failed")
+    expect(text).toContain("fanout_probe")
+    expect(text).toContain("context.lane_id")
+  })
+
+  test("the same holds when the client is not ready", async () => {
+    _resetDedupe()
+    const hook = await hookWith({ session: {} })
+    const output = questionOutput()
+
+    await hook({ tool: "ouroboros_interview", sessionID: "parent_1", callID: "call_fail2" }, output)
+
+    const text = readText(output)
+    expect(text).toContain("client not ready")
+    expect(text).toContain("fanout_probe")
+    expect(text).toContain("context.lane_id")
+  })
+
+  test("and when the message id cannot be resolved", async () => {
+    _resetDedupe()
+    const hook = await hookWith(readyCli)
+    const output = questionOutput()
+
+    // messages() returns no matching callID, so resolveMid gives up.
+    await hook({ tool: "ouroboros_interview", sessionID: "parent_1", callID: "call_missing" }, output)
+
+    const text = readText(output)
+    expect(text).toContain("Dispatch failed")
+    expect(text).toContain("fanout_probe")
+    expect(text).toContain("context.lane_id")
+  })
+})
+
+describe("malformed message data does not strand the fan-out", () => {
+  // `resolveMid` walks the session's messages. A stale or malformed entry used
+  // to throw out of the hook, whose only handler logs — so the response was
+  // left exactly as it arrived: no failure notice, no fan-out id, no
+  // correlation key. The server has already registered the required lane by
+  // then, so the host cannot declare it undispatched and re-entry is stranded.
+  function questionOutput() {
+    return {
+      content: [{ type: "text", text: "Session sess-1\n\nHow do you define completion?" }],
+      metadata: {
+        session_id: "sess-1",
+        question_advisory_preserve_content: true,
+        question_advisory_fanout_id: "fanout_probe",
+        question_advisory_result_correlation_key: "context.lane_id",
+        question_advisory_subagents: [
+          {
+            tool_name: "ouroboros_interview",
+            title: "Interview advisory: data_context",
+            agent: "general",
+            prompt: "Measure it.",
+          },
+        ],
+      },
+    }
+  }
+
+  async function runWith(messages: () => Promise<unknown>) {
+    _resetDedupe()
+    const cli = {
+      session: {
+        _client: { patch: async () => ({}) },
+        create: async () => ({ data: { id: "child_1" } }),
+        prompt: async () => ({ data: { parts: [] } }),
+        abort: async () => ({}),
+        messages,
+      },
+    }
+    const plugin = await OuroborosBridge({ client: cli, directory: "/tmp/ouroboros-test" } as never)
+    const hook = (plugin as Record<string, (...args: unknown[]) => Promise<void>>)["tool.execute.after"]
+    const output = questionOutput()
+    await hook({ tool: "ouroboros_interview", sessionID: "parent_1", callID: "call_x" }, output)
+    return readText(output)
+  }
+
+  test("an entry with no info or parts is skipped, not thrown on", async () => {
+    const text = await runWith(async () => ({ data: [{}] }))
+    expect(text).toContain("Dispatch failed")
+    expect(text).toContain("fanout_probe")
+    expect(text).toContain("context.lane_id")
+  })
+
+  test("null entries and non-array parts are skipped too", async () => {
+    const text = await runWith(async () => ({
+      data: [null, { info: { role: "assistant" } }, { info: { role: "assistant", id: 7 }, parts: "x" }],
+    }))
+    expect(text).toContain("Dispatch failed")
+    expect(text).toContain("fanout_probe")
+  })
+
+  test("an unexpected throw still renders the identity", async () => {
+    const text = await runWith(async () => {
+      throw new Error("transport exploded")
+    })
+    expect(text).toContain("Dispatch failed")
+    expect(text).toContain("fanout_probe")
+    expect(text).toContain("context.lane_id")
+  })
+})

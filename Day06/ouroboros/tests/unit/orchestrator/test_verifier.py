@@ -1,0 +1,778 @@
+"""Tests for ouroboros.orchestrator.verifier (RFC v2 #830, PR 3)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import json
+
+import pytest
+
+from ouroboros.harness.deliver_gate import DeliverGateVerdict
+from ouroboros.harness.deliver_routing import deliver_gate_verifier_verdict
+from ouroboros.orchestrator.evidence_schema import EvidenceRecord, ProfileEvidenceConfigError
+from ouroboros.orchestrator.profile_loader import EvidenceSchema, ExecutionProfile, load_profile
+from ouroboros.orchestrator.verifier import (
+    DEFAULT_MAX_RETRIES,
+    LoopResult,
+    RetryAdmission,
+    VerifierContractError,
+    VerifierStatus,
+    VerifierVerdict,
+    run_with_verifier,
+)
+
+
+def _code_evidence(tests_passed: list[str] | None = None) -> str:
+    return json.dumps(
+        {
+            "files_touched": ["src/a.py"],
+            "commands_run": ["pytest"],
+            "tests_passed": tests_passed if tests_passed is not None else ["test_a"],
+        }
+    )
+
+
+@dataclass
+class ScriptedExecutor:
+    """Executor that returns canned outputs in order, recording feedback it saw."""
+
+    outputs: list[str]
+    feedbacks: list[tuple[str, ...]] = field(default_factory=list)
+
+    def __call__(self, *, ac: str, feedback: tuple[str, ...]) -> str:
+        self.feedbacks.append(feedback)
+        if not self.outputs:
+            msg = "ScriptedExecutor ran out of outputs"
+            raise AssertionError(msg)
+        return self.outputs.pop(0)
+
+
+@dataclass
+class ScriptedVerifier:
+    """Verifier that returns canned verdicts in order, recording invocations."""
+
+    verdicts: list[VerifierVerdict]
+    calls: int = 0
+
+    def __call__(
+        self,
+        *,
+        profile: ExecutionProfile,
+        ac: str,
+        leaf_output: str,
+        record: EvidenceRecord,
+    ) -> VerifierVerdict:
+        self.calls += 1
+        return self.verdicts.pop(0)
+
+
+@pytest.fixture
+def code_profile() -> ExecutionProfile:
+    return load_profile("code")
+
+
+class TestVerifierVerdict:
+    def test_pass_with_reasons_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must not carry reasons"):
+            VerifierVerdict(passed=True, reasons=("noise",))
+
+    def test_pass_with_failure_class_rejected(self) -> None:
+        with pytest.raises(ValueError, match="failure_class"):
+            VerifierVerdict(passed=True, failure_class="STALL")
+
+    def test_fail_can_carry_class_and_reasons(self) -> None:
+        verdict = VerifierVerdict(
+            passed=False, reasons=("missing test",), failure_class="EVIDENCE_MISSING"
+        )
+        assert verdict.passed is False
+        assert verdict.status is VerifierStatus.FAIL
+        assert verdict.retry_admission is RetryAdmission.RETRY
+
+    def test_pass_defaults_to_typed_acceptance(self) -> None:
+        verdict = VerifierVerdict(passed=True, evidence_used=(" evt_1 ", "evt_1", "evt_2"))
+
+        assert verdict.status is VerifierStatus.PASS
+        assert verdict.retry_admission is RetryAdmission.ACCEPT
+        assert verdict.evidence_used == ("evt_1", "evt_2")
+
+    def test_blocked_failure_defaults_to_block_status_and_admission(self) -> None:
+        verdict = VerifierVerdict(
+            passed=False,
+            reasons=("blocked",),
+            failure_class="BLOCKED",
+        )
+
+        assert verdict.status is VerifierStatus.BLOCKED
+        assert verdict.retry_admission is RetryAdmission.BLOCK
+
+    def test_unclassified_failure_defaults_to_stall_redispatch_policy(self) -> None:
+        verdict = VerifierVerdict(passed=False, reasons=("ambiguous verifier failure",))
+
+        assert verdict.status is VerifierStatus.FAIL
+        assert verdict.failure_class is None
+        assert verdict.retry_admission is RetryAdmission.REDISPATCH
+
+    def test_fail_without_reasons_rejected(self) -> None:
+        # A bare FAIL produces no feedback for the retry executor and no
+        # explanation on budget exhaustion — rejected at construction
+        # time per #884 review.
+        with pytest.raises(ValueError, match="must include at least one reason"):
+            VerifierVerdict(passed=False)
+
+    def test_fail_empty_reasons_tuple_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must include at least one reason"):
+            VerifierVerdict(passed=False, reasons=())
+
+    def test_fail_with_class_still_needs_reasons(self) -> None:
+        # failure_class alone is not enough — the executor needs prose
+        # to act on. Both are required when passed=False.
+        with pytest.raises(ValueError, match="must include at least one reason"):
+            VerifierVerdict(passed=False, failure_class="STALL")
+
+    def test_unknown_failure_class_rejected(self) -> None:
+        # The H7 classifier would silently degrade an unknown class to
+        # STALL, masking real fabrication / scope-creep signals from a
+        # verifier impl that typo'd the tag. Reject at construction.
+        with pytest.raises(ValueError, match="not a recognized taxonomy"):
+            VerifierVerdict(passed=False, reasons=("bad",), failure_class="MYSTERY")
+
+    def test_pass_cannot_use_non_accept_retry_admission(self) -> None:
+        with pytest.raises(ValueError, match="retry_admission ACCEPT"):
+            VerifierVerdict(passed=True, retry_admission="RETRY")
+
+    def test_fail_cannot_use_accept_retry_admission(self) -> None:
+        with pytest.raises(ValueError, match="UNAVAILABLE requires"):
+            VerifierVerdict(
+                passed=False,
+                reasons=("bad",),
+                retry_admission="ACCEPT",
+            )
+
+    def test_transcript_missing_defaults_to_unavailable_accept(self) -> None:
+        verdict = VerifierVerdict(
+            passed=False,
+            reasons=("transcript missing",),
+            failure_class="TRANSCRIPT_MISSING_INFRASTRUCTURE",
+        )
+
+        assert verdict.status is VerifierStatus.UNAVAILABLE
+        assert verdict.retry_admission is RetryAdmission.ACCEPT
+
+    @pytest.mark.parametrize(
+        ("failure_class", "status", "retry_admission"),
+        [
+            ("EVIDENCE_MISSING", "UNAVAILABLE", "ACCEPT"),
+            ("TRANSCRIPT_MISSING_INFRASTRUCTURE", "FAIL", "ACCEPT"),
+            ("TRANSCRIPT_MISSING_INFRASTRUCTURE", "UNAVAILABLE", "RETRY"),
+        ],
+    )
+    def test_unavailable_contract_rejects_inconsistent_triplets(
+        self, failure_class: str, status: str, retry_admission: str
+    ) -> None:
+        with pytest.raises(ValueError, match="UNAVAILABLE requires"):
+            VerifierVerdict(
+                passed=False,
+                reasons=("bad",),
+                failure_class=failure_class,
+                status=status,
+                retry_admission=retry_admission,
+            )
+
+    @pytest.mark.parametrize(
+        "klass",
+        [
+            "EVIDENCE_MISSING",
+            "EVIDENCE_FORM_MISMATCH",
+            "FABRICATION_SUSPECTED",
+            "SCOPE_CREEP",
+            "STALL",
+            "BLOCKED",
+        ],
+    )
+    def test_known_failure_classes_accepted(self, klass: str) -> None:
+        verdict = VerifierVerdict(passed=False, reasons=("r",), failure_class=klass)
+        assert verdict.failure_class == klass
+
+
+class TestVerifierExceptionWrapping:
+    """Verifier impls run tests / LLMs — transient failures become FAIL.
+
+    Per bot review on #884, letting a verifier exception escape would
+    skip the bounded-retry path and produce no LoopResult transcript
+    for upstream escalation. The loop must trap and convert to a FAIL
+    verdict with surfaceable reasons.
+    """
+
+    def test_verifier_runtime_error_becomes_fail_verdict(
+        self, code_profile: ExecutionProfile
+    ) -> None:
+        call_count = 0
+
+        def flaky_verifier(
+            *,
+            profile: ExecutionProfile,
+            ac: str,
+            leaf_output: str,
+            record: EvidenceRecord,
+        ) -> VerifierVerdict:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise TimeoutError("LLM call timed out")
+            return VerifierVerdict(passed=True)
+
+        executor = ScriptedExecutor(outputs=[_code_evidence(), _code_evidence()])
+        result = run_with_verifier(
+            executor=executor,
+            verifier=flaky_verifier,
+            profile=code_profile,
+            ac="x",
+        )
+        assert result.accepted is True
+        assert len(result.attempts) == 2
+        first = result.attempts[0]
+        assert first.verdict is not None
+        assert first.verdict.passed is False
+        assert first.verdict.failure_class == "STALL"
+        assert any("TimeoutError" in r for r in first.verdict.reasons)
+        # Retry executor must have seen the wrapped reason as feedback.
+        assert any("TimeoutError" in line for line in executor.feedbacks[1])
+
+    def test_contract_error_propagates_not_masked_as_stall(
+        self, code_profile: ExecutionProfile
+    ) -> None:
+        # A verifier impl that constructs an invalid verdict is a
+        # deterministic programming bug — masking it as STALL would
+        # burn retry budget and ship a broken verifier. The loop must
+        # let VerifierContractError propagate (bot finding on #884 r3).
+        def buggy_verifier(
+            *,
+            profile: ExecutionProfile,
+            ac: str,
+            leaf_output: str,
+            record: EvidenceRecord,
+        ) -> VerifierVerdict:
+            # passed=True with reasons → __post_init__ raises
+            # VerifierContractError.
+            return VerifierVerdict(passed=True, reasons=("oops",))
+
+        executor = ScriptedExecutor(outputs=[_code_evidence()])
+        with pytest.raises(VerifierContractError):
+            run_with_verifier(
+                executor=executor,
+                verifier=buggy_verifier,
+                profile=code_profile,
+                ac="x",
+            )
+
+    def test_contract_error_is_value_error_subclass(self) -> None:
+        # Subclassing ValueError preserves backward compatibility for
+        # callers that already check `except ValueError`.
+        with pytest.raises(ValueError):
+            VerifierVerdict(passed=False)
+
+    def test_verifier_returning_none_raises_contract_error(
+        self, code_profile: ExecutionProfile
+    ) -> None:
+        # Bot finding on #884 r4: Verifier is a static Protocol, so a
+        # buggy impl can return None (or any non-VerifierVerdict) at
+        # runtime. Without an explicit check, None would silently burn
+        # the retry budget with no reasons surfaced.
+        def returns_none(*, profile, ac, leaf_output, record):  # type: ignore[no-untyped-def]
+            return None
+
+        executor = ScriptedExecutor(outputs=[_code_evidence()])
+        with pytest.raises(VerifierContractError, match="expected VerifierVerdict"):
+            run_with_verifier(
+                executor=executor,
+                verifier=returns_none,  # type: ignore[arg-type]
+                profile=code_profile,
+                ac="x",
+            )
+
+    def test_verifier_returning_wrong_type_raises_contract_error(
+        self, code_profile: ExecutionProfile
+    ) -> None:
+        def returns_bool(*, profile, ac, leaf_output, record):  # type: ignore[no-untyped-def]
+            return True
+
+        executor = ScriptedExecutor(outputs=[_code_evidence()])
+        with pytest.raises(VerifierContractError, match="bool"):
+            run_with_verifier(
+                executor=executor,
+                verifier=returns_bool,  # type: ignore[arg-type]
+                profile=code_profile,
+                ac="x",
+            )
+
+    @pytest.mark.parametrize(
+        "operational_exc",
+        [
+            TimeoutError("LLM timed out"),
+            ConnectionError("network blip"),
+            OSError("transient FS error"),
+            __import__("subprocess").TimeoutExpired("pytest", 30),
+            __import__("subprocess").CalledProcessError(1, "pytest"),
+        ],
+    )
+    def test_operational_errors_become_stall_verdict(
+        self, code_profile: ExecutionProfile, operational_exc: BaseException
+    ) -> None:
+        # Bot finding on #884 r6: verifiers documented to run tests via
+        # subprocess hit TimeoutExpired / CalledProcessError; both must
+        # be absorbed as retryable STALL, not propagated as programming
+        # bugs.
+        captured_exc = operational_exc
+
+        def transient_then_pass(
+            *,
+            profile: ExecutionProfile,
+            ac: str,
+            leaf_output: str,
+            record: EvidenceRecord,
+        ) -> VerifierVerdict:
+            if not getattr(transient_then_pass, "fired", False):
+                transient_then_pass.fired = True  # type: ignore[attr-defined]
+                raise captured_exc
+            return VerifierVerdict(passed=True)
+
+        executor = ScriptedExecutor(outputs=[_code_evidence(), _code_evidence()])
+        result = run_with_verifier(
+            executor=executor,
+            verifier=transient_then_pass,
+            profile=code_profile,
+            ac="x",
+        )
+        assert result.accepted is True
+        assert result.attempts[0].verdict is not None
+        assert result.attempts[0].verdict.failure_class == "STALL"
+        assert any(type(captured_exc).__name__ in r for r in result.attempts[0].verdict.reasons)
+
+    def test_verifier_exhausts_budget_on_persistent_timeouts(
+        self, code_profile: ExecutionProfile
+    ) -> None:
+        # TimeoutError is an operational failure — the retry loop must
+        # absorb it as STALL across the full budget.
+        def always_times_out(
+            *,
+            profile: ExecutionProfile,
+            ac: str,
+            leaf_output: str,
+            record: EvidenceRecord,
+        ) -> VerifierVerdict:
+            raise TimeoutError("verifier timed out")
+
+        executor = ScriptedExecutor(outputs=[_code_evidence()] * 3)
+        result = run_with_verifier(
+            executor=executor,
+            verifier=always_times_out,
+            profile=code_profile,
+            ac="x",
+            max_retries=2,
+        )
+        assert result.accepted is False
+        assert len(result.attempts) == 3
+        for a in result.attempts:
+            assert a.verdict is not None
+            assert a.verdict.failure_class == "STALL"
+
+    @pytest.mark.parametrize(
+        "exc_factory",
+        [
+            lambda: AttributeError("verifier impl bug"),
+            lambda: KeyError("missing_field"),
+            lambda: AssertionError("invariant failed"),
+            lambda: RuntimeError("uncaught path"),
+            lambda: TypeError("wrong arg shape"),
+        ],
+    )
+    def test_programming_bug_exceptions_propagate(
+        self, code_profile: ExecutionProfile, exc_factory
+    ) -> None:
+        # Bot finding on #884 r5: programming bugs (AttributeError,
+        # KeyError, etc.) must NOT be silently retried as STALL — the
+        # operator needs the surfaced exception to fix the broken
+        # verifier instead of watching it exhaust retries.
+        def buggy(
+            *,
+            profile: ExecutionProfile,
+            ac: str,
+            leaf_output: str,
+            record: EvidenceRecord,
+        ) -> VerifierVerdict:
+            raise exc_factory()
+
+        executor = ScriptedExecutor(outputs=[_code_evidence()])
+        with pytest.raises(type(exc_factory())):
+            run_with_verifier(
+                executor=executor,
+                verifier=buggy,
+                profile=code_profile,
+                ac="x",
+            )
+
+
+class TestHappyPath:
+    def test_passes_on_first_attempt(self, code_profile: ExecutionProfile) -> None:
+        executor = ScriptedExecutor(outputs=[_code_evidence()])
+        verifier = ScriptedVerifier(verdicts=[VerifierVerdict(passed=True)])
+
+        result = run_with_verifier(
+            executor=executor, verifier=verifier, profile=code_profile, ac="do thing"
+        )
+
+        assert result.accepted is True
+        assert len(result.attempts) == 1
+        assert result.final.accepted is True
+        assert verifier.calls == 1
+        # First call must see empty feedback.
+        assert executor.feedbacks == [()]
+
+
+class TestRetryWithFeedback:
+    def test_fail_then_pass_within_budget(self, code_profile: ExecutionProfile) -> None:
+        executor = ScriptedExecutor(outputs=[_code_evidence(), _code_evidence()])
+        verifier = ScriptedVerifier(
+            verdicts=[
+                VerifierVerdict(
+                    passed=False,
+                    reasons=("tests look fake",),
+                    retry_admission=RetryAdmission.RETRY,
+                ),
+                VerifierVerdict(passed=True),
+            ]
+        )
+
+        result = run_with_verifier(
+            executor=executor, verifier=verifier, profile=code_profile, ac="do thing"
+        )
+
+        assert result.accepted is True
+        assert len(result.attempts) == 2
+        # Second executor invocation must see the verifier's reason as feedback.
+        assert executor.feedbacks[0] == ()
+        assert executor.feedbacks[1] == ("tests look fake",)
+
+    def test_exhaust_retries_returns_unaccepted(self, code_profile: ExecutionProfile) -> None:
+        outputs = [_code_evidence() for _ in range(3)]
+        verdicts = [
+            VerifierVerdict(passed=False, reasons=("bad",), failure_class="EVIDENCE_MISSING")
+            for _ in range(3)
+        ]
+        executor = ScriptedExecutor(outputs=outputs)
+        verifier = ScriptedVerifier(verdicts=verdicts)
+
+        result = run_with_verifier(
+            executor=executor,
+            verifier=verifier,
+            profile=code_profile,
+            ac="x",
+            max_retries=2,
+        )
+
+        assert result.accepted is False
+        assert len(result.attempts) == 3
+        assert verifier.calls == 3
+        # Final attempt is not accepted but verdict is recorded.
+        assert result.final.verdict is not None
+        assert result.final.verdict.retry_admission is RetryAdmission.RETRY
+
+    def test_default_max_retries_is_two(self) -> None:
+        assert DEFAULT_MAX_RETRIES == 2
+
+    def test_h1_stops_same_leaf_retry_for_traceguard_redispatch_admission(
+        self, code_profile: ExecutionProfile
+    ) -> None:
+        executor = ScriptedExecutor(outputs=[_code_evidence(), _code_evidence()])
+
+        def traceguard_backed_verifier(
+            *,
+            profile: ExecutionProfile,
+            ac: str,
+            leaf_output: str,
+            record: EvidenceRecord,
+        ) -> VerifierVerdict:
+            del profile, ac, leaf_output, record
+            return deliver_gate_verifier_verdict(
+                DeliverGateVerdict(
+                    ac_id="AC-1",
+                    accepted=False,
+                    unsupported_claim_rate=1.0,
+                    rejected_fact_ids=("fact_1",),
+                    rejected_reasons=(
+                        "semantic_miss: evidence text lacks behavior=admin_delete_denied",
+                    ),
+                    evidence_event_ids=("evt_semantic_miss",),
+                )
+            )
+
+        result = run_with_verifier(
+            executor=executor,
+            verifier=traceguard_backed_verifier,
+            profile=code_profile,
+            ac="deny admin delete",
+            max_retries=1,
+        )
+
+        assert result.accepted is False
+        assert len(result.attempts) == 1
+        first = result.attempts[0]
+        assert first.verdict is not None
+        assert first.verdict.failure_class == "SCOPE_CREEP"
+        assert first.verdict.retry_admission is RetryAdmission.REDISPATCH
+        assert first.verdict.evidence_used == ("evt_semantic_miss",)
+        assert executor.feedbacks == [()]
+
+    @pytest.mark.parametrize(
+        ("verdict", "expected_admission"),
+        [
+            (
+                VerifierVerdict(
+                    passed=False,
+                    reasons=("fabricated",),
+                    failure_class="FABRICATION_SUSPECTED",
+                ),
+                RetryAdmission.ESCALATE_MODEL,
+            ),
+            (
+                VerifierVerdict(
+                    passed=False,
+                    reasons=("blocked",),
+                    failure_class="BLOCKED",
+                ),
+                RetryAdmission.BLOCK,
+            ),
+            (
+                VerifierVerdict(
+                    passed=False,
+                    reasons=("human needed",),
+                    failure_class="BLOCKED",
+                    retry_admission=RetryAdmission.ESCALATE_HUMAN,
+                ),
+                RetryAdmission.ESCALATE_HUMAN,
+            ),
+        ],
+    )
+    def test_h1_stops_same_leaf_retry_for_non_retry_admissions(
+        self,
+        code_profile: ExecutionProfile,
+        verdict: VerifierVerdict,
+        expected_admission: RetryAdmission,
+    ) -> None:
+        executor = ScriptedExecutor(outputs=[_code_evidence(), _code_evidence()])
+        verifier = ScriptedVerifier(verdicts=[verdict, VerifierVerdict(passed=True)])
+
+        result = run_with_verifier(
+            executor=executor,
+            verifier=verifier,
+            profile=code_profile,
+            ac="x",
+            max_retries=1,
+        )
+
+        assert result.accepted is False
+        assert len(result.attempts) == 1
+        assert verifier.calls == 1
+        assert executor.feedbacks == [()]
+        assert result.final.verdict is not None
+        assert result.final.verdict.retry_admission is expected_admission
+
+
+class TestEvidenceShortCircuit:
+    def test_evidence_parse_error_skips_verifier(self, code_profile: ExecutionProfile) -> None:
+        executor = ScriptedExecutor(outputs=["not json at all", _code_evidence()])
+        verifier = ScriptedVerifier(verdicts=[VerifierVerdict(passed=True)])
+
+        result = run_with_verifier(
+            executor=executor, verifier=verifier, profile=code_profile, ac="x"
+        )
+
+        assert result.accepted is True
+        # Verifier called exactly once — on the second (well-formed) attempt.
+        assert verifier.calls == 1
+        first = result.attempts[0]
+        assert first.evidence_error is not None
+        assert first.record is None
+        assert first.verdict is None
+        # Feedback to the retry should mention the parse failure.
+        assert any("evidence parse failed" in line for line in executor.feedbacks[1])
+
+    def test_blocked_evidence_stops_without_retry_or_verifier(
+        self, code_profile: ExecutionProfile
+    ) -> None:
+        blocked = json.dumps(
+            {
+                "status": "blocked",
+                "blocker": {
+                    "code": "MISSING_CONFIGURATION",
+                    "reason": "DATABASE_URL is required to verify this AC",
+                },
+            }
+        )
+        executor = ScriptedExecutor(outputs=[blocked, _code_evidence()])
+        verifier = ScriptedVerifier(verdicts=[VerifierVerdict(passed=True)])
+
+        result = run_with_verifier(
+            executor=executor,
+            verifier=verifier,
+            profile=code_profile,
+            ac="x",
+        )
+
+        assert result.accepted is False
+        assert len(result.attempts) == 1
+        assert result.final.blocked is True
+        assert result.final.validation is not None
+        assert result.final.validation.blocker is not None
+        assert verifier.calls == 0
+        assert len(executor.feedbacks) == 1
+
+    def test_evidence_validation_fail_skips_verifier(self, code_profile: ExecutionProfile) -> None:
+        empty_tests = _code_evidence(tests_passed=[])
+        executor = ScriptedExecutor(outputs=[empty_tests, _code_evidence()])
+        verifier = ScriptedVerifier(verdicts=[VerifierVerdict(passed=True)])
+
+        result = run_with_verifier(
+            executor=executor, verifier=verifier, profile=code_profile, ac="x"
+        )
+
+        assert result.accepted is True
+        # First attempt failed H2 validation; verifier must not have been called yet.
+        assert verifier.calls == 1
+        first = result.attempts[0]
+        assert first.validation is not None and not first.validation.ok
+        assert first.verdict is None
+        assert any("tests_passed == []" in line for line in executor.feedbacks[1])
+
+    def test_malformed_blocker_validation_retries_without_crashing(
+        self, code_profile: ExecutionProfile
+    ) -> None:
+        malformed_blocker = json.dumps({"status": "blocked", "blocker": {"code": "MISSING_TOOL"}})
+        executor = ScriptedExecutor(outputs=[malformed_blocker, _code_evidence()])
+        verifier = ScriptedVerifier(verdicts=[VerifierVerdict(passed=True)])
+
+        result = run_with_verifier(
+            executor=executor,
+            verifier=verifier,
+            profile=code_profile,
+            ac="x",
+        )
+
+        assert result.accepted is True
+        assert verifier.calls == 1
+        first = result.attempts[0]
+        assert first.record is not None
+        assert first.validation_error is not None
+        assert "blocker.reason" in first.validation_error
+        assert first.validation is None
+        assert first.verdict is None
+        assert any("evidence validation failed" in line for line in executor.feedbacks[1])
+
+    def test_malformed_profile_rejected_if_propagates_without_retry(
+        self, code_profile: ExecutionProfile
+    ) -> None:
+        broken_profile = code_profile.model_copy(
+            update={
+                "evidence_schema": EvidenceSchema(
+                    required=(),
+                    rejected_if=("len(tests_passed) < 1",),
+                )
+            }
+        )
+        executor = ScriptedExecutor(outputs=[_code_evidence(), _code_evidence()])
+        verifier = ScriptedVerifier(verdicts=[VerifierVerdict(passed=True)])
+
+        with pytest.raises(ProfileEvidenceConfigError, match="Unsupported rejected_if"):
+            run_with_verifier(
+                executor=executor,
+                verifier=verifier,
+                profile=broken_profile,
+                ac="x",
+            )
+
+        # A malformed profile cannot be fixed by asking the leaf to retry.
+        assert len(executor.feedbacks) == 1
+        assert verifier.calls == 0
+
+    def test_evidence_fail_exhausts_budget_without_verifier(
+        self, code_profile: ExecutionProfile
+    ) -> None:
+        executor = ScriptedExecutor(outputs=["garbage"] * 3)
+        verifier = ScriptedVerifier(verdicts=[])  # would raise if invoked
+
+        result = run_with_verifier(
+            executor=executor,
+            verifier=verifier,
+            profile=code_profile,
+            ac="x",
+            max_retries=2,
+        )
+
+        assert result.accepted is False
+        assert verifier.calls == 0
+        assert all(a.evidence_error is not None for a in result.attempts)
+
+
+class TestErrorBubbling:
+    def test_executor_exception_bubbles(self, code_profile: ExecutionProfile) -> None:
+        def boom(*, ac: str, feedback: tuple[str, ...]) -> str:
+            raise RuntimeError("network died")
+
+        verifier = ScriptedVerifier(verdicts=[])
+
+        with pytest.raises(RuntimeError, match="network died"):
+            run_with_verifier(executor=boom, verifier=verifier, profile=code_profile, ac="x")
+
+    def test_negative_max_retries_rejected(self, code_profile: ExecutionProfile) -> None:
+        executor = ScriptedExecutor(outputs=[])
+        verifier = ScriptedVerifier(verdicts=[])
+        with pytest.raises(ValueError, match="max_retries must be >= 0"):
+            run_with_verifier(
+                executor=executor,
+                verifier=verifier,
+                profile=code_profile,
+                ac="x",
+                max_retries=-1,
+            )
+
+    def test_loop_result_final_without_attempts_raises(self) -> None:
+        empty = LoopResult(accepted=False, attempts=())
+        with pytest.raises(RuntimeError, match="no attempts"):
+            _ = empty.final
+
+
+class TestZeroRetryBudget:
+    def test_max_retries_zero_runs_exactly_once(self, code_profile: ExecutionProfile) -> None:
+        executor = ScriptedExecutor(outputs=[_code_evidence()])
+        verifier = ScriptedVerifier(verdicts=[VerifierVerdict(passed=False, reasons=("nope",))])
+
+        result = run_with_verifier(
+            executor=executor,
+            verifier=verifier,
+            profile=code_profile,
+            ac="x",
+            max_retries=0,
+        )
+
+        assert result.accepted is False
+        assert len(result.attempts) == 1
+        assert verifier.calls == 1
+
+
+def test_callable_verifier_via_function(code_profile: ExecutionProfile) -> None:
+    """Verifier Protocol must accept a plain function, not only dataclasses."""
+
+    def verifier(
+        *,
+        profile: ExecutionProfile,
+        ac: str,
+        leaf_output: str,
+        record: EvidenceRecord,
+    ) -> VerifierVerdict:
+        return VerifierVerdict(passed=True)
+
+    def executor(*, ac: str, feedback: tuple[str, ...]) -> str:
+        return _code_evidence()
+
+    result = run_with_verifier(executor=executor, verifier=verifier, profile=code_profile, ac="x")
+    assert result.accepted is True

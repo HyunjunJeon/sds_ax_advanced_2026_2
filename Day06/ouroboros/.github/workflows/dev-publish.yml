@@ -1,0 +1,116 @@
+name: Dev Build
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/*-beta'
+    tags-ignore:
+      - 'v*'
+
+jobs:
+  dev-publish:
+    name: Build Dev Artifact
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Check if dev version
+        id: check
+        run: |
+          # Skip if HEAD is exactly on a tag (release.yml handles that)
+          if git describe --exact-match HEAD 2>/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install uv
+        if: steps.check.outputs.skip == 'false'
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          uv sync --dev
+          uv pip check
+
+      - name: Sync plugin version
+        if: steps.check.outputs.skip == 'false'
+        run: python scripts/sync-plugin-version.py --write
+
+      - name: Build package
+        if: steps.check.outputs.skip == 'false'
+        id: build
+        run: |
+          uv build
+          VERSION=$(python -c "
+          import re, pathlib
+          for f in pathlib.Path('dist').iterdir():
+              if f.suffix == '.whl':
+                  m = re.match(r'[^-]+-([^-]+)-', f.name)
+                  if m: print(m.group(1))
+          ")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "::notice::📦 Dev version: $VERSION"
+
+      - name: Smoke test
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          uv pip install dist/*.whl --system
+          python -c "
+          import ouroboros
+          v = ouroboros.__version__
+          print(f'Runtime version: {v}')
+          assert 'dev' in v or 'unknown' not in v, f'Unexpected version: {v}'
+          "
+          # Packaging contract: opencode bridge assets must be reachable via
+          # importlib.resources in the installed wheel. Guards against
+          # regressions where hatch include rules stop shipping non-Python
+          # assets (see PR #462).
+          python -c "
+          from importlib.resources import files
+          root = files('ouroboros.opencode.plugin')
+          required = ['ouroboros-bridge.ts', 'package.json', 'tsconfig.json']
+          missing = [n for n in required if not (root / n).is_file()]
+          assert not missing, f'Missing opencode plugin assets in wheel: {missing}'
+          print('opencode plugin assets present:', required)
+          "
+
+      # Dev builds are CI artifacts, NOT PyPI releases. Publishing every main
+      # push to PyPI re-shipped the sdist on each commit and drove the
+      # ouroboros-ai project past its 10GB storage cap (publishes started
+      # 400ing). Artifacts auto-expire, cost no project storage, and are
+      # downloadable per-run from the Actions tab. Real releases still go to
+      # PyPI via release.yml on a v* tag.
+      - name: Upload dev build artifact
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ouroboros-ai-${{ steps.build.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Summarize dev build
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          echo "::notice::📦 Dev build ${{ steps.build.outputs.version }} available as an Actions artifact (Actions tab → this run → Artifacts)"
+          echo "### 📦 Dev build \`${{ steps.build.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Download the wheel/sdist from the **Artifacts** section of this run, then:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```bash' >> "$GITHUB_STEP_SUMMARY"
+          echo "pip install ./ouroboros_ai-${{ steps.build.outputs.version }}-py3-none-any.whl" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

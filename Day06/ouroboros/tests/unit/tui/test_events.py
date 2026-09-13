@@ -1,0 +1,1102 @@
+"""Unit tests for ouroboros.tui.events module."""
+
+from datetime import UTC, datetime
+
+import pytest
+
+from ouroboros.events.base import BaseEvent
+from ouroboros.tui.events import (
+    ACModelRouted,
+    ACTokenAttribution,
+    ACUpdated,
+    CostUpdated,
+    DriftUpdated,
+    ExecutionUpdated,
+    FrugalityProofEvaluated,
+    FrugalityRetrospectiveReported,
+    LogMessage,
+    PauseRequested,
+    PhaseChanged,
+    ResumeRequested,
+    SubtaskUpdated,
+    TUIState,
+    WorkflowProgressUpdated,
+    create_message_from_event,
+    format_frugality_retrospective_summary,
+    format_frugality_summary,
+)
+
+
+class TestExecutionUpdated:
+    """Tests for ExecutionUpdated message."""
+
+    def test_create_execution_updated(self) -> None:
+        """Test creating ExecutionUpdated message."""
+        msg = ExecutionUpdated(
+            execution_id="exec_123",
+            session_id="sess_456",
+            status="running",
+            data={"key": "value"},
+        )
+
+        assert msg.execution_id == "exec_123"
+        assert msg.session_id == "sess_456"
+        assert msg.status == "running"
+        assert msg.data == {"key": "value"}
+
+    def test_execution_updated_default_data(self) -> None:
+        """Test ExecutionUpdated with default empty data."""
+        msg = ExecutionUpdated(
+            execution_id="exec_123",
+            session_id="sess_456",
+            status="running",
+        )
+
+        assert msg.data == {}
+
+
+class TestPhaseChanged:
+    """Tests for PhaseChanged message."""
+
+    def test_create_phase_changed(self) -> None:
+        """Test creating PhaseChanged message."""
+        msg = PhaseChanged(
+            execution_id="exec_123",
+            previous_phase="discover",
+            current_phase="define",
+            iteration=1,
+        )
+
+        assert msg.execution_id == "exec_123"
+        assert msg.previous_phase == "discover"
+        assert msg.current_phase == "define"
+        assert msg.iteration == 1
+
+    def test_phase_changed_none_previous(self) -> None:
+        """Test PhaseChanged with no previous phase."""
+        msg = PhaseChanged(
+            execution_id="exec_123",
+            previous_phase=None,
+            current_phase="discover",
+            iteration=1,
+        )
+
+        assert msg.previous_phase is None
+
+
+class TestDriftUpdated:
+    """Tests for DriftUpdated message."""
+
+    def test_create_drift_updated(self) -> None:
+        """Test creating DriftUpdated message."""
+        msg = DriftUpdated(
+            execution_id="exec_123",
+            goal_drift=0.15,
+            constraint_drift=0.1,
+            ontology_drift=0.05,
+            combined_drift=0.12,
+            is_acceptable=True,
+        )
+
+        assert msg.execution_id == "exec_123"
+        assert msg.goal_drift == 0.15
+        assert msg.constraint_drift == 0.1
+        assert msg.ontology_drift == 0.05
+        assert msg.combined_drift == 0.12
+        assert msg.is_acceptable is True
+
+    def test_drift_updated_not_acceptable(self) -> None:
+        """Test DriftUpdated with unacceptable drift."""
+        msg = DriftUpdated(
+            execution_id="exec_123",
+            goal_drift=0.5,
+            constraint_drift=0.3,
+            ontology_drift=0.2,
+            combined_drift=0.4,
+            is_acceptable=False,
+        )
+
+        assert msg.is_acceptable is False
+
+
+class TestCostUpdated:
+    """Tests for CostUpdated message."""
+
+    def test_create_cost_updated(self) -> None:
+        """Test creating CostUpdated message."""
+        msg = CostUpdated(
+            execution_id="exec_123",
+            total_tokens=10000,
+            total_cost_usd=0.05,
+            tokens_this_phase=2500,
+        )
+
+        assert msg.execution_id == "exec_123"
+        assert msg.total_tokens == 10000
+        assert msg.total_cost_usd == 0.05
+        assert msg.tokens_this_phase == 2500
+
+
+class TestLogMessage:
+    """Tests for LogMessage message."""
+
+    def test_create_log_message(self) -> None:
+        """Test creating LogMessage message."""
+        timestamp = datetime.now(UTC)
+        msg = LogMessage(
+            timestamp=timestamp,
+            level="info",
+            source="test.module",
+            message="Test log message",
+            data={"extra": "data"},
+        )
+
+        assert msg.timestamp == timestamp
+        assert msg.level == "info"
+        assert msg.source == "test.module"
+        assert msg.message == "Test log message"
+        assert msg.data == {"extra": "data"}
+
+    def test_log_message_default_data(self) -> None:
+        """Test LogMessage with default empty data."""
+        msg = LogMessage(
+            timestamp=datetime.now(UTC),
+            level="error",
+            source="test",
+            message="Error",
+        )
+
+        assert msg.data == {}
+
+
+class TestACUpdated:
+    """Tests for ACUpdated message."""
+
+    def test_create_ac_updated(self) -> None:
+        """Test creating ACUpdated message."""
+        msg = ACUpdated(
+            execution_id="exec_123",
+            ac_id="ac_abc123",
+            status="atomic",
+            depth=1,
+            is_atomic=True,
+        )
+
+        assert msg.execution_id == "exec_123"
+        assert msg.ac_id == "ac_abc123"
+        assert msg.status == "atomic"
+        assert msg.depth == 1
+        assert msg.is_atomic is True
+
+
+class TestPauseResumeMessages:
+    """Tests for pause/resume messages."""
+
+    def test_pause_requested(self) -> None:
+        """Test creating PauseRequested message."""
+        msg = PauseRequested(execution_id="exec_123")
+
+        assert msg.execution_id == "exec_123"
+        assert msg.reason == "user_request"
+
+    def test_pause_requested_custom_reason(self) -> None:
+        """Test PauseRequested with custom reason."""
+        msg = PauseRequested(
+            execution_id="exec_123",
+            reason="drift_threshold",
+        )
+
+        assert msg.reason == "drift_threshold"
+
+    def test_resume_requested(self) -> None:
+        """Test creating ResumeRequested message."""
+        msg = ResumeRequested(execution_id="exec_123")
+
+        assert msg.execution_id == "exec_123"
+
+
+class TestTUIState:
+    """Tests for TUIState dataclass."""
+
+    def test_default_state(self) -> None:
+        """Test default TUIState values."""
+        state = TUIState()
+
+        assert state.execution_id == ""
+        assert state.session_id == ""
+        assert state.status == "idle"
+        assert state.current_phase == ""
+        assert state.iteration == 0
+        assert state.goal_drift == 0.0
+        assert state.constraint_drift == 0.0
+        assert state.ontology_drift == 0.0
+        assert state.combined_drift == 0.0
+        assert state.total_tokens == 0
+        assert state.total_cost_usd == 0.0
+        assert state.is_paused is False
+        assert state.ac_tree == {}
+        assert state.logs == []
+        assert state.max_logs == 100
+
+    def test_add_log(self) -> None:
+        """Test adding log entries."""
+        state = TUIState()
+        state.add_log("info", "test.source", "Test message", {"key": "value"})
+
+        assert len(state.logs) == 1
+        assert state.logs[0]["level"] == "info"
+        assert state.logs[0]["source"] == "test.source"
+        assert state.logs[0]["message"] == "Test message"
+        assert state.logs[0]["data"] == {"key": "value"}
+        assert "timestamp" in state.logs[0]
+
+    def test_add_log_trims_to_max(self) -> None:
+        """Test that logs are trimmed to max_logs."""
+        state = TUIState(max_logs=5)
+
+        for i in range(10):
+            state.add_log("info", "test", f"Message {i}")
+
+        assert len(state.logs) == 5
+        # Should have the last 5 messages
+        assert state.logs[0]["message"] == "Message 5"
+        assert state.logs[-1]["message"] == "Message 9"
+
+
+class TestCreateMessageFromEvent:
+    """Tests for create_message_from_event function."""
+
+    def test_session_started_event(self) -> None:
+        """Test converting session.started event."""
+        event = BaseEvent(
+            type="orchestrator.session.started",
+            aggregate_type="session",
+            aggregate_id="sess_123",
+            data={"execution_id": "exec_456"},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ExecutionUpdated)
+        assert msg.execution_id == "exec_456"
+        assert msg.session_id == "sess_123"
+        assert msg.status == "running"
+
+    def test_session_completed_event(self) -> None:
+        """Test converting session.completed event."""
+        event = BaseEvent(
+            type="orchestrator.session.completed",
+            aggregate_type="session",
+            aggregate_id="sess_123",
+            data={"execution_id": "exec_456"},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ExecutionUpdated)
+        assert msg.status == "completed"
+
+    def test_session_failed_event(self) -> None:
+        """Test converting session.failed event."""
+        event = BaseEvent(
+            type="orchestrator.session.failed",
+            aggregate_type="session",
+            aggregate_id="sess_123",
+            data={"error": "Something went wrong"},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ExecutionUpdated)
+        assert msg.status == "failed"
+
+    def test_session_paused_event(self) -> None:
+        """Test converting session.paused event."""
+        event = BaseEvent(
+            type="orchestrator.session.paused",
+            aggregate_type="session",
+            aggregate_id="sess_123",
+            data={"reason": "user_request"},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ExecutionUpdated)
+        assert msg.status == "paused"
+
+    def test_execution_terminal_paused_event(self) -> None:
+        """Paused terminal events from execution stream should update execution status."""
+        event = BaseEvent(
+            type="execution.terminal",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={"session_id": "sess_123", "status": "paused"},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ExecutionUpdated)
+        assert msg.execution_id == "exec_123"
+        assert msg.session_id == "sess_123"
+        assert msg.status == "paused"
+
+    def test_phase_completed_event(self) -> None:
+        """Test converting phase.completed event."""
+        event = BaseEvent(
+            type="execution.phase.completed",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={"phase": "define", "previous_phase": "discover", "iteration": 1},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, PhaseChanged)
+        assert msg.current_phase == "define"
+        assert msg.iteration == 1
+
+    def test_drift_measured_event(self) -> None:
+        """Test converting drift.measured event."""
+        event = BaseEvent(
+            type="observability.drift.measured",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "goal_drift": 0.15,
+                "constraint_drift": 0.1,
+                "ontology_drift": 0.05,
+                "combined_drift": 0.12,
+                "is_acceptable": True,
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, DriftUpdated)
+        assert msg.goal_drift == 0.15
+        assert msg.constraint_drift == 0.1
+        assert msg.ontology_drift == 0.05
+        assert msg.combined_drift == 0.12
+        assert msg.is_acceptable is True
+
+    def test_workflow_progress_event_preserves_last_update(self) -> None:
+        """Workflow progress events should retain the normalized latest artifact snapshot."""
+        event = BaseEvent(
+            type="workflow.progress.updated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "acceptance_criteria": [],
+                "completed_count": 1,
+                "total_count": 3,
+                "last_update": {
+                    "message_type": "tool_result",
+                    "content_preview": "Tool completed successfully.",
+                    "tool_name": "Edit",
+                    "ac_tracking": {"started": [], "completed": [1]},
+                },
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, WorkflowProgressUpdated)
+        assert msg.last_update == {
+            "message_type": "tool_result",
+            "content_preview": "Tool completed successfully.",
+            "tool_name": "Edit",
+            "ac_tracking": {"started": [], "completed": [1]},
+        }
+
+    def test_ac_event(self) -> None:
+        """Test converting AC-related events."""
+        event = BaseEvent(
+            type="ac.marked_atomic",
+            aggregate_type="ac_decomposition",
+            aggregate_id="ac_abc",
+            data={"execution_id": "exec_123", "depth": 1, "is_atomic": True},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ACUpdated)
+        assert msg.execution_id == "exec_123"
+        assert msg.ac_id == "ac_abc"
+        assert msg.status == "atomic"
+        assert msg.is_atomic is True
+
+    def test_subtask_event_preserves_runtime_activity_payload(self) -> None:
+        """Live Sub-AC events should keep tool activity attached for the dashboard."""
+        event = BaseEvent(
+            type="execution.subtask.updated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "ac_index": 1,
+                "sub_task_index": 2,
+                "sub_task_id": "ac_1_sub_2",
+                "content": "Patch the event bridge",
+                "status": "executing",
+                "current_tool_activity": {
+                    "message_type": "tool",
+                    "tool_name": "Edit",
+                    "tool_input": {"file_path": "src/ouroboros/tui/events.py"},
+                },
+                "last_update": {
+                    "message_type": "tool",
+                    "tool_name": "Edit",
+                    "tool_input": {"file_path": "src/ouroboros/tui/events.py"},
+                },
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, SubtaskUpdated)
+        assert msg.current_tool_activity == {
+            "message_type": "tool",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "src/ouroboros/tui/events.py"},
+        }
+        assert msg.last_update == {
+            "message_type": "tool",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "src/ouroboros/tui/events.py"},
+        }
+
+    def test_node_event_preserves_hierarchical_identity(self) -> None:
+        """Generic node events should project through the same SubtaskUpdated bridge."""
+        event = BaseEvent(
+            type="execution.node.updated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "identity_model": "execution_node_v1",
+                "node_id": "node_child",
+                "parent_node_id": "ac_0",
+                "display_path": "1.2",
+                "path": [0, 1],
+                "depth": 1,
+                "ordinal": 1,
+                "root_ac_index": 0,
+                "root_ac_number": 1,
+                "legacy_parent_node_id": "ac_0",
+                "legacy_parent_node_aliases": ["ac_1"],
+                "legacy_ac_index": 1,
+                "legacy_sub_task_index": 2,
+                "legacy_sub_task_id": "ac_1_sub_2",
+                "content": "Patch node event ownership",
+                "status": "executing",
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, SubtaskUpdated)
+        assert msg.node_id == "node_child"
+        assert msg.parent_node_id == "ac_0"
+        assert msg.display_path == "1.2"
+        assert msg.path == [0, 1]
+        assert msg.node_depth == 1
+        assert msg.ordinal == 1
+        assert msg.root_ac_index == 0
+        assert msg.root_ac_number == 1
+        assert msg.legacy_parent_node_id == "ac_0"
+        assert msg.legacy_parent_node_aliases == ["ac_1"]
+        assert msg.ac_index == 1
+        assert msg.sub_task_id == "ac_1_sub_2"
+
+    def test_node_event_uses_root_ac_number_for_subtask_bucket(self) -> None:
+        """Nested node events should group under their root AC, not synthetic indexes."""
+        event = BaseEvent(
+            type="execution.node.updated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "identity_model": "execution_node_v1",
+                "node_id": "node_grandchild",
+                "parent_node_id": "node_child",
+                "display_path": "2.1.1",
+                "path": [1, 0, 0],
+                "depth": 2,
+                "ordinal": 0,
+                "root_ac_index": 1,
+                "root_ac_number": 2,
+                "legacy_ac_index": 101,
+                "ac_index": 101,
+                "legacy_sub_task_index": 1,
+                "legacy_sub_task_id": "ac_101_sub_1",
+                "content": "Nested child event",
+                "status": "executing",
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, SubtaskUpdated)
+        assert msg.ac_index == 2
+        assert msg.root_ac_index == 1
+        assert msg.root_ac_number == 2
+        assert msg.sub_task_id == "ac_101_sub_1"
+
+    def test_node_event_uses_root_ac_index_when_root_number_missing(self) -> None:
+        """Root AC index is enough to avoid synthetic nested bucket indexes."""
+        event = BaseEvent(
+            type="execution.node.updated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "node_id": "node_grandchild",
+                "parent_node_id": "node_child",
+                "depth": 2,
+                "root_ac_index": 1,
+                "ac_index": 101,
+                "legacy_ac_index": 101,
+                "legacy_sub_task_id": "ac_101_sub_1",
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, SubtaskUpdated)
+        assert msg.ac_index == 2
+
+    @pytest.mark.parametrize(
+        "event_type",
+        ("execution.node.updated", "execution.subtask.updated"),
+    )
+    def test_subtask_events_prefer_full_content_over_truncated_label(
+        self,
+        event_type: str,
+    ) -> None:
+        """TUI detail consumers should keep full Sub-AC content when label is present."""
+        full_content = "Patch the event bridge and preserve the complete Sub-AC description."
+        event = BaseEvent(
+            type=event_type,
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "node_id": "node_child",
+                "parent_node_id": "node_parent",
+                "label": "Patch the event bridge and preserve...",
+                "content": full_content,
+                "status": "executing",
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, SubtaskUpdated)
+        assert msg.content == full_content
+        assert msg.content != "Patch the event bridge and preserve..."
+
+    def test_cost_updated_event(self) -> None:
+        """Test converting cost.updated event."""
+        event = BaseEvent(
+            type="observability.cost.updated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "total_tokens": 15000,
+                "total_cost_usd": 0.075,
+                "tokens_this_phase": 3000,
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, CostUpdated)
+        assert msg.execution_id == "exec_123"
+        assert msg.total_tokens == 15000
+        assert msg.total_cost_usd == 0.075
+        assert msg.tokens_this_phase == 3000
+
+    def test_cost_updated_event_defaults(self) -> None:
+        """Test converting cost.updated event with missing fields."""
+        event = BaseEvent(
+            type="observability.cost.updated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, CostUpdated)
+        assert msg.total_tokens == 0
+        assert msg.total_cost_usd == 0.0
+        assert msg.tokens_this_phase == 0
+
+    def test_session_cancelled_event(self) -> None:
+        """Test converting session.cancelled event to ExecutionUpdated with cancelled status."""
+        event = BaseEvent(
+            type="orchestrator.session.cancelled",
+            aggregate_type="session",
+            aggregate_id="sess_123",
+            data={"execution_id": "exec_456", "reason": "user_request"},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ExecutionUpdated)
+        assert msg.execution_id == "exec_456"
+        assert msg.session_id == "sess_123"
+        assert msg.status == "cancelled"
+        assert msg.data["reason"] == "user_request"
+
+    def test_session_cancelled_event_without_execution_id(self) -> None:
+        """Test cancelled event falls back to aggregate_id when execution_id missing."""
+        event = BaseEvent(
+            type="orchestrator.session.cancelled",
+            aggregate_type="session",
+            aggregate_id="sess_123",
+            data={"reason": "stale_cleanup"},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ExecutionUpdated)
+        assert msg.execution_id == "sess_123"
+        assert msg.status == "cancelled"
+
+    def test_unhandled_event_returns_none(self) -> None:
+        """Test that unhandled event types return None."""
+        event = BaseEvent(
+            type="some.unknown.event",
+            aggregate_type="unknown",
+            aggregate_id="unknown_123",
+            data={},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert msg is None
+
+
+class TestFrugalityTelemetryEvents:
+    """Tests for the frugality telemetry events feeding the TUI dashboard."""
+
+    def test_model_routed_event(self) -> None:
+        """model_routed events convert to ACModelRouted with routing fields."""
+        event = BaseEvent(
+            type="execution.ac.model_routed",
+            aggregate_type="ac",
+            aggregate_id="ac_abc",
+            data={
+                "node_id": "node_7",
+                "ac_index": 2,
+                "model_tier": "frugal",
+                "model": "claude-haiku-4-5",
+                "model_mode": "enforced",
+                "retry_attempt": 1,
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ACModelRouted)
+        assert msg.node_id == "node_7"
+        assert msg.ac_index == 2
+        assert msg.model_tier == "frugal"
+        assert msg.model == "claude-haiku-4-5"
+        assert msg.model_mode == "enforced"
+        assert msg.retry_attempt == 1
+
+    def test_model_routed_falls_back_to_ac_index_without_node_id(self) -> None:
+        """A model_routed event without node_id still carries the ac_index key."""
+        event = BaseEvent(
+            type="execution.ac.model_routed",
+            aggregate_type="ac",
+            aggregate_id="ac_abc",
+            data={"ac_index": 0, "model_tier": "standard", "model_mode": "advised"},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ACModelRouted)
+        assert msg.node_id is None
+        assert msg.ac_index == 0
+
+    def test_model_routed_without_join_key_returns_none(self) -> None:
+        """A model_routed event with neither node_id nor a valid ac_index is dropped."""
+        event = BaseEvent(
+            type="execution.ac.model_routed",
+            aggregate_type="ac",
+            aggregate_id="ac_abc",
+            data={"model_tier": "frugal"},
+        )
+
+        assert create_message_from_event(event) is None
+
+    def test_token_attribution_event(self) -> None:
+        """token_attribution events convert to ACTokenAttribution with the spend."""
+        event = BaseEvent(
+            type="execution.ac.token_attribution.reported",
+            aggregate_type="ac",
+            aggregate_id="ac_abc",
+            data={
+                "node_id": "node_7",
+                "ac_index": 2,
+                "token_spend": 1234.5,
+                "model_tier": "frugal",
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ACTokenAttribution)
+        assert msg.node_id == "node_7"
+        assert msg.ac_index == 2
+        assert msg.token_spend == 1234.5
+        assert msg.model_tier == "frugal"
+
+    def test_token_attribution_malformed_spend_returns_none(self) -> None:
+        """A non-numeric token_spend is malformed and dropped."""
+        event = BaseEvent(
+            type="execution.ac.token_attribution.reported",
+            aggregate_type="ac",
+            aggregate_id="ac_abc",
+            data={"node_id": "node_7", "ac_index": 2, "token_spend": "lots"},
+        )
+
+        assert create_message_from_event(event) is None
+
+    def test_token_attribution_rejects_bool_spend(self) -> None:
+        """A bool token_spend (a Python int subclass) must not be treated as numeric."""
+        event = BaseEvent(
+            type="execution.ac.token_attribution.reported",
+            aggregate_type="ac",
+            aggregate_id="ac_abc",
+            data={"node_id": "node_7", "ac_index": 2, "token_spend": True},
+        )
+
+        assert create_message_from_event(event) is None
+
+    @pytest.mark.parametrize(
+        "token_spend",
+        [
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            -1,
+            -0.5,
+            10**400,
+        ],
+    )
+    def test_token_attribution_rejects_non_finite_or_negative_spend(
+        self, token_spend: float
+    ) -> None:
+        """Non-finite (NaN/±Inf), negative, or unconvertible (``OverflowError``) spend
+        is malformed and dropped at parse.
+
+        Mirrors the board reducer's finite-number guard so a poisoned payload never
+        reaches the run total (negatives were previously dropped only downstream).
+        """
+        event = BaseEvent(
+            type="execution.ac.token_attribution.reported",
+            aggregate_type="ac",
+            aggregate_id="ac_abc",
+            data={"node_id": "node_7", "ac_index": 2, "token_spend": token_spend},
+        )
+
+        assert create_message_from_event(event) is None
+
+    def test_frugality_proof_event(self) -> None:
+        """frugality_proof events convert to FrugalityProofEvaluated."""
+        event = BaseEvent(
+            type="execution.frugality_proof.evaluated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "status": "pass",
+                "token_reduction_pct": 18.0,
+                "reason": "18% fewer tokens with no grounding regression",
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, FrugalityProofEvaluated)
+        assert msg.status == "pass"
+        assert msg.token_reduction_pct == 18.0
+        assert msg.reason.startswith("18%")
+
+    def test_frugality_proof_negative_reduction_pct_is_kept(self) -> None:
+        """A negative ``token_reduction_pct`` legitimately means spend increased —
+        unlike ``token_spend``, it must NOT be dropped."""
+        event = BaseEvent(
+            type="execution.frugality_proof.evaluated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={"status": "fail_no_frugality", "token_reduction_pct": -5.0},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, FrugalityProofEvaluated)
+        assert msg.token_reduction_pct == -5.0
+
+    @pytest.mark.parametrize(
+        "token_reduction_pct",
+        [
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            10**400,
+        ],
+    )
+    def test_frugality_proof_rejects_non_finite_or_unconvertible_pct(
+        self, token_reduction_pct: float
+    ) -> None:
+        """Non-finite (NaN/±Inf) or unconvertible (``OverflowError``) ``token_reduction_pct``
+        is malformed and omitted (never crashes ``create_message_from_event``).
+
+        Mirrors the board reducer's finite-number guard (``dashboard.board._coerce_spend``)
+        so a poisoned payload never crashes live TUI event polling.
+        """
+        event = BaseEvent(
+            type="execution.frugality_proof.evaluated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={"status": "pass", "token_reduction_pct": token_reduction_pct},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, FrugalityProofEvaluated)
+        assert msg.token_reduction_pct is None
+
+    def test_frugality_proof_without_status_returns_none(self) -> None:
+        """A frugality_proof event lacking a status string is dropped."""
+        event = BaseEvent(
+            type="execution.frugality_proof.evaluated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={"token_reduction_pct": 18.0},
+        )
+
+        assert create_message_from_event(event) is None
+
+    def test_frugality_retrospective_event(self) -> None:
+        event = BaseEvent(
+            type="execution.frugality_retrospective.reported",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "execution_id": "exec_123",
+                "retrospective_version": "v1",
+                "trigger": "execution_finalized",
+                "terminal_status": "failed",
+                "evidence_only": True,
+                "coverage": {
+                    "measured_attempts": 3,
+                    "unknown_attempts": 1,
+                    "invalid_attempts": 0,
+                    "total_measured_tokens": 250.0,
+                },
+                "evidence_signals": [
+                    {
+                        "name": "retry_associated_spend",
+                        "token_spend": 100.0,
+                        "attempt_count": 1,
+                    },
+                    {
+                        "name": "unaccepted_spend",
+                        "token_spend": 150.0,
+                        "attempt_count": 2,
+                    },
+                ],
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, FrugalityRetrospectiveReported)
+        assert msg.execution_id == "exec_123"
+        assert msg.summary["retry_associated_tokens"] == 100.0
+        assert msg.summary["unaccepted_tokens"] == 150.0
+
+    def test_frugality_retrospective_malformed_event_returns_none(self) -> None:
+        event = BaseEvent(
+            type="execution.frugality_retrospective.reported",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "retrospective_version": "v1",
+                "trigger": "execution_finalized",
+                "terminal_status": "paused",
+                "evidence_only": True,
+                "coverage": {},
+                "evidence_signals": [],
+            },
+        )
+
+        assert create_message_from_event(event) is None
+
+    def test_format_frugality_summary_pass_includes_reduction(self) -> None:
+        """A PASS verdict shows the token reduction percentage."""
+        assert format_frugality_summary("pass", 18.0) == "⚖ frugal −18% tok"
+
+    def test_format_frugality_summary_non_pass_omits_percentage(self) -> None:
+        """A non-PASS verdict is a bare labelled line, no percentage."""
+        assert format_frugality_summary("fail_no_frugality", None) == "⚖ no savings"
+
+    def test_format_frugality_retrospective_summary_is_neutral(self) -> None:
+        line = format_frugality_retrospective_summary(
+            {
+                "retry_associated_tokens": 1200.0,
+                "retry_associated_attempts": 1,
+                "unaccepted_tokens": 500.0,
+                "unaccepted_attempts": 1,
+                "measured_attempts": 3,
+                "unknown_attempts": 1,
+                "invalid_attempts": 0,
+            }
+        )
+
+        assert line == (
+            "Evidence: retry-associated 1.2k tok | unaccepted 500 tok | "
+            "coverage 3 measured/1 unknown/0 invalid"
+        )
+        assert "waste" not in line.lower()
+        assert "avoidable" not in line.lower()
+
+
+class TestToolCompletionSuccessFailClosed:
+    """`execution.tool.completed` must not display a reported failure as success.
+
+    No producer sets `success` on this event: `emit_atomic_tool_completed` builds
+    its payload from the runtime identity plus `serialize_runtime_message_metadata`,
+    and neither contributes that key. The previous `data.get("success", True)`
+    therefore rendered every failed tool green.
+    """
+
+    @staticmethod
+    def _completed_event(**data: object) -> BaseEvent:
+        return BaseEvent(
+            type="execution.tool.completed",
+            aggregate_type="execution",
+            aggregate_id="exec_1",
+            data={"ac_id": "ac_1", "tool_name": "Bash", **data},
+        )
+
+    def test_reported_error_renders_as_failure(self) -> None:
+        message = create_message_from_event(self._completed_event(is_error=True))
+        assert message is not None
+        assert message.success is False
+
+    def test_reported_error_false_renders_as_success(self) -> None:
+        message = create_message_from_event(self._completed_event(is_error=False))
+        assert message is not None
+        assert message.success is True
+
+    def test_malformed_error_claim_fails_closed(self) -> None:
+        message = create_message_from_event(self._completed_event(is_error_invalid=True))
+        assert message is not None
+        assert message.success is False
+
+    def test_explicit_success_field_wins(self) -> None:
+        message = create_message_from_event(self._completed_event(success=False, is_error=False))
+        assert message is not None
+        assert message.success is False
+
+    def test_nested_tool_result_error_renders_as_failure(self) -> None:
+        """OpenCode reports failure only inside `tool_result`, with no top-level key."""
+        message = create_message_from_event(
+            self._completed_event(tool_result={"is_error": True, "text_content": "failed"})
+        )
+        assert message is not None
+        assert message.success is False
+
+    def test_nested_tool_result_success_renders_as_success(self) -> None:
+        message = create_message_from_event(
+            self._completed_event(tool_result={"is_error": False, "text_content": "ok"})
+        )
+        assert message is not None
+        assert message.success is True
+
+    def test_nested_malformed_error_claim_fails_closed(self) -> None:
+        message = create_message_from_event(self._completed_event(tool_result={"is_error": "boom"}))
+        assert message is not None
+        assert message.success is False
+
+    def test_top_level_verdict_wins_over_nested(self) -> None:
+        message = create_message_from_event(
+            self._completed_event(is_error=True, tool_result={"is_error": False})
+        )
+        assert message is not None
+        assert message.success is False
+
+    def test_nested_error_reaches_display_through_production_metadata(self) -> None:
+        """Drive the real projection path, not a hand-built event payload."""
+        from ouroboros.orchestrator.adapter import AgentMessage
+        from ouroboros.orchestrator.execution_event_emitter import ExecutionEventEmitter
+
+        agent_message = AgentMessage(
+            type="tool_result",
+            content="failed to patch",
+            data={
+                "subtype": "tool_result",
+                "tool_name": "Edit",
+                "tool_result": {"is_error": True, "text_content": "failed to patch"},
+            },
+        )
+        metadata = ExecutionEventEmitter.runtime_event_metadata(agent_message)
+        assert "is_error" not in metadata, "this envelope must carry no top-level verdict"
+        assert metadata["tool_result"]["is_error"] is True
+
+        message = create_message_from_event(self._completed_event(**metadata))
+        assert message is not None
+        assert message.success is False
+
+    def test_absent_verdict_stays_optimistic(self) -> None:
+        """No verdict channel is forwarded, so there is nothing to fail closed on."""
+        message = create_message_from_event(self._completed_event())
+        assert message is not None
+        assert message.success is True
+
+    @pytest.mark.parametrize(
+        ("exit_code", "expected_success"),
+        [(0, True), (1, False)],
+    )
+    def test_real_codex_completion_reaches_the_display_verdict(
+        self, exit_code: int, expected_success: bool
+    ) -> None:
+        """Drive the real adapter and projection, not a hand-built payload.
+
+        This is the path from #1724: a Codex command exiting non-zero produced
+        `is_error=True` and was still displayed as a success.
+        """
+        from ouroboros.orchestrator.codex_cli_runtime import CodexCliRuntime
+        from ouroboros.orchestrator.runtime_message_projection import (
+            serialize_runtime_message_metadata,
+        )
+
+        runtime = CodexCliRuntime()
+        messages = runtime._convert_event(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "cmd-1",
+                    "type": "command_execution",
+                    "command": "pytest -q",
+                    "exit_code": exit_code,
+                    "status": "completed",
+                },
+            },
+            None,
+        )
+        results = [m for m in messages if m.data.get("subtype") == "tool_result"]
+        assert results, "adapter must emit a tool_result message"
+
+        metadata = serialize_runtime_message_metadata(results[0])
+        event = BaseEvent(
+            type="execution.tool.completed",
+            aggregate_type="execution",
+            aggregate_id="exec_1",
+            data={"ac_id": "ac_1", "tool_name": "Bash", **metadata},
+        )
+
+        message = create_message_from_event(event)
+        assert message is not None
+        assert message.success is expected_success

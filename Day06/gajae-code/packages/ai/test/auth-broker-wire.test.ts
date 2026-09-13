@@ -1,0 +1,673 @@
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+	AuthBrokerClient,
+	AuthBrokerCredentialMetadataUnsupportedError,
+	type AuthBrokerServerHandle,
+	AuthBrokerStreamUnsupportedError,
+	AuthStorage,
+	REMOTE_REFRESH_SENTINEL,
+	RemoteAuthCredentialStore,
+	type SnapshotStreamEvent,
+	SqliteAuthCredentialStore,
+	startAuthBroker,
+} from "../src";
+import * as oauthUtils from "../src/utils/oauth";
+
+const ANTHROPIC_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"] as const;
+const savedEnv: Partial<Record<(typeof ANTHROPIC_ENV)[number], string | undefined>> = {};
+
+function mintOAuthCredential(suffix: string, expires: number) {
+	return {
+		type: "oauth" as const,
+		access: `access-${suffix}`,
+		refresh: `refresh-${suffix}`,
+		expires,
+		accountId: `account-${suffix}`,
+		email: `${suffix}@example.com`,
+	};
+}
+
+describe("auth-broker wire surface", () => {
+	let tempDir = "";
+	let store: SqliteAuthCredentialStore | undefined;
+	let storage: AuthStorage | undefined;
+	let handle: AuthBrokerServerHandle | undefined;
+	let token = "";
+
+	beforeEach(async () => {
+		for (const key of ANTHROPIC_ENV) {
+			savedEnv[key] = process.env[key];
+			delete process.env[key];
+		}
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "auth-broker-wire-"));
+		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		store.saveOAuth("anthropic", mintOAuthCredential("a", Date.now() + 60_000));
+		storage = new AuthStorage(store);
+		await storage.reload();
+		token = "test-bearer";
+		handle = startAuthBroker({
+			storage,
+			bind: "127.0.0.1:0",
+			bearerTokens: [token],
+			disableRefresher: true,
+		});
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		await handle?.close();
+		storage?.close();
+		store?.close();
+		await fs.rm(tempDir, { recursive: true, force: true });
+		for (const key of ANTHROPIC_ENV) {
+			if (savedEnv[key] === undefined) delete process.env[key];
+			else process.env[key] = savedEnv[key];
+		}
+	});
+
+	test("GET /v1/healthz returns ok without auth", async () => {
+		const res = await fetch(`${handle!.url}/v1/healthz`);
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { ok: boolean };
+		expect(body.ok).toBe(true);
+	});
+
+	test("GET /v1/credentials/metadata is authenticated, strict, redacted, and generation-aware", async () => {
+		const unauthorized = await fetch(`${handle!.url}/v1/credentials/metadata`);
+		expect(unauthorized.status).toBe(401);
+
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const metadata = await client.fetchCredentialMetadata();
+		expect(metadata.generation).toBe(storage!.getGeneration());
+		expect(metadata.generatedAt).toBeGreaterThan(0);
+		expect(metadata.credentials).toHaveLength(1);
+		expect(metadata.credentials[0]).toEqual({
+			id: expect.any(Number),
+			provider: "anthropic",
+			type: "oauth",
+			identity: "a@example.com",
+			disabledCause: null,
+		});
+		expect(Object.keys(metadata.credentials[0] ?? {}).sort()).toEqual([
+			"disabledCause",
+			"id",
+			"identity",
+			"provider",
+			"type",
+		]);
+		const raw = JSON.stringify(metadata);
+		expect(raw).not.toContain("access-a");
+		expect(raw).not.toContain("refresh-a");
+		expect(raw).not.toContain("key");
+
+		storage!.upsertCredential("kagi", { type: "api_key", key: "api-key-secret" });
+		const withApiKey = await client.fetchCredentialMetadata();
+		expect(withApiKey.credentials.find(record => record.provider === "kagi")).toEqual({
+			id: expect.any(Number),
+			provider: "kagi",
+			type: "api_key",
+			identity: null,
+			disabledCause: null,
+		});
+		expect(JSON.stringify(withApiKey)).not.toContain("api-key-secret");
+
+		storage!.disableCredentialById(metadata.credentials[0]!.id, "secret disabled reason");
+		const disabled = await client.fetchCredentialMetadata();
+		expect(disabled.credentials[0]).toMatchObject({
+			id: metadata.credentials[0]!.id,
+			disabledCause: "disabled via auth-broker",
+		});
+		expect(disabled.generation).toBeGreaterThan(metadata.generation);
+	});
+
+	test("metadata wire schema rejects extra secret-bearing record fields", async () => {
+		const dummy = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () =>
+				Response.json({
+					generation: 1,
+					generatedAt: Date.now(),
+					credentials: [
+						{
+							id: 1,
+							provider: "anthropic",
+							type: "oauth",
+							identity: null,
+							disabledCause: null,
+							access: "secret",
+						},
+					],
+				}),
+		});
+		try {
+			const client = new AuthBrokerClient({ url: `http://${dummy.hostname}:${dummy.port}`, token });
+			await expect(client.fetchCredentialMetadata()).rejects.toThrow(/schema validation/);
+		} finally {
+			dummy.stop(true);
+		}
+	});
+
+	test("GET /v1/snapshot requires bearer and redacts refresh tokens", async () => {
+		const unauthorized = await fetch(`${handle!.url}/v1/snapshot`);
+		expect(unauthorized.status).toBe(401);
+
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const snapshotResult = await client.fetchSnapshot();
+		if (snapshotResult.status !== 200) throw new Error("expected snapshot");
+		const snapshot = snapshotResult.snapshot;
+		expect(snapshot.credentials).toHaveLength(1);
+		const entry = snapshot.credentials[0];
+		expect(entry.provider).toBe("anthropic");
+		expect(entry.credential.type).toBe("oauth");
+		if (entry.credential.type === "oauth") {
+			expect(entry.credential.access).toBe("access-a");
+			// Refresh token is replaced with the wire sentinel — clients never see it.
+			expect(entry.credential.refresh).toBe(REMOTE_REFRESH_SENTINEL);
+		}
+		expect(entry.revision).toBe(1);
+	});
+
+	test("snapshot client accepts omitted revisions and rejects malformed revisions", async () => {
+		const snapshot = {
+			generation: 1,
+			generatedAt: Date.now(),
+			serverNowMs: Date.now(),
+			refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+			credentials: [
+				{
+					id: 1,
+					provider: "anthropic",
+					credential: {
+						type: "oauth",
+						access: "access-a",
+						refresh: REMOTE_REFRESH_SENTINEL,
+						expires: Date.now() + 60_000,
+					},
+					identityKey: null,
+					rotatesInMs: null,
+				},
+			],
+		};
+		let malformed = false;
+		const dummy = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () =>
+				Response.json(
+					malformed ? { ...snapshot, credentials: [{ ...snapshot.credentials[0], revision: 1.5 }] } : snapshot,
+				),
+		});
+		try {
+			const client = new AuthBrokerClient({ url: `http://${dummy.hostname}:${dummy.port}`, token });
+			const accepted = await client.fetchSnapshot();
+			expect(accepted.status).toBe(200);
+			if (accepted.status === 200) expect(accepted.snapshot.credentials[0]?.revision).toBeUndefined();
+			malformed = true;
+			await expect(client.fetchSnapshot()).rejects.toThrow(/schema validation/);
+		} finally {
+			dummy.stop(true);
+		}
+	});
+
+	test("broker refresh posts the real secret only to the stored MCP token endpoint and preserves binding", async () => {
+		let requestBody = "";
+		const tokenServer = Bun.serve({
+			port: 0,
+			async fetch(request) {
+				requestBody = await request.text();
+				return Response.json({
+					access_token: "rotated-access",
+					refresh_token: "rotated-refresh",
+					expires_in: 3600,
+				});
+			},
+		});
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const provider = "mcp_oauth_remote";
+		const mcpBinding = {
+			resourceOrigin: "https://mcp.example",
+			tokenEndpoint: tokenServer.url.href,
+		};
+
+		let clientStorage: AuthStorage | undefined;
+		let streamIterator: AsyncIterator<SnapshotStreamEvent> | undefined;
+		try {
+			const uploaded = await client.uploadCredential(provider, {
+				type: "oauth",
+				access: "old-access",
+				refresh: "broker-refresh-secret",
+				expires: Date.now() - 1,
+				mcpBinding,
+			});
+			const id = uploaded.entries[0]?.id;
+			if (id === undefined) throw new Error("expected uploaded credential");
+			const initial = await client.fetchSnapshot();
+			if (initial.status !== 200) throw new Error("expected snapshot");
+			const remoteStore = new RemoteAuthCredentialStore({ client, initialSnapshot: initial.snapshot });
+			clientStorage = new AuthStorage(remoteStore);
+			await clientStorage.reload();
+			const expected = clientStorage.get(provider);
+			if (expected?.type !== "oauth") throw new Error("expected remote OAuth credential");
+			streamIterator = client.openSnapshotStream()[Symbol.asyncIterator]();
+			await streamIterator.next();
+
+			const refreshed = await clientStorage.forceRefreshOAuthCredential(provider, expected, {
+				clientId: "remote-client",
+				clientSecret: "REMOTE_CLIENT_SECRET",
+			});
+			expect(requestBody).toContain("refresh_token=broker-refresh-secret");
+			expect(requestBody).not.toContain(REMOTE_REFRESH_SENTINEL);
+			expect(requestBody).toContain("client_id=remote-client");
+			expect(requestBody).toContain("client_secret=REMOTE_CLIENT_SECRET");
+			expect(refreshed).toMatchObject({
+				type: "oauth",
+				access: "rotated-access",
+				refresh: REMOTE_REFRESH_SENTINEL,
+				mcpBinding,
+			});
+			const delta = await streamIterator.next();
+			expect(delta.done).toBe(false);
+			expect(JSON.stringify(delta.value)).not.toContain("REMOTE_CLIENT_SECRET");
+
+			const snapshot = await client.fetchSnapshot();
+			if (snapshot.status !== 200) throw new Error("expected snapshot");
+			expect(snapshot.snapshot.credentials.find(entry => entry.id === id)?.credential).toMatchObject({
+				access: "rotated-access",
+				mcpBinding,
+			});
+			expect(JSON.stringify(snapshot.snapshot)).not.toContain("REMOTE_CLIENT_SECRET");
+			expect(store!.listAuthCredentials(provider)[0]?.credential).toMatchObject({
+				access: "rotated-access",
+				refresh: "rotated-refresh",
+				mcpBinding,
+			});
+		} finally {
+			await streamIterator?.return?.();
+			clientStorage?.close();
+			await tokenServer.stop(true);
+		}
+	});
+
+	test("GET /v1/snapshot rejects legacy conditional revalidation across restarts", async () => {
+		const res = await fetch(`${handle!.url}/v1/snapshot`, {
+			headers: { Authorization: `Bearer ${token}`, "X-GJC-Auth-Broker-Epoch": "1" },
+		});
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as {
+			epoch?: string;
+			generation: number;
+			serverNowMs: number;
+			refresher: { enabled: boolean };
+		};
+		expect(body.epoch).toBeTruthy();
+		expect(res.headers.get("etag")).toBe(`"${body.epoch}:${body.generation}"`);
+		expect(res.headers.get("cache-control")).toBe("no-store");
+		expect(body.generation).toBeGreaterThan(0);
+		expect(body.serverNowMs).toBeGreaterThan(0);
+		expect(body.refresher.enabled).toBe(false);
+		const legacy = await fetch(`${handle!.url}/v1/snapshot`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(legacy.status).toBe(200);
+		const legacyBody = (await legacy.json()) as { epoch?: string; generation: number };
+		expect(legacyBody.epoch).toBeUndefined();
+		expect(legacy.headers.get("etag")).toBe(`"${legacyBody.generation}"`);
+		const legacyUnchanged = await fetch(`${handle!.url}/v1/snapshot?wait=10`, {
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"If-None-Match": `"${legacyBody.generation}"`,
+			},
+		});
+		expect(legacyUnchanged.status).toBe(200);
+		const legacyRefreshBody = (await legacyUnchanged.json()) as { generation: number };
+		expect(legacyRefreshBody.generation).toBe(legacyBody.generation);
+
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const unchanged = await client.fetchSnapshot({
+			ifEpoch: body.epoch,
+			ifGenerationGt: body.generation,
+			waitMs: 10,
+		});
+		expect(unchanged.status).toBe(304);
+		if (unchanged.status !== 304) throw new Error("expected unchanged snapshot");
+		expect(unchanged.generation).toBe(body.generation);
+		expect(unchanged.epoch).toBe(body.epoch);
+
+		const restarted = await client.fetchSnapshot({
+			ifEpoch: "restarted-epoch",
+			ifGenerationGt: body.generation,
+			waitMs: 10,
+		});
+		expect(restarted.status).toBe(200);
+	});
+
+	test("GET /v1/snapshot long-poll wakes when generation changes", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const initial = await client.fetchSnapshot();
+		if (initial.status !== 200) throw new Error("expected snapshot");
+
+		const pending = client.fetchSnapshot({
+			ifEpoch: initial.snapshot.epoch,
+			ifGenerationGt: initial.generation,
+			waitMs: 1000,
+		});
+		setTimeout(() => {
+			storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+		}, 10);
+
+		const changed = await pending;
+		expect(changed.status).toBe(200);
+		if (changed.status !== 200) throw new Error("expected changed snapshot");
+		expect(changed.generation).toBeGreaterThan(initial.generation);
+		expect(
+			changed.snapshot.credentials.some(
+				entry => entry.credential.type === "oauth" && entry.credential.access === "access-b",
+			),
+		).toBe(true);
+	});
+
+	test("POST /v1/credential/:id/refresh forces a refresh and persists the new credential", async () => {
+		const refreshed = {
+			access: "access-rotated",
+			refresh: "refresh-rotated",
+			expires: Date.now() + 120_000,
+			accountId: "account-a",
+			email: "a@example.com",
+		};
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockResolvedValue(refreshed);
+
+		const initialResult = await new AuthBrokerClient({ url: handle!.url, token }).fetchSnapshot();
+		if (initialResult.status !== 200) throw new Error("expected snapshot");
+		const id = initialResult.snapshot.credentials[0].id;
+
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const result = await client.refreshCredential(id);
+		expect(result.entry.id).toBe(id);
+		expect(result.entry.revision).toBe(2);
+		if (result.entry.credential.type === "oauth") {
+			expect(result.entry.credential.access).toBe("access-rotated");
+			expect(result.entry.credential.refresh).toBe(REMOTE_REFRESH_SENTINEL);
+		}
+
+		// Underlying SQLite row was updated with the *real* refresh token (no sentinel).
+		const persisted = store!.getOAuth("anthropic");
+		expect(persisted?.access).toBe("access-rotated");
+		expect(persisted?.refresh).toBe("refresh-rotated");
+	});
+
+	test("POST /v1/credential/:id/disable soft-deletes the credential and surfaces 404 thereafter", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const initialResult = await client.fetchSnapshot();
+		if (initialResult.status !== 200) throw new Error("expected snapshot");
+		const id = initialResult.snapshot.credentials[0].id;
+
+		const result = await client.disableCredential(id, "revoked by user");
+		expect(result.ok).toBe(true);
+
+		const afterResult = await client.fetchSnapshot();
+		if (afterResult.status !== 200) throw new Error("expected snapshot");
+		expect(afterResult.snapshot.credentials).toHaveLength(0);
+
+		await expect(client.refreshCredential(id)).rejects.toThrow();
+	});
+
+	test("Unknown route returns 404", async () => {
+		const res = await fetch(`${handle!.url}/v1/nope`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(res.status).toBe(404);
+	});
+
+	test("GET /v1/snapshot/stream requires bearer", async () => {
+		const res = await fetch(`${handle!.url}/v1/snapshot/stream`);
+		expect(res.status).toBe(401);
+	});
+
+	test("SSE stream emits complete snapshots for credential updates", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const controller = new AbortController();
+		const iter = client.openSnapshotStream({ signal: controller.signal });
+		try {
+			const first = await iter.next();
+			if (first.done) throw new Error("expected snapshot frame");
+			expect(first.value.kind).toBe("snapshot");
+			if (first.value.kind === "snapshot") {
+				expect(first.value.credentials).toHaveLength(1);
+				expect(first.value.credentials[0].provider).toBe("anthropic");
+			}
+
+			storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
+
+			const next = await nextMatching(
+				iter,
+				event =>
+					event.kind === "snapshot" &&
+					event.credentials.some(
+						entry => entry.credential.type === "oauth" && entry.credential.access === "access-b",
+					),
+			);
+			if (next.kind !== "snapshot") throw new Error("expected snapshot frame");
+			const updated = next.credentials.find(
+				entry => entry.credential.type === "oauth" && entry.credential.access === "access-b",
+			);
+			expect(updated?.provider).toBe("anthropic");
+			expect(updated?.credential.type).toBe("oauth");
+			if (updated?.credential.type === "oauth") {
+				expect(updated.credential.access).toBe("access-b");
+				expect(updated.credential.refresh).toBe(REMOTE_REFRESH_SENTINEL);
+			}
+		} finally {
+			controller.abort();
+			await iter.return(undefined).catch(() => {});
+		}
+	});
+
+	test("SSE stream pushes a complete snapshot on refresh", async () => {
+		const refreshed = {
+			access: "access-rotated",
+			refresh: "refresh-rotated",
+			expires: Date.now() + 120_000,
+			accountId: "account-a",
+			email: "a@example.com",
+		};
+		vi.spyOn(oauthUtils, "refreshOAuthToken").mockResolvedValue(refreshed);
+
+		const initialSnapshot = await new AuthBrokerClient({ url: handle!.url, token }).fetchSnapshot();
+		if (initialSnapshot.status !== 200) throw new Error("expected snapshot");
+		const id = initialSnapshot.snapshot.credentials[0].id;
+
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const controller = new AbortController();
+		const iter = client.openSnapshotStream({ signal: controller.signal });
+		try {
+			const first = await iter.next();
+			if (first.done) throw new Error("expected snapshot frame");
+
+			await storage!.refreshCredentialById(id);
+
+			const next = await nextMatching(
+				iter,
+				event =>
+					event.kind === "snapshot" &&
+					event.credentials.some(
+						entry =>
+							entry.id === id &&
+							entry.credential.type === "oauth" &&
+							entry.credential.access === "access-rotated",
+					),
+			);
+			if (next.kind !== "snapshot") throw new Error("expected snapshot frame");
+			const updated = next.credentials.find(entry => entry.id === id);
+			if (!updated) throw new Error("expected credential");
+			if (updated.credential.type !== "oauth") throw new Error("expected oauth credential");
+			expect(updated.credential.access).toBe("access-rotated");
+			expect(updated.credential.refresh).toBe(REMOTE_REFRESH_SENTINEL);
+		} finally {
+			controller.abort();
+			await iter.return(undefined).catch(() => {});
+		}
+	});
+
+	test("SSE stream pushes a complete snapshot on disable", async () => {
+		const initialSnapshot = await new AuthBrokerClient({ url: handle!.url, token }).fetchSnapshot();
+		if (initialSnapshot.status !== 200) throw new Error("expected snapshot");
+		const id = initialSnapshot.snapshot.credentials[0].id;
+
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const controller = new AbortController();
+		const iter = client.openSnapshotStream({ signal: controller.signal });
+		try {
+			const first = await iter.next();
+			if (first.done) throw new Error("expected snapshot frame");
+
+			const disabled = storage!.disableCredentialById(id, "revoked by test");
+			expect(disabled).toBe(true);
+
+			const next = await nextMatching(
+				iter,
+				event => event.kind === "snapshot" && !event.credentials.some(entry => entry.id === id),
+			);
+			if (next.kind !== "snapshot") throw new Error("expected snapshot frame");
+			expect(next.credentials.some(entry => entry.id === id)).toBe(false);
+		} finally {
+			controller.abort();
+			await iter.return(undefined).catch(() => {});
+		}
+	});
+
+	test("SSE stream keepalive comment arrives on cadence", async () => {
+		const localStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "keepalive.db"));
+		localStore.saveOAuth("anthropic", mintOAuthCredential("k", Date.now() + 60_000));
+		const localStorage = new AuthStorage(localStore);
+		await localStorage.reload();
+		const localToken = "keepalive-bearer";
+		const localHandle = startAuthBroker({
+			storage: localStorage,
+			bind: "127.0.0.1:0",
+			bearerTokens: [localToken],
+			disableRefresher: true,
+			streamKeepaliveMs: 25,
+		});
+		const controller = new AbortController();
+		try {
+			const res = await fetch(`${localHandle.url}/v1/snapshot/stream`, {
+				headers: { Authorization: `Bearer ${localToken}`, Accept: "text/event-stream" },
+				signal: controller.signal,
+			});
+			expect(res.status).toBe(200);
+			expect(res.headers.get("content-type") ?? "").toContain("text/event-stream");
+			expect(res.body).not.toBeNull();
+			const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+			const decoder = new TextDecoder();
+			const deadline = Date.now() + 1_000;
+			let seenKeepalive = false;
+			let buffer = "";
+			try {
+				while (Date.now() < deadline) {
+					const { value, done } = await reader.read();
+					if (done) break;
+					buffer += decoder.decode(value, { stream: true });
+					if (buffer.includes(": keepalive\n\n")) {
+						seenKeepalive = true;
+						break;
+					}
+				}
+			} finally {
+				await reader.cancel().catch(() => {});
+			}
+			expect(seenKeepalive).toBe(true);
+		} finally {
+			controller.abort();
+			await localHandle.close();
+			localStorage.close();
+			localStore.close();
+		}
+	});
+
+	test("openSnapshotStream throws AuthBrokerStreamUnsupportedError on 404", async () => {
+		const dummy = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () => new Response("Not Found", { status: 404 }),
+		});
+		try {
+			const client = new AuthBrokerClient({ url: `http://${dummy.hostname}:${dummy.port}`, token });
+			const iter = client.openSnapshotStream();
+			await expect(iter.next()).rejects.toBeInstanceOf(AuthBrokerStreamUnsupportedError);
+		} finally {
+			dummy.stop(true);
+		}
+	});
+
+	test("fetchCredentialMetadata preserves 404 unsupported compatibility", async () => {
+		const dummy = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () => new Response("Not Found", { status: 404 }),
+		});
+		try {
+			const client = new AuthBrokerClient({ url: `http://${dummy.hostname}:${dummy.port}`, token });
+			await expect(client.fetchCredentialMetadata()).rejects.toBeInstanceOf(
+				AuthBrokerCredentialMetadataUnsupportedError,
+			);
+		} finally {
+			dummy.stop(true);
+		}
+	});
+
+	test("openSnapshotStream rejects 200 responses that are not SSE", async () => {
+		const dummy = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () => new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } }),
+		});
+		try {
+			const client = new AuthBrokerClient({ url: `http://${dummy.hostname}:${dummy.port}`, token });
+			const iter = client.openSnapshotStream();
+			await expect(iter.next()).rejects.toThrow(/non-SSE/);
+		} finally {
+			dummy.stop(true);
+		}
+	});
+
+	test("openSnapshotStream rejects SSE responses without an initial snapshot", async () => {
+		const dummy = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () =>
+				new Response(": keepalive\n\n", { status: 200, headers: { "Content-Type": "text/event-stream" } }),
+		});
+		try {
+			const client = new AuthBrokerClient({ url: `http://${dummy.hostname}:${dummy.port}`, token });
+			const iter = client.openSnapshotStream();
+			await expect(iter.next()).rejects.toThrow(/initial snapshot/);
+		} finally {
+			dummy.stop(true);
+		}
+	});
+});
+
+async function nextMatching(
+	iter: AsyncGenerator<SnapshotStreamEvent>,
+	predicate: (event: SnapshotStreamEvent) => boolean,
+	timeoutMs = 2_000,
+): Promise<SnapshotStreamEvent> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) throw new Error("nextMatching timeout");
+		const timer = Promise.withResolvers<never>();
+		const handle = setTimeout(() => timer.reject(new Error("nextMatching timeout")), remaining);
+		try {
+			const res = await Promise.race([iter.next(), timer.promise]);
+			if (res.done) throw new Error("stream ended before predicate satisfied");
+			if (predicate(res.value)) return res.value;
+		} finally {
+			clearTimeout(handle);
+		}
+	}
+}

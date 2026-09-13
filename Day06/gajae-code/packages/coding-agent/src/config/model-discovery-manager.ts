@@ -1,0 +1,297 @@
+import {
+	type Api,
+	applyFinalCodexGpt56ContextCap,
+	createModelManager,
+	type Model,
+	type ModelRefreshStrategy,
+	readModelCache,
+} from "@gajae-code/ai/core";
+
+export interface DiscoveryProvider {
+	provider: string;
+	optional?: boolean;
+}
+
+export type ProviderDiscoveryStatus = "idle" | "ok" | "empty" | "cached" | "unavailable" | "unauthenticated";
+
+export interface ProviderDiscoveryState {
+	provider: string;
+	status: ProviderDiscoveryStatus;
+	optional: boolean;
+	stale: boolean;
+	fetchedAt?: number;
+	models: string[];
+	error?: string;
+}
+
+export interface DiscoveryRefreshToken {
+	provider: string;
+	generation: number;
+}
+
+/** A generation-guarded, immutable result for the registry to merge into its catalog. */
+export interface DiscoveryMergeInput {
+	provider: string;
+	token: DiscoveryRefreshToken;
+	current: boolean;
+	models: readonly Model<Api>[];
+	state: ProviderDiscoveryState;
+	warning?: string;
+	authGeneration?: string;
+	fetched?: boolean;
+}
+
+export interface ProviderDiscoveryCallbacks<TProvider extends DiscoveryProvider> {
+	cacheDbPath?: string;
+	requiresAuth: (provider: TProvider) => boolean;
+	peekApiKey: (provider: TProvider) => Promise<string | undefined>;
+	isAuthenticated: (apiKey: string | undefined) => boolean;
+	fetchModels: (provider: TProvider, apiKey: string | undefined) => Promise<Model<Api>[]>;
+	getEvidenceGeneration?: (provider: TProvider) => string;
+	canPublishCache?: (provider: TProvider) => boolean;
+	/**
+	 * Stable fingerprint of the discovery fetch context (credential evidence +
+	 * endpoint). When supplied, the published cache row records it alongside the
+	 * discovered model ids so a later `online-if-uncached` refresh can trust a
+	 * fresh cache instead of treating the ids as provenance-less and re-fetching.
+	 */
+	cacheDynamicModelProvenance?: string;
+}
+
+/** Owns configured discovery inputs, status, cache lifecycle, and refresh generations. */
+export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
+	#providers: TProvider[] = [];
+	#states = new Map<string, ProviderDiscoveryState>();
+	#refreshGenerations = new Map<string, number>();
+	#lastWarnings = new Map<string, string>();
+
+	reset(): void {
+		for (const provider of this.#providers) this.#invalidate(provider.provider);
+		this.#providers = [];
+		this.#states.clear();
+		this.#lastWarnings.clear();
+	}
+
+	setProviders(providers: readonly TProvider[]): void {
+		const previousProviderIds = new Set(this.#providers.map(provider => provider.provider));
+		this.#providers = providers.map(provider => this.#snapshot(provider));
+		for (const provider of this.#providers) previousProviderIds.add(provider.provider);
+		for (const providerId of previousProviderIds) this.#invalidate(providerId);
+		this.#states.clear();
+		this.#lastWarnings.clear();
+	}
+
+	addProvider(provider: TProvider): void {
+		this.#providers.push(this.#snapshot(provider));
+		this.#invalidate(provider.provider);
+		this.#states.delete(provider.provider);
+		this.#lastWarnings.delete(provider.provider);
+	}
+
+	get providers(): readonly TProvider[] {
+		return this.#providers.map(provider => this.#snapshot(provider));
+	}
+
+	providerIds(): Set<string> {
+		return new Set(this.#providers.map(provider => provider.provider));
+	}
+
+	getState(provider: string): ProviderDiscoveryState | undefined {
+		const state = this.#states.get(provider);
+		return state === undefined ? undefined : this.#snapshot(state);
+	}
+	invalidate(provider: string): void {
+		this.#invalidate(provider);
+		this.#states.delete(provider);
+		this.#lastWarnings.delete(provider);
+	}
+
+	loadCached(provider: TProvider, cacheDbPath?: string, expectedProvenance?: string): readonly Model<Api>[] {
+		const cache = readModelCache<Api>(provider.provider, 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
+		// A cache row whose dynamic models were discovered under a different
+		// request context (credential/endpoint/headers/shape fingerprint) must
+		// never seed the synchronous catalog: it belongs to a different
+		// discovery context (e.g. another tenant), not this one.
+		const provenanceMismatch =
+			cache !== null &&
+			(cache.dynamicModelIds === undefined ||
+				expectedProvenance === undefined ||
+				cache.dynamicModelProvenance !== expectedProvenance);
+		const usableCache = provenanceMismatch ? null : cache;
+		const models = applyFinalCodexGpt56ContextCap(usableCache?.models ?? []);
+		this.#states.set(provider.provider, {
+			provider: provider.provider,
+			status: usableCache ? "cached" : "idle",
+			optional: provider.optional ?? false,
+			stale: usableCache ? !usableCache.fresh || !usableCache.authoritative : false,
+			fetchedAt: usableCache?.updatedAt,
+			models: models.map(model => model.id),
+		});
+		return this.#snapshot(models);
+	}
+
+	beginRefresh(provider: string): DiscoveryRefreshToken {
+		return { provider, generation: this.#invalidate(provider) };
+	}
+
+	isCurrent(token: DiscoveryRefreshToken): boolean {
+		return (
+			this.#refreshGenerations.get(token.provider) === token.generation &&
+			this.#providers.some(provider => provider.provider === token.provider)
+		);
+	}
+
+	async discover(
+		provider: TProvider,
+		strategy: ModelRefreshStrategy,
+		callbacks: ProviderDiscoveryCallbacks<TProvider>,
+	): Promise<DiscoveryMergeInput> {
+		const token = this.beginRefresh(provider.provider);
+		const cached = readModelCache<Api>(provider.provider, 24 * 60 * 60 * 1000, Date.now, callbacks.cacheDbPath);
+		const cacheEligible =
+			cached !== null &&
+			(callbacks.cacheDynamicModelProvenance === undefined ||
+				(cached.dynamicModelIds !== undefined &&
+					cached.dynamicModelProvenance === callbacks.cacheDynamicModelProvenance));
+		const eligibleCache = cacheEligible ? cached : null;
+		const cachedModels = applyFinalCodexGpt56ContextCap(eligibleCache?.models ?? []);
+		const unauthenticated = (models: readonly Model<Api>[]): DiscoveryMergeInput =>
+			this.#complete(token, models, {
+				provider: provider.provider,
+				status: "unauthenticated",
+				optional: provider.optional ?? false,
+				stale: eligibleCache !== null,
+				fetchedAt: eligibleCache?.updatedAt,
+				models: models.map(model => model.id),
+			});
+
+		let authGeneration = callbacks.getEvidenceGeneration?.(provider);
+		let apiKey: string | undefined;
+		if (callbacks.requiresAuth(provider)) {
+			apiKey = await callbacks.peekApiKey(provider);
+			const resolvedGeneration = callbacks.getEvidenceGeneration?.(provider);
+			if (!this.isCurrent(token)) return this.#stale(token);
+			if (authGeneration !== resolvedGeneration) {
+				authGeneration = resolvedGeneration;
+				// Resolving a command-backed key can update the evidence generation. Keep
+				// the key resolved for this refresh so round-robin selection cannot switch
+				// credentials between the request and its published evidence.
+				if (!this.isCurrent(token) || authGeneration !== callbacks.getEvidenceGeneration?.(provider)) {
+					return this.#stale(token);
+				}
+			}
+			if (!callbacks.isAuthenticated(apiKey)) return unauthenticated(cachedModels);
+		}
+
+		let error: string | undefined;
+		const manager = createModelManager<Api>({
+			providerId: provider.provider,
+			staticModels: [],
+			cacheDbPath: callbacks.cacheDbPath,
+			cacheTtlMs: 24 * 60 * 60 * 1000,
+			cacheDynamicModelProvenance: callbacks.cacheDynamicModelProvenance,
+			canPublishCache: () =>
+				this.isCurrent(token) &&
+				(callbacks.getEvidenceGeneration === undefined ||
+					callbacks.getEvidenceGeneration(provider) === authGeneration) &&
+				(callbacks.canPublishCache?.(provider) ?? true),
+			fetchDynamicModels: async () => {
+				try {
+					return await callbacks.fetchModels(provider, apiKey);
+				} catch (cause) {
+					error = cause instanceof Error ? cause.message : String(cause);
+					return null;
+				}
+			},
+		});
+		const result = await manager.refresh(strategy);
+		if (
+			!this.isCurrent(token) ||
+			(callbacks.getEvidenceGeneration !== undefined && callbacks.getEvidenceGeneration(provider) !== authGeneration)
+		)
+			return this.#stale(token);
+		const status: ProviderDiscoveryStatus = error
+			? result.models.length > 0
+				? "cached"
+				: "unavailable"
+			: strategy === "offline"
+				? eligibleCache
+					? "cached"
+					: "idle"
+				: result.models.length > 0
+					? result.stale
+						? "cached"
+						: "ok"
+					: result.fetched
+						? "empty"
+						: // No fetch happened (non-authoritative retry backoff, or an
+							// ineligible cache) and no eligible row served models: the
+							// provider is unvalidated, not authoritatively empty.
+							"unavailable";
+		const state: ProviderDiscoveryState = {
+			provider: provider.provider,
+			status,
+			optional: provider.optional ?? false,
+			stale: result.stale || status === "cached",
+			// Cache-served refreshes did not fetch now: report the row's actual
+			// fetch time instead of laundering it through Date.now().
+			fetchedAt: error || !result.fetched ? eligibleCache?.updatedAt : Date.now(),
+			models: result.models.map(model => model.id),
+			error,
+		};
+		return this.#complete(token, result.models, state, error, authGeneration, result.fetched);
+	}
+
+	#complete(
+		token: DiscoveryRefreshToken,
+		models: readonly Model<Api>[],
+		state: ProviderDiscoveryState,
+		error?: string,
+		authGeneration?: string,
+		fetched?: boolean,
+	): DiscoveryMergeInput {
+		const current = this.isCurrent(token);
+		if (current) this.#states.set(token.provider, this.#snapshot(state));
+		const warning = current && error && this.#lastWarnings.get(token.provider) !== error ? error : undefined;
+		if (current) {
+			if (error) this.#lastWarnings.set(token.provider, error);
+			else this.#lastWarnings.delete(token.provider);
+		}
+		return this.#snapshot({
+			provider: token.provider,
+			token,
+			current,
+			models,
+			state,
+			warning,
+			authGeneration,
+			fetched,
+		});
+	}
+
+	#stale(token: DiscoveryRefreshToken): DiscoveryMergeInput {
+		return this.#snapshot({
+			provider: token.provider,
+			token,
+			current: false,
+			models: [],
+			state: this.#states.get(token.provider) ?? {
+				provider: token.provider,
+				status: "idle",
+				optional: false,
+				stale: false,
+				models: [],
+			},
+		});
+	}
+
+	#invalidate(provider: string): number {
+		const generation = (this.#refreshGenerations.get(provider) ?? 0) + 1;
+		this.#refreshGenerations.set(provider, generation);
+		return generation;
+	}
+
+	#snapshot<T>(value: T): T {
+		return structuredClone(value);
+	}
+}

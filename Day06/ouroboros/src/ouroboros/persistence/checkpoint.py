@@ -1,0 +1,698 @@
+"""Checkpoint and recovery system for workflow persistence.
+
+This module provides:
+- CheckpointData: Data model for checkpoint state
+- CheckpointStore: Save/load checkpoints with integrity validation
+- Recovery logic with rollback support (max 3 levels per NFR11)
+- PeriodicCheckpointer: Background task for automatic checkpointing
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable
+import copy
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+from typing import Any
+
+from ouroboros.core.errors import PersistenceError
+from ouroboros.core.file_lock import file_lock as _file_lock
+from ouroboros.core.types import Result
+
+
+def _checkpoint_hash(seed_id: str, phase: str, state: dict[str, Any], timestamp_iso: str) -> str:
+    """Integrity hash over one exact checkpoint payload."""
+    serialized = json.dumps(
+        {
+            "seed_id": seed_id,
+            "phase": phase,
+            "state": state,
+            "timestamp": timestamp_iso,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointData:
+    """Immutable checkpoint data for workflow state.
+
+    Attributes:
+        seed_id: Unique identifier for the seed being executed.
+        phase: Current execution phase (e.g., "planning", "execution").
+        state: Arbitrary state data as JSON-serializable dict.
+        timestamp: UTC timestamp when checkpoint was created.
+        hash: SHA-256 hash of serialized data for integrity validation.
+    """
+
+    seed_id: str
+    phase: str
+    state: dict[str, Any]
+    timestamp: datetime
+    hash: str
+
+    @classmethod
+    def create(cls, seed_id: str, phase: str, state: dict[str, Any]) -> CheckpointData:
+        """Create a new checkpoint with automatic hash generation.
+
+        Args:
+            seed_id: Unique identifier for the seed.
+            phase: Current execution phase.
+            state: State data to checkpoint.
+
+        Returns:
+            New CheckpointData instance with computed hash.
+        """
+        timestamp = datetime.now(UTC)
+        # Snapshot the caller's state before hashing: the integrity hash must
+        # bind exactly the payload this checkpoint will carry, so a caller
+        # mutating its dictionary (or anything nested in it) after
+        # construction cannot desync the two (#1829). State is JSON-bound by
+        # the hash below, so every valid state is deep-copyable.
+        state = copy.deepcopy(state)
+        hash_value = _checkpoint_hash(seed_id, phase, state, timestamp.isoformat())
+
+        return cls(
+            seed_id=seed_id,
+            phase=phase,
+            state=state,
+            timestamp=timestamp,
+            hash=hash_value,
+        )
+
+    def validate_integrity(self) -> Result[bool, str]:
+        """Validate checkpoint integrity by recomputing hash.
+
+        Returns:
+            Result.ok(True) if hash matches, Result.err with details if corrupted.
+        """
+        computed_hash = _checkpoint_hash(
+            self.seed_id, self.phase, self.state, self.timestamp.isoformat()
+        )
+
+        if computed_hash != self.hash:
+            return Result.err(f"Hash mismatch: expected {self.hash}, got {computed_hash}")
+        return Result.ok(True)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert checkpoint to JSON-serializable dict.
+
+        Returns:
+            Dict representation suitable for JSON serialization.
+        """
+        data = asdict(self)
+        data["timestamp"] = self.timestamp.isoformat()
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CheckpointData:
+        """Reconstruct checkpoint from dict.
+
+        Args:
+            data: Dict with checkpoint data.
+
+        Returns:
+            CheckpointData instance.
+
+        Raises:
+            ValueError: If timestamp parsing fails.
+        """
+        timestamp_str = data["timestamp"]
+        timestamp = datetime.fromisoformat(timestamp_str)
+        return cls(
+            seed_id=data["seed_id"],
+            phase=data["phase"],
+            state=data["state"],
+            timestamp=timestamp,
+            hash=data["hash"],
+        )
+
+
+class CheckpointStore:
+    """Store for persisting and recovering checkpoints with integrity validation.
+
+    Checkpoints are stored as JSON files in ~/.ouroboros/data/checkpoints/.
+    Each checkpoint is validated with SHA-256 hash for integrity.
+    Supports rollback up to 3 levels (NFR11) when corruption is detected.
+
+    Usage:
+        store = CheckpointStore()
+        store.initialize()
+
+        # Save checkpoint
+        checkpoint = CheckpointData.create("seed-123", "planning", {"step": 1})
+        result = store.save(checkpoint)
+
+        # Load latest valid checkpoint with automatic rollback
+        result = store.load("seed-123")
+        if result.is_ok:
+            checkpoint = result.value
+    """
+
+    MAX_ROLLBACK_DEPTH = 3
+
+    def __init__(self, base_path: Path | None = None) -> None:
+        """Initialize checkpoint store.
+
+        Args:
+            base_path: Base directory for checkpoints.
+                      Defaults to ~/.ouroboros/data/checkpoints/
+        """
+        if base_path is None:
+            base_path = Path.home() / ".ouroboros" / "data" / "checkpoints"
+        self._base_path = base_path
+
+    def initialize(self) -> None:
+        """Create checkpoint directory if it doesn't exist.
+
+        This method is idempotent - safe to call multiple times.
+        """
+        self._base_path.mkdir(parents=True, exist_ok=True)
+
+    # Filename components used by _get_checkpoint_path:
+    #   "checkpoint_" + <seed> + ".json"         (level 0)
+    #   "checkpoint_" + <seed> + ".json.N"       (level 1-3)
+    # file_lock appends ".lock", so worst-case basename is:
+    #   "checkpoint_" + <seed> + ".json.N.lock"
+    _FILENAME_PREFIX = "checkpoint_"
+    _FILENAME_SUFFIX_WORST = ".json.0.lock"  # longest possible basename suffix
+    _MAX_SEED_LEN = 255 - len(_FILENAME_PREFIX) - len(_FILENAME_SUFFIX_WORST)  # 232
+    # When truncating, reserve space for a collision-resistant hash suffix.
+    _HASH_SUFFIX_LEN = 8  # hex chars from SHA-256
+
+    @staticmethod
+    def _sanitize_seed_id(seed_id: str, *, max_len: int | None = None) -> str:
+        """Sanitize seed_id to prevent path traversal attacks.
+
+        Strips null bytes, removes path separators, Windows-reserved
+        filename characters and parent-directory sequences, and caps
+        length so that the **full** checkpoint
+        filename (prefix + seed + suffix) stays within the 255-byte
+        filesystem limit.  When truncation is needed a SHA-256 hash
+        fragment is appended to keep the mapping collision-resistant.
+
+        Args:
+            seed_id: Raw seed identifier.
+            max_len: Override for maximum sanitized length (used in tests).
+
+        Returns:
+            Sanitized seed identifier safe for use in filenames.
+
+        Raises:
+            ValueError: If seed_id is empty or becomes empty after sanitization.
+        """
+        if not seed_id:
+            raise ValueError("seed_id must not be empty")
+
+        budget = max_len if max_len is not None else CheckpointStore._MAX_SEED_LEN
+
+        # Strip null bytes
+        sanitized = seed_id.replace("\x00", "")
+
+        # Remove parent-directory traversal sequences before stripping separators
+        # so that inputs like "x/../../PWNED" are neutralised.
+        sanitized = sanitized.replace("..", "")
+
+        # Replace path separators AND Windows-reserved filename characters
+        # (: * ? " < > |) with underscores. On POSIX only "/" is illegal in a
+        # filename, but Windows forbids these too; without stripping them a
+        # colon-bearing seed_id (e.g. an MCP cancel-checkpoint id like
+        # "..._cancel:mcp_job:job_<id>") yields an invalid path and the write
+        # fails with WinError 123. See https://github.com/Q00/ouroboros/issues/1155
+        sanitized = re.sub(r'[/\\:*?"<>|]', "_", sanitized)
+
+        # Cap length to the remaining filename budget.
+        # When truncation is required, append a hash suffix for collision resistance.
+        if len(sanitized) > budget:
+            hash_hex = hashlib.sha256(sanitized.encode()).hexdigest()[
+                : CheckpointStore._HASH_SUFFIX_LEN
+            ]
+            truncated_len = budget - CheckpointStore._HASH_SUFFIX_LEN - 1  # 1 for "_"
+            sanitized = f"{sanitized[:truncated_len]}_{hash_hex}"
+
+        # Final check: must still be non-empty after sanitization
+        if not sanitized or not sanitized.strip():
+            raise ValueError(f"seed_id is empty after sanitization (original: {seed_id!r})")
+
+        return sanitized
+
+    def _validate_path_containment(self, path: Path) -> None:
+        """Verify that *path* is inside the checkpoint base directory.
+
+        Args:
+            path: Resolved path to validate.
+
+        Raises:
+            ValueError: If path escapes the base directory.
+        """
+        resolved = path.resolve()
+        base_resolved = self._base_path.resolve()
+        # Use os.path so the check works on all platforms.
+        if not str(resolved).startswith(str(base_resolved) + os.sep) and resolved != base_resolved:
+            raise ValueError(f"Path traversal detected: {resolved} is outside {base_resolved}")
+
+    def save(self, checkpoint: CheckpointData) -> Result[None, PersistenceError]:
+        """Save checkpoint to disk.
+
+        The checkpoint is rotated: existing checkpoints are shifted to .1, .2, .3
+        for rollback support (max 3 levels per NFR11).
+
+        Uses file locking to prevent race conditions during concurrent access.
+        The new checkpoint is serialized to a staged sibling file, flushed,
+        and fsynced — so any process-visible write failure surfaces before a
+        committed file moves (directory entries are not fsynced; power-loss
+        ordering is out of scope) — and the rotate-and-publish step is
+        reversible: a failed save leaves the current checkpoint and the
+        rollback chain exactly as they were (#1830).
+
+        Args:
+            checkpoint: Checkpoint data to save.
+
+        Returns:
+            Result.ok(None) on success, Result.err(PersistenceError) on failure.
+        """
+        try:
+            # Serialize exactly once and validate that snapshot: the live
+            # object's state is caller-visible and mutable, so validating one
+            # read and writing a second would reopen the desync between
+            # payload and hash (#1829). The snapshot below is what gets
+            # written, byte for byte.
+            payload = checkpoint.to_dict()
+            snapshot_hash = _checkpoint_hash(
+                payload["seed_id"],
+                payload["phase"],
+                payload["state"],
+                payload["timestamp"],
+            )
+            if snapshot_hash != payload["hash"]:
+                # Never persist a checkpoint load() would immediately reject:
+                # refusing here keeps the committed chain untouched and
+                # surfaces the mismatch to the caller instead (#1829).
+                return Result.err(
+                    PersistenceError(
+                        "Refusing to save checkpoint with stale integrity hash: "
+                        f"expected {payload['hash']}, got {snapshot_hash}",
+                        operation="write",
+                        details={
+                            "seed_id": checkpoint.seed_id,
+                            "phase": checkpoint.phase,
+                            "integrity_mismatch": True,
+                        },
+                    )
+                )
+
+            checkpoint_path = self._get_checkpoint_path(checkpoint.seed_id)
+
+            # Use file locking to prevent race conditions
+            with _file_lock(checkpoint_path, exclusive=True):
+                # The staged name is constant-length and seed-free so it can
+                # never breach the 255-byte filename budget that the seed
+                # sanitizer enforces for the real checkpoint files.
+                staged = checkpoint_path.with_name(f".tmp-{secrets.token_hex(8)}.json")
+                try:
+                    with staged.open("w") as f:
+                        json.dump(payload, f, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    self._publish_staged_checkpoint(checkpoint.seed_id, staged, checkpoint_path)
+                finally:
+                    # A successful publish consumed the staged file via
+                    # rename; anything still here is failure debris. The
+                    # cleanup itself must never fail a committed save.
+                    try:
+                        staged.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+            return Result.ok(None)
+        except Exception as e:
+            return Result.err(
+                PersistenceError(
+                    f"Failed to save checkpoint: {e}",
+                    operation="write",
+                    details={"seed_id": checkpoint.seed_id, "phase": checkpoint.phase},
+                )
+            )
+
+    def _publish_staged_checkpoint(self, seed_id: str, staged: Path, destination: Path) -> None:
+        """Rotate history and promote the staged file as one reversible step.
+
+        The oldest checkpoint is retired aside rather than deleted and every
+        shift is recorded, so a failure while promoting the staged file
+        undoes the rotation and restores the exact pre-save chain. All moves
+        are same-directory renames.
+        """
+        self._compact_checkpoint_levels(seed_id)
+        oldest = self._get_checkpoint_path(seed_id, self.MAX_ROLLBACK_DEPTH)
+        retired: Path | None = None
+        if oldest.exists():
+            retired = oldest.with_name(f".retire-{secrets.token_hex(8)}.json")
+            os.replace(oldest, retired)
+        shifted: list[tuple[Path, Path]] = []
+        try:
+            for level in range(self.MAX_ROLLBACK_DEPTH - 1, -1, -1):
+                source = self._get_checkpoint_path(seed_id, level)
+                if source.exists():
+                    target = self._get_checkpoint_path(seed_id, level + 1)
+                    os.replace(source, target)
+                    shifted.append((source, target))
+            os.replace(staged, destination)
+        except Exception:
+            # Undo in reverse order; a rename that fails mid-undo aborts the
+            # walk but destroys nothing — every checkpoint still exists at
+            # some level or in the retired file, and load()'s rollback walk
+            # finds the levels.
+            undo_complete = True
+            for source, target in reversed(shifted):
+                try:
+                    os.replace(target, source)
+                except OSError:
+                    undo_complete = False
+                    break
+            # The retired checkpoint may be restored only into a provably
+            # vacated oldest slot. After a partial undo that slot can still
+            # hold an unshifted generation, and restoring over it would
+            # destroy that generation — the retired file then stays on disk
+            # as recoverable debris instead.
+            if retired is not None and retired.exists() and undo_complete and not oldest.exists():
+                try:
+                    os.replace(retired, oldest)
+                except OSError:
+                    pass
+            raise
+        if retired is not None:
+            try:
+                retired.unlink(missing_ok=True)
+            except OSError:
+                # Promotion is the commit point; cleanup debris after a
+                # committed save is preferable to reporting failure and
+                # inviting a retry of a transaction that already happened.
+                pass
+
+    def _compact_checkpoint_levels(self, seed_id: str) -> None:
+        """Slide existing generations down to fill holes in the chain.
+
+        A partially undone save can leave the chain sparse. Rotating a
+        sparse chain would retire the oldest generation while an empty slot
+        remains below it — silently shrinking the rollback window — so every
+        save first compacts the chain. Moves only fill previously empty
+        slots, never overwrite, so a failure here cannot lose a generation.
+        """
+        occupied = [
+            level
+            for level in range(self.MAX_ROLLBACK_DEPTH + 1)
+            if self._get_checkpoint_path(seed_id, level).exists()
+        ]
+        for index, level in enumerate(occupied):
+            if index != level:
+                os.replace(
+                    self._get_checkpoint_path(seed_id, level),
+                    self._get_checkpoint_path(seed_id, index),
+                )
+
+    def load(self, seed_id: str) -> Result[CheckpointData, PersistenceError]:
+        """Load latest valid checkpoint with automatic rollback on corruption.
+
+        Attempts to load the latest checkpoint. If corrupted (hash mismatch or
+        parse error), automatically rolls back to previous checkpoint up to 3 levels.
+        Logs corruption details for debugging.
+
+        Args:
+            seed_id: Seed identifier to load checkpoint for.
+
+        Returns:
+            Result.ok(CheckpointData) with valid checkpoint,
+            Result.err(PersistenceError) if no valid checkpoint found.
+        """
+        # Try loading checkpoints in order: current, .1, .2, .3
+        for level in range(self.MAX_ROLLBACK_DEPTH + 1):
+            result = self._load_checkpoint_level(seed_id, level)
+            if result.is_ok:
+                if level > 0:
+                    # Log successful recovery after rollback
+                    print(f"Recovered checkpoint for {seed_id} from rollback level {level}")
+                return result
+
+            # Log corruption details for debugging
+            error = result.error
+            print(f"Checkpoint corruption at level {level} for {seed_id}: {error.message}")
+
+        # No valid checkpoint found at any level
+        return Result.err(
+            PersistenceError(
+                f"No valid checkpoint found for seed {seed_id} "
+                f"(tried {self.MAX_ROLLBACK_DEPTH + 1} levels)",
+                operation="load",
+                details={"seed_id": seed_id},
+            )
+        )
+
+    def _load_checkpoint_level(
+        self, seed_id: str, level: int
+    ) -> Result[CheckpointData, PersistenceError]:
+        """Load checkpoint at specific rollback level.
+
+        Uses file locking to prevent race conditions during concurrent access.
+
+        Args:
+            seed_id: Seed identifier.
+            level: Rollback level (0=current, 1-3=previous).
+
+        Returns:
+            Result.ok(CheckpointData) if valid, Result.err otherwise.
+        """
+        checkpoint_path = self._get_checkpoint_path(seed_id, level)
+
+        if not checkpoint_path.exists():
+            return Result.err(
+                PersistenceError(
+                    f"Checkpoint not found at level {level}",
+                    operation="read",
+                    details={"seed_id": seed_id, "level": level},
+                )
+            )
+
+        try:
+            # Use shared lock for reading
+            with _file_lock(checkpoint_path, exclusive=False):
+                with checkpoint_path.open("r") as f:
+                    data = json.load(f)
+
+            checkpoint = CheckpointData.from_dict(data)
+
+            # Validate integrity
+            validation_result = checkpoint.validate_integrity()
+            if validation_result.is_err:
+                return Result.err(
+                    PersistenceError(
+                        f"Checkpoint integrity validation failed: {validation_result.error}",
+                        operation="validate",
+                        details={"seed_id": seed_id, "level": level},
+                    )
+                )
+
+            return Result.ok(checkpoint)
+
+        except json.JSONDecodeError as e:
+            return Result.err(
+                PersistenceError(
+                    f"Failed to parse checkpoint JSON: {e}",
+                    operation="parse",
+                    details={"seed_id": seed_id, "level": level},
+                )
+            )
+        except Exception as e:
+            return Result.err(
+                PersistenceError(
+                    f"Failed to load checkpoint: {e}",
+                    operation="read",
+                    details={"seed_id": seed_id, "level": level},
+                )
+            )
+
+    def _rotate_checkpoints(self, seed_id: str) -> None:
+        """Rotate existing checkpoints for rollback support.
+
+        Shifts checkpoints: current -> .1, .1 -> .2, .2 -> .3
+        Oldest checkpoint (.3) is deleted if it exists.
+
+        Args:
+            seed_id: Seed identifier for checkpoint rotation.
+        """
+        # Delete oldest checkpoint (.3) if it exists
+        oldest_path = self._get_checkpoint_path(seed_id, self.MAX_ROLLBACK_DEPTH)
+        if oldest_path.exists():
+            oldest_path.unlink()
+
+        # Shift existing checkpoints
+        for level in range(self.MAX_ROLLBACK_DEPTH - 1, -1, -1):
+            current_path = self._get_checkpoint_path(seed_id, level)
+            if current_path.exists():
+                next_path = self._get_checkpoint_path(seed_id, level + 1)
+                os.replace(current_path, next_path)
+
+    def _get_checkpoint_path(self, seed_id: str, level: int = 0) -> Path:
+        """Get file path for checkpoint at specific rollback level.
+
+        The seed_id is sanitized to prevent path traversal, and the
+        resulting path is validated to stay within the base directory.
+
+        Args:
+            seed_id: Seed identifier.
+            level: Rollback level (0=current, 1-3=previous).
+
+        Returns:
+            Path to checkpoint file.
+
+        Raises:
+            ValueError: If seed_id is invalid or path escapes base directory.
+        """
+        safe_id = self._sanitize_seed_id(seed_id)
+        filename = f"checkpoint_{safe_id}.json"
+        if level > 0:
+            filename = f"checkpoint_{safe_id}.json.{level}"
+        path = self._base_path / filename
+        self._validate_path_containment(path)
+        return path
+
+
+class PeriodicCheckpointer:
+    """Background task for automatic periodic checkpointing.
+
+    Runs a background asyncio task that calls a checkpoint callback
+    at regular intervals (default 5 minutes per AC2).
+
+    Usage:
+        async def checkpoint_callback():
+            # Get current state and save checkpoint
+            checkpoint = CheckpointData.create("seed-123", "planning", state)
+            store.save(checkpoint)
+
+        checkpointer = PeriodicCheckpointer(checkpoint_callback, interval=300)
+        await checkpointer.start()
+
+        # Later, when done
+        await checkpointer.stop()
+    """
+
+    def __init__(
+        self,
+        checkpoint_callback: Callable[[], Awaitable[None]],
+        interval: int = 300,  # 5 minutes default
+    ) -> None:
+        """Initialize periodic checkpointer.
+
+        Args:
+            checkpoint_callback: Async function to call for checkpointing.
+            interval: Interval in seconds between checkpoints (default 300 = 5 min).
+        """
+        self._callback = checkpoint_callback
+        self._interval = interval
+        self._task: asyncio.Task | None = None
+        self._stop_event = asyncio.Event()
+
+    async def start(self) -> None:
+        """Start the periodic checkpointing background task.
+
+        This method is idempotent - calling it multiple times is safe.
+        """
+        if self._task is None or self._task.done():
+            self._stop_event.clear()
+            self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        """Stop the periodic checkpointing background task.
+
+        Waits for the current checkpoint to complete before stopping.
+        """
+        if self._task is not None and not self._task.done():
+            self._stop_event.set()
+            await self._task
+            self._task = None
+
+    async def _run(self) -> None:
+        """Internal background task loop."""
+        while not self._stop_event.is_set():
+            try:
+                # Wait for interval or stop event
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self._interval)
+                # If we get here, stop event was set
+                break
+            except TimeoutError:
+                # Timeout means it's time to checkpoint
+                try:
+                    await self._callback()
+                except Exception as e:
+                    # Log error but continue checkpointing
+                    print(f"Periodic checkpoint failed: {e}")
+
+
+class RecoveryManager:
+    """Manager for workflow recovery on startup.
+
+    Handles loading the latest valid checkpoint and restoring workflow state.
+    Provides recovery status and logging for debugging.
+
+    Usage:
+        store = CheckpointStore()
+        manager = RecoveryManager(store)
+
+        result = await manager.recover("seed-123")
+        if result.is_ok:
+            checkpoint = result.value
+            # Restore workflow state from checkpoint
+    """
+
+    def __init__(self, checkpoint_store: CheckpointStore) -> None:
+        """Initialize recovery manager.
+
+        Args:
+            checkpoint_store: CheckpointStore instance for loading checkpoints.
+        """
+        self._store = checkpoint_store
+
+    async def recover(self, seed_id: str) -> Result[CheckpointData | None, PersistenceError]:
+        """Recover workflow state from latest valid checkpoint.
+
+        Attempts to load the latest checkpoint. If not found or corrupted,
+        uses automatic rollback. Returns None if no checkpoint exists
+        (normal for first run).
+
+        Args:
+            seed_id: Seed identifier to recover.
+
+        Returns:
+            Result.ok(CheckpointData) if checkpoint loaded,
+            Result.ok(None) if no checkpoint exists (normal),
+            Result.err(PersistenceError) if recovery failed after rollback.
+        """
+        result = self._store.load(seed_id)
+
+        if result.is_err:
+            error = result.error
+            # Check if error is due to no checkpoint (normal for first run)
+            # Match both "not found" and "no valid checkpoint found"
+            error_msg_lower = error.message.lower()
+            if "not found" in error_msg_lower or "no valid checkpoint found" in error_msg_lower:
+                print(f"No checkpoint found for {seed_id} - starting fresh")
+                return Result.ok(None)
+
+            # Other errors indicate corruption/recovery failure
+            print(f"Recovery failed for {seed_id}: {error.message}")
+            return Result.err(error)
+
+        checkpoint = result.value
+        print(
+            f"Recovered checkpoint for {seed_id} "
+            f"from phase '{checkpoint.phase}' "
+            f"at {checkpoint.timestamp.isoformat()}"
+        )
+        return Result.ok(checkpoint)

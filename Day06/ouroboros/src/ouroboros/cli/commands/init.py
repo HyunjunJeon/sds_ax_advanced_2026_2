@@ -1,0 +1,1243 @@
+"""Init command for starting interactive interview.
+
+This command initiates the Big Bang phase interview process.
+Supports both LiteLLM (external API) and Claude Code (Max Plan) modes.
+"""
+
+import asyncio
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import Enum, auto
+from pathlib import Path
+from typing import Annotated
+
+import click
+from rich.prompt import Confirm, Prompt
+import structlog
+import typer
+import yaml
+
+from ouroboros.bigbang.ambiguity import (
+    AMBIGUITY_THRESHOLD,
+    AmbiguityScore,
+    AmbiguityScorer,
+    get_completion_floor_failures,
+    qualifies_for_seed_completion,
+)
+from ouroboros.bigbang.interview import (
+    MIN_ROUNDS_BEFORE_EARLY_EXIT,
+    InterviewEngine,
+    InterviewState,
+    InterviewStatus,
+)
+from ouroboros.bigbang.seed_generator import SeedGenerator
+from ouroboros.cli.formatters import console
+from ouroboros.cli.formatters.panels import print_error, print_info, print_success, print_warning
+from ouroboros.cli.formatters.prompting import multiline_prompt_async
+from ouroboros.cli.logging_setup import configure_cli_logging
+from ouroboros.config import get_clarification_model, get_llm_backend
+from ouroboros.core.errors import ProviderError
+from ouroboros.core.hitl_contract import (
+    HumanInputKind,
+    HumanInputRequest,
+    HumanInputResponse,
+    HumanInputResponseKind,
+    HumanInputRiskClass,
+    HumanInputSource,
+)
+from ouroboros.core.initial_context import (
+    load_pm_seed_as_context as _load_pm_seed_as_context_result,
+)
+from ouroboros.core.initial_context import (
+    resolve_initial_context_input,
+)
+from ouroboros.events.hitl import (
+    create_hitl_answered_event,
+    create_hitl_requested_event,
+)
+from ouroboros.package_profiles import (
+    PublicAgentRuntimeBackend as AgentRuntimeBackend,
+)
+from ouroboros.package_profiles import (
+    public_runtime_backend,
+)
+from ouroboros.providers import create_llm_adapter, resolve_llm_backend
+from ouroboros.providers.base import LLMAdapter
+
+log = structlog.get_logger(__name__)
+
+# Retry budget for the per-round scorer, which runs between two interactive
+# prompts. ``AmbiguityScorer`` defaults to 10 attempts with doubling token
+# budgets; a person waiting at a prompt should see the score-blind fallback
+# well before that. Matches the MCP live-scoring budget.
+_LOOP_AMBIGUITY_MAX_RETRIES = 3
+
+
+class SeedGenerationResult(Enum):
+    """Result of seed generation attempt."""
+
+    SUCCESS = auto()
+    CANCELLED = auto()
+    CONTINUE_INTERVIEW = auto()
+
+
+class LLMBackend(str, Enum):  # noqa: UP042
+    """Supported interview/seed LLM backends."""
+
+    CLAUDE_CODE = "claude_code"
+    LITELLM = "litellm"
+    CODEX = "codex"
+    COPILOT = "copilot"
+    OPENCODE = "opencode"
+    GEMINI = "gemini"
+    GOOSE = "goose"
+    KIRO = "kiro"
+    PI = "pi"
+    OMP = "omp"
+    ZCODE = "zcode"
+    DSH = "dsh"
+
+
+class _DefaultStartGroup(typer.core.TyperGroup):
+    """TyperGroup that falls back to 'start' when no subcommand matches.
+
+    This enables the shorthand `ouroboros init "Build a REST API"` which is
+    equivalent to `ouroboros init start "Build a REST API"`.
+    """
+
+    default_cmd_name: str = "start"
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        if args and args[0] not in self.commands and not args[0].startswith("-"):
+            args = [self.default_cmd_name, *args]
+        return super().parse_args(ctx, args)
+
+
+app = typer.Typer(
+    name="init",
+    help="Start interactive interview to refine requirements.",
+    no_args_is_help=False,
+    cls=_DefaultStartGroup,
+)
+
+
+def _make_message_callback(debug: bool):
+    """Create message callback for streaming output.
+
+    Args:
+        debug: If True, show thinking and tool use.
+
+    Returns:
+        Callback function or None.
+    """
+    if not debug:
+        return None
+
+    def callback(msg_type: str, content: str) -> None:
+        if msg_type == "thinking":
+            # Take first line only, truncate if needed
+            first_line = content.split("\n")[0].strip()
+            display = first_line[:100] + "..." if len(first_line) > 100 else first_line
+            if display:
+                console.print(f"  [dim]💭 {display}[/dim]")
+        elif msg_type == "tool_started":
+            # External chat renderers and debug terminals can show tool/MCP progress
+            # before completion when providers stream start events.
+            console.print(f"  [cyan]▶ {content}[/cyan]")
+        elif msg_type == "tool":
+            # Tool info now includes details like "Read: /path/to/file"
+            console.print(f"  [yellow]🔧 {content}[/yellow]")
+
+    return callback
+
+
+def _resolve_init_llm_backend(use_orchestrator: bool, backend: str | None = None) -> str:
+    """Resolve the interview LLM backend for ``init start``.
+
+    Explicit ``--llm-backend`` wins. ``--orchestrator`` remains a
+    compatibility shortcut for Claude Code. Without either flag, respect the
+    persisted ``llm.backend`` config instead of forcing LiteLLM.
+    """
+    if backend:
+        return backend
+    if use_orchestrator:
+        return "claude_code"
+    return get_llm_backend()
+
+
+def _get_adapter(
+    use_orchestrator: bool,
+    backend: str | None = None,
+    for_interview: bool = False,
+    debug: bool = False,
+) -> LLMAdapter:
+    """Get the appropriate LLM adapter.
+
+    Args:
+        use_orchestrator: If True, default to Claude Code for compatibility.
+        backend: Optional explicit LLM backend override.
+        for_interview: If True, enable Read/Glob/Grep tools for codebase exploration.
+        debug: If True, show streaming messages (thinking, tool use).
+
+    Returns:
+        LLM adapter instance.
+    """
+    resolved_backend = _resolve_init_llm_backend(use_orchestrator, backend)
+
+    if for_interview:
+        # Interview mode: request the interview-specific permission policy and
+        # debug/tool callback behavior across all backends that support it.
+        return create_llm_adapter(
+            backend=resolved_backend,
+            use_case="interview",
+            allowed_tools=None,
+            max_turns=5,
+            on_message=_make_message_callback(debug),
+            cwd=Path.cwd(),
+        )
+
+    return create_llm_adapter(backend=resolved_backend, cwd=Path.cwd())
+
+
+def _interview_hitl_request(
+    state: InterviewState,
+    *,
+    round_number: int,
+    question: str,
+    created_at: datetime | None = None,
+) -> HumanInputRequest:
+    return HumanInputRequest(
+        request_id=f"hitl_interview_{state.interview_id}_{round_number}",
+        session_id=state.interview_id,
+        run_id=state.interview_id,
+        invocation_id=f"interview-round-{round_number}",
+        created_by="ouroboros.init",
+        kind=HumanInputKind.FREE_TEXT,
+        source=HumanInputSource.INTERVIEW,
+        risk_class=HumanInputRiskClass.LOW,
+        question=question,
+        resume_target=f"init:interview:{state.interview_id}:round:{round_number}",
+        title=f"Interview round {round_number}",
+        surface="cli.init.interview",
+        created_at=created_at or datetime.now(UTC),
+    )
+
+
+def _interview_hitl_response(
+    request: HumanInputRequest,
+    response: str,
+    *,
+    received_at: datetime | None = None,
+) -> HumanInputResponse:
+    return HumanInputResponse(
+        request_id=request.request_id,
+        session_id=request.session_id,
+        run_id=request.run_id,
+        invocation_id=request.invocation_id,
+        actor="local-user",
+        response_kind=HumanInputResponseKind.TEXT,
+        text=response,
+        surface="cli.init.interview",
+        received_at=received_at or datetime.now(UTC),
+    )
+
+
+async def _append_hitl_events(event_store, events: list) -> bool:
+    if event_store is None:
+        return True
+    try:
+        await event_store.append_batch(events)
+    except Exception as exc:  # noqa: BLE001 - HITL telemetry must not block CLI init.
+        print_warning(f"HITL telemetry persistence failed; continuing without it: {exc}")
+        return False
+    return True
+
+
+async def _get_init_event_store():
+    from ouroboros.persistence.event_store import EventStore
+
+    event_store = None
+    try:
+        event_store = EventStore()
+        await event_store.initialize()
+    except Exception as exc:  # noqa: BLE001 - init interview must not depend on telemetry.
+        if event_store is not None:
+            try:
+                await event_store.close()
+            except Exception:
+                pass
+        print_warning(f"HITL telemetry is unavailable; continuing without it: {exc}")
+        return None
+    return event_store
+
+
+async def _refresh_ambiguity(
+    engine: InterviewEngine,
+    state: InterviewState,
+    scorer: AmbiguityScorer | None,
+) -> AmbiguityScore | None:
+    """Score the in-progress interview and persist the snapshot on state.
+
+    The stored snapshot is what turns on the seed-closer perspective and the
+    ambiguity block in the question prompt, so a failed score must clear it
+    rather than leave a stale one behind (the same contract the MCP live
+    scoring path follows).
+    """
+    if scorer is None:
+        return None
+
+    with console.status("[cyan]Measuring ambiguity...[/]", spinner="dots"):
+        score_result = await scorer.score(state)
+
+    if score_result.is_err:
+        state.clear_stored_ambiguity()
+        log.warning(
+            "cli.init.live_ambiguity_failed",
+            interview_id=state.interview_id,
+            error=str(score_result.error),
+        )
+    else:
+        score = score_result.value
+        state.store_ambiguity(
+            score=score.overall_score,
+            breakdown=score.breakdown.model_dump(mode="json"),
+        )
+
+    save_result = await engine.save_state(state)
+    if save_result.is_err:
+        log.warning(
+            "cli.init.persist_live_ambiguity_failed",
+            interview_id=state.interview_id,
+            error=str(save_result.error),
+        )
+
+    return None if score_result.is_err else score_result.value
+
+
+@dataclass(frozen=True, slots=True)
+class InterviewLoopOutcome:
+    """How the interview loop ended, not just where it left the state.
+
+    ``seed_generation_approved`` is true only when the user answered the
+    score-aware "proceed to Seed generation?" confirmation. The outer flow
+    consumes it instead of asking the same question a second time, so one
+    affirmative answer means what it says.
+    """
+
+    state: InterviewState
+    seed_generation_approved: bool = False
+    # The score the approval was given for. Reused by seed generation so the
+    # answer cannot be undone by a second, independently sampled score.
+    approved_score: AmbiguityScore | None = None
+
+
+async def _run_interview_loop(
+    engine: InterviewEngine,
+    state: InterviewState,
+    *,
+    event_store=None,
+    disabled_event_stores: set[int] | None = None,
+    scorer: AmbiguityScorer | None = None,
+) -> InterviewLoopOutcome:
+    """Run the interview question loop until completion or user exit.
+
+    Rounds 1-2 auto-continue to gather minimum context. From
+    ``MIN_ROUNDS_BEFORE_EARLY_EXIT`` on, each round ends by measuring ambiguity
+    and asking the question that score implies:
+
+    - Qualifying score (overall threshold *and* every component floor, brownfield
+      aware): "proceed to Seed generation?". Approving ends the interview and is
+      reported in the outcome, so the caller starts generation with the same
+      score instead of asking again or sampling a second one. Declining keeps
+      the interview open.
+    - Otherwise, or with no scorer: "Continue with more questions?", where
+      declining completes the interview without approving generation.
+
+    A scoring failure clears any stored snapshot and falls back to the
+    score-blind prompt for that round rather than deciding on a stale score.
+
+    Args:
+        engine: Interview engine instance.
+        state: Current interview state.
+        scorer: Optional ambiguity scorer. When omitted, the loop keeps the
+            score-blind confirmation prompt.
+
+    Returns:
+        ``InterviewLoopOutcome``: the updated state, whether the user approved
+        Seed generation at the score-aware prompt, and the score they approved.
+    """
+    seed_approved = False
+    approved_score: AmbiguityScore | None = None
+    while not state.is_complete:
+        current_round = state.current_round_number
+        console.print(f"[bold]Round {current_round}[/]")
+
+        # Generate question
+        with console.status("[cyan]Generating question...[/]", spinner="dots"):
+            question_result = await engine.ask_next_question(state)
+
+        if question_result.is_err:
+            print_error(f"Failed to generate question: {question_result.error.message}")
+            should_retry = Confirm.ask("Retry?", default=True)
+            if not should_retry:
+                state.status = InterviewStatus.ABORTED
+                state.mark_updated()
+                save_result = await engine.save_state(state)
+                if save_result.is_err:
+                    print_error(
+                        "Failed to persist aborted interview state; do not resume this session: "
+                        f"{save_result.error.message}"
+                    )
+                    raise typer.Exit(code=1)
+                break
+            continue
+
+        question = question_result.value
+
+        # Display question
+        console.print()
+        console.print(f"[bold yellow]Q:[/] {question}")
+        console.print()
+
+        hitl_request = _interview_hitl_request(state, round_number=current_round, question=question)
+
+        # Get user response (multiline-safe for paste)
+        response = await multiline_prompt_async("Your response")
+
+        if not response.strip():
+            print_error("Response cannot be empty. Please try again.")
+            continue
+
+        # Record and save the accepted response before best-effort HITL telemetry
+        # touches SQLite. CLI init's durable interview state must not wait behind
+        # telemetry locks/retries; HITL events are emitted only after the
+        # interview transition is durably saved.
+        record_result = await engine.record_response(state, response, question)
+        if record_result.is_err:
+            print_error(f"Failed to record response: {record_result.error.message}")
+            continue
+
+        state = record_result.value
+
+        # Save state immediately after recording
+        save_result = await engine.save_state(state)
+        if save_result.is_err:
+            print_error(f"Warning: Failed to save state: {save_result.error.message}")
+        elif not await _append_hitl_events(
+            event_store,
+            [
+                create_hitl_requested_event(hitl_request),
+                create_hitl_answered_event(
+                    hitl_request,
+                    _interview_hitl_response(hitl_request, response),
+                ),
+            ],
+        ):
+            if disabled_event_stores is not None and event_store is not None:
+                disabled_event_stores.add(id(event_store))
+            event_store = None
+
+        console.print()
+
+        # Tiered confirmation logic
+        if current_round >= MIN_ROUNDS_BEFORE_EARLY_EXIT:
+            score = await _refresh_ambiguity(engine, state, scorer)
+            if score is not None:
+                console.print(
+                    f"[muted]Ambiguity score: {score.overall_score:.2f} "
+                    f"(Seed threshold: <= {AMBIGUITY_THRESHOLD})[/]"
+                )
+            if score is not None and qualifies_for_seed_completion(
+                score,
+                is_brownfield=state.is_brownfield,
+            ):
+                seed_approved = Confirm.ask(
+                    "[bold cyan]Ambiguity is low enough — proceed to Seed generation?[/]",
+                    default=True,
+                )
+                approved_score = score if seed_approved else None
+                should_continue = not seed_approved
+            else:
+                should_continue = Confirm.ask(
+                    "Continue with more questions?",
+                    default=True,
+                )
+            if not should_continue:
+                complete_result = await engine.complete_interview(state)
+                if complete_result.is_ok:
+                    state = complete_result.value
+                await engine.save_state(state)
+                break
+
+    return InterviewLoopOutcome(
+        state=state,
+        seed_generation_approved=seed_approved,
+        approved_score=approved_score,
+    )
+
+
+def _raise_for_aborted_interview(state: InterviewState) -> None:
+    """Stop the CLI before an aborted interview can be resumed or finalized."""
+    if state.status != InterviewStatus.ABORTED:
+        return
+    print_error(
+        "Interview stopped before completion after question generation failed. "
+        f"Session {state.interview_id} is terminal with status 'aborted'; start a new "
+        "interview instead of resuming this session."
+    )
+    raise typer.Exit(code=1)
+
+
+async def _run_interview(
+    initial_context: str,
+    resume_id: str | None = None,
+    state_dir: Path | None = None,
+    use_orchestrator: bool = False,
+    debug: bool = False,
+    workflow_runtime_backend: str | None = None,
+    llm_backend: str | None = None,
+) -> None:
+    """Run the interview process.
+
+    Args:
+        initial_context: Initial context or idea for the interview.
+        resume_id: Optional interview ID to resume.
+        state_dir: Optional custom state directory.
+        use_orchestrator: If True, use Claude Code (Max Plan) instead of LiteLLM.
+        workflow_runtime_backend: Optional agent runtime backend for the workflow handoff.
+        llm_backend: Optional LLM backend override for interview and seed generation.
+    """
+    # Initialize components
+    llm_adapter = _get_adapter(
+        use_orchestrator,
+        backend=llm_backend,
+        for_interview=True,
+        debug=debug,
+    )
+    engine = InterviewEngine(
+        llm_adapter=llm_adapter,
+        state_dir=state_dir or Path.home() / ".ouroboros" / "data",
+        model=get_clarification_model(llm_backend),
+    )
+    # Bounded retries: the loop scorer runs between two interactive prompts,
+    # so an unresolvable scoring failure must surface, not retry forever.
+    loop_scorer = AmbiguityScorer(
+        llm_adapter=llm_adapter,
+        model=get_clarification_model(llm_backend),
+        max_retries=_LOOP_AMBIGUITY_MAX_RETRIES,
+    )
+
+    # Load or start interview
+    if resume_id:
+        print_info(f"Resuming interview: {resume_id}")
+        state_result = await engine.load_state(resume_id)
+        if state_result.is_err:
+            print_error(f"Failed to load interview: {state_result.error.message}")
+            raise typer.Exit(code=1)
+        state = state_result.value
+    else:
+        print_info("Starting new interview session...")
+        state_result = await engine.start_interview(initial_context)
+        if state_result.is_err:
+            print_error(f"Failed to start interview: {state_result.error.message}")
+            raise typer.Exit(code=1)
+        state = state_result.value
+
+    _raise_for_aborted_interview(state)
+
+    console.print()
+    console.print(f"[bold cyan]Interview Session: {state.interview_id}[/]")
+    console.print("[muted]No round limit - you decide when to stop[/]")
+    console.print()
+
+    # Run initial interview loop
+    event_store = await _get_init_event_store()
+    disabled_event_stores: set[int] = set()
+
+    try:
+        loop_event_store = None if event_store is None else event_store
+        outcome = await _run_interview_loop(
+            engine,
+            state,
+            event_store=loop_event_store,
+            disabled_event_stores=disabled_event_stores,
+            scorer=loop_scorer,
+        )
+        state = outcome.state
+
+        # Outer loop for retry on high ambiguity
+        while True:
+            if state.status == InterviewStatus.ABORTED:
+                console.print()
+                _raise_for_aborted_interview(state)
+
+            # Interview complete
+            console.print()
+            print_success("Interview completed!")
+            console.print(f"[muted]Total rounds: {len(state.rounds)}[/]")
+            console.print(f"[muted]Interview ID: {state.interview_id}[/]")
+
+            # Save final state
+            save_result = await engine.save_state(state)
+            if save_result.is_ok:
+                console.print(f"[muted]State saved to: {save_result.value}[/]")
+
+            console.print()
+
+            # Ask if user wants to proceed to Seed generation — unless the
+            # loop already asked it. Approving the score-aware prompt and then
+            # being asked the same thing again would make that answer mean
+            # nothing, and a decline at the second prompt would contradict the
+            # action the first one named.
+            should_generate_seed = outcome.seed_generation_approved or Confirm.ask(
+                "[bold cyan]Proceed to generate Seed specification?[/]",
+                default=True,
+            )
+
+            if not should_generate_seed:
+                console.print(
+                    "[muted]You can resume later with:[/] "
+                    f"[bold]ouroboros init start --resume {state.interview_id}[/]"
+                )
+                return
+
+            # Generate Seed
+            seed_path, result = await _generate_seed_from_interview(
+                state,
+                llm_adapter,
+                llm_backend,
+                engine=engine,
+                approved_score=outcome.approved_score,
+            )
+
+            if result == SeedGenerationResult.CONTINUE_INTERVIEW:
+                # Re-open interview for more questions
+                console.print()
+                print_info("Continuing interview to reduce ambiguity...")
+                state.status = InterviewStatus.IN_PROGRESS
+                await engine.save_state(state)  # Save status change immediately
+
+                # Continue interview loop (reusing the same helper)
+                loop_event_store = (
+                    None
+                    if event_store is None or id(event_store) in disabled_event_stores
+                    else event_store
+                )
+                outcome = await _run_interview_loop(
+                    engine,
+                    state,
+                    event_store=loop_event_store,
+                    disabled_event_stores=disabled_event_stores,
+                    scorer=loop_scorer,
+                )
+                state = outcome.state
+                continue
+
+            if result == SeedGenerationResult.CANCELLED:
+                return
+
+            # Success - proceed to workflow
+            break
+
+        # Ask if user wants to start workflow
+        console.print()
+        should_start_workflow = Confirm.ask(
+            "[bold cyan]Start workflow now?[/]",
+            default=True,
+        )
+
+        if should_start_workflow:
+            await _start_workflow(
+                seed_path,
+                runtime_backend=workflow_runtime_backend,
+                project_fallback_dir=Path.cwd(),
+            )
+
+    finally:
+        if event_store is not None:
+            try:
+                await event_store.close()
+            except Exception:
+                pass
+
+
+async def _generate_seed_from_interview(
+    state: InterviewState,
+    llm_adapter: LLMAdapter,
+    llm_backend: str | None = None,
+    *,
+    engine: InterviewEngine,
+    approved_score: AmbiguityScore | None = None,
+) -> tuple[Path | None, SeedGenerationResult]:
+    """Generate Seed from completed interview.
+
+    Args:
+        state: Completed interview state.
+        llm_adapter: LLM adapter for scoring and generation.
+        engine: Interview engine that owns durable state persistence.
+        approved_score: The score the user already approved for generation, for
+            the same answers. Reused instead of sampling a second score, which
+            could disagree and drop the user into the "too ambiguous" menu right
+            after they approved generation.
+
+    Returns:
+        Tuple of (path to generated seed file or None, result status).
+    """
+    console.print()
+    console.print("[bold cyan]Generating Seed specification...[/]")
+
+    # Step 1: Calculate ambiguity score
+    if approved_score is not None:
+        ambiguity_score = approved_score
+    else:
+        with console.status("[cyan]Calculating ambiguity score...[/]", spinner="dots"):
+            scorer = AmbiguityScorer(
+                llm_adapter=llm_adapter,
+                model=get_clarification_model(llm_backend),
+            )
+            score_result = await scorer.score(state)
+
+        if score_result.is_err:
+            print_error(f"Failed to calculate ambiguity: {score_result.error.message}")
+            return None, SeedGenerationResult.CANCELLED
+
+        ambiguity_score = score_result.value
+    console.print(f"[muted]Ambiguity score: {ambiguity_score.overall_score:.2f}[/]")
+
+    # Persist the evaluation like the MCP path does (#1901): without this the
+    # state file reads ambiguity_score: null and the score only survives in
+    # rotating logs. A save failure must never block seed generation.
+    state.store_ambiguity(
+        score=ambiguity_score.overall_score,
+        breakdown=ambiguity_score.breakdown.model_dump(mode="json"),
+    )
+    save_result = await engine.save_state(state)
+    if save_result.is_err:
+        log.warning(
+            "cli.init.persist_ambiguity_failed",
+            interview_id=state.interview_id,
+            error=str(save_result.error),
+        )
+
+    # One predicate for one decision. The loop's confirmation already asks
+    # whether the interview is seed-ready using overall ambiguity *and* the
+    # per-component floors; checking only the overall score here let a score
+    # the loop had just classified as not ready walk into generation through
+    # the outer confirmation, unforced and without the warning that exists for
+    # exactly that case.
+    floor_failures = get_completion_floor_failures(
+        ambiguity_score,
+        is_brownfield=state.is_brownfield,
+    )
+    seed_ready = qualifies_for_seed_completion(
+        ambiguity_score,
+        is_brownfield=state.is_brownfield,
+    )
+
+    if not seed_ready:
+        if ambiguity_score.is_ready_for_seed and floor_failures:
+            # Naming the overall score here would read as a contradiction: it
+            # is under the threshold. The blocked dimensions are the reason.
+            print_warning(
+                f"Some requirement dimensions are still unclear: {'; '.join(floor_failures)}."
+            )
+        else:
+            print_warning(
+                f"Ambiguity score ({ambiguity_score.overall_score:.2f}) is too high. "
+                "Consider more interview rounds to clarify requirements."
+            )
+        console.print()
+        console.print("[bold]What would you like to do?[/]")
+        console.print("  [cyan]1[/] - Continue interview with more questions")
+        console.print("  [cyan]2[/] - Generate Seed anyway (force)")
+        console.print("  [cyan]3[/] - Cancel")
+        console.print()
+
+        choice = Prompt.ask(
+            "[yellow]Select option[/]",
+            choices=["1", "2", "3"],
+            default="1",
+        )
+
+        if choice == "1":
+            # Reopening bypasses record_response's reopen contract, so the
+            # snapshot persisted above must be invalidated here: an in-progress
+            # interview must never carry a live score.
+            state.clear_stored_ambiguity()
+            clear_result = await engine.save_state(state)
+            if clear_result.is_err:
+                log.warning(
+                    "cli.init.clear_ambiguity_failed",
+                    interview_id=state.interview_id,
+                    error=str(clear_result.error),
+                )
+            return None, SeedGenerationResult.CONTINUE_INTERVIEW
+        elif choice == "3":
+            return None, SeedGenerationResult.CANCELLED
+        # choice == "2" falls through to generate anyway
+
+    # Step 2: Generate Seed
+    with console.status("[cyan]Generating Seed from interview...[/]", spinner="dots"):
+        generator = SeedGenerator(
+            llm_adapter=llm_adapter,
+            model=get_clarification_model(llm_backend),
+        )
+        seed_result = await generator.generate(
+            state,
+            ambiguity_score,
+            force=not seed_ready,
+        )
+
+    if seed_result.is_err:
+        error = seed_result.error
+        if isinstance(error, ProviderError):
+            print_error(f"Failed to generate Seed: {error.format_details()}")
+        else:
+            print_error(f"Failed to generate Seed: {error.message}")
+        return None, SeedGenerationResult.CANCELLED
+
+    seed = seed_result.value
+
+    # Step 3: Save Seed
+    seed_path = Path.home() / ".ouroboros" / "seeds" / f"{seed.metadata.seed_id}.yaml"
+    save_result = await generator.save_seed(seed, seed_path)
+
+    if save_result.is_err:
+        print_error(f"Failed to save Seed: {save_result.error.message}")
+        return None, SeedGenerationResult.CANCELLED
+
+    print_success(f"Seed generated: {seed_path}")
+    return seed_path, SeedGenerationResult.SUCCESS
+
+
+async def _start_workflow(
+    seed_path: Path,
+    parallel: bool = True,
+    runtime_backend: str | None = None,
+    project_fallback_dir: Path | None = None,
+) -> None:
+    """Start workflow from generated seed.
+
+    Args:
+        seed_path: Path to the seed YAML file.
+        parallel: Execute independent ACs in parallel. Default: True.
+        runtime_backend: Optional runtime backend for orchestrator execution.
+        project_fallback_dir: Directory to build in when the Seed does not say
+            where it belongs. An interview is conducted from the project it is
+            about, so the invocation directory stands in for the Seed file's
+            folder — otherwise a Seed written to ``~/.ouroboros/seeds`` makes
+            the Seed store the workspace. Seed metadata and a valid brownfield
+            target still win; the run command weighs all of that in one place.
+    """
+    console.print()
+    console.print("[bold cyan]Starting workflow...[/]")
+
+    # One execution path, the same one `ouroboros run workflow` takes by
+    # default. The previous non-orchestrator branch printed "not yet
+    # implemented" and returned, so answering yes to "Start workflow now?"
+    # did nothing unless the caller had also passed --orchestrator.
+    #
+    # Nothing is caught here. `_run_orchestrator` signals every failure —
+    # unloadable Seed, unsafe project path, workspace error, failed execution —
+    # as `typer.Exit(1)` and has no zero-code exit to absorb, so catching it
+    # printed the error and still finished `init start` successfully: a caller
+    # in a script could not tell a built product from a failed one.
+    #
+    # `KeyboardInterrupt` is not caught either, but that is about ownership, not
+    # exit codes. The command wrapper below still answers Ctrl+C with exit 0 and
+    # "Interview interrupted. Progress has been saved.", which is the policy for
+    # an interactive command; the point is that one place decides it instead of
+    # this handoff printing a competing line on the way there.
+    from ouroboros.cli.commands.run import _run_orchestrator
+
+    await _run_orchestrator(
+        seed_path,
+        resume_session=None,
+        parallel=parallel,
+        runtime_backend=runtime_backend,
+        project_fallback_dir=project_fallback_dir,
+    )
+
+
+def _find_pm_seeds(seeds_dir: Path | None = None) -> list[Path]:
+    """Find all pm_seed YAML files in the seeds directory.
+
+    Args:
+        seeds_dir: Directory to scan. Defaults to ~/.ouroboros/seeds/.
+
+    Returns:
+        List of paths to pm_seed files (JSON or YAML), sorted by modification time (newest first).
+    """
+    seeds_dir = seeds_dir or Path.home() / ".ouroboros" / "seeds"
+    if not seeds_dir.is_dir():
+        return []
+    # Support both JSON (new) and YAML (legacy) PM seed formats
+    pm_seeds = sorted(
+        list(seeds_dir.glob("pm_seed_*.json")) + list(seeds_dir.glob("pm_seed_*.yaml")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return pm_seeds
+
+
+def _has_dev_seed(seeds_dir: Path | None = None) -> bool:
+    """Check if any dev seed (non-PM) exists in the seeds directory.
+
+    Looks for seed.json or any YAML seed file that is NOT a pm_seed.
+
+    Args:
+        seeds_dir: Directory to check. Defaults to ~/.ouroboros/seeds/.
+
+    Returns:
+        True if a dev seed file exists.
+    """
+    seeds_dir = seeds_dir or Path.home() / ".ouroboros" / "seeds"
+    if not seeds_dir.is_dir():
+        return False
+    # Check for seed.json
+    if (seeds_dir / "seed.json").exists():
+        return True
+    # Check for any non-pm seed YAML files
+    return any(not yaml_file.name.startswith("pm_seed_") for yaml_file in seeds_dir.glob("*.yaml"))
+
+
+def _display_pm_seed_info(seed_path: Path) -> dict[str, str]:
+    """Read and display summary info for a PM seed file.
+
+    Args:
+        seed_path: Path to the pm_seed YAML file.
+
+    Returns:
+        Dict with 'name', 'goal', and 'pm_id' extracted from the file.
+        Falls back to defaults if the file is malformed.
+    """
+    try:
+        with open(seed_path) as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            raise ValueError("PM seed file is not a YAML mapping")
+        name = data.get("product_name", "") or "Unnamed"
+        goal = data.get("goal", "") or "No goal specified"
+        pm_id = data.get("pm_id", seed_path.stem)
+    except (yaml.YAMLError, OSError, ValueError, AttributeError):
+        name = seed_path.stem
+        goal = "No goal specified"
+        pm_id = seed_path.stem
+    return {"name": name, "goal": goal, "pm_id": pm_id}
+
+
+def _notify_pm_seed_detected(pm_seeds: list[Path]) -> None:
+    """Display a prominent notification that PM seed(s) were auto-detected.
+
+    Shows a bordered panel with seed details so the user clearly sees
+    that PM output is available for use as dev interview context.
+
+    Args:
+        pm_seeds: List of detected PM seed file paths.
+    """
+    console.print()
+    console.print("[bold cyan]╔══════════════════════════════════════════════╗[/]")
+    console.print(
+        "[bold cyan]║[/]  [bold yellow]PM Seed Auto-Detected[/]                      [bold cyan]║[/]"
+    )
+    console.print("[bold cyan]╚══════════════════════════════════════════════╝[/]")
+    console.print()
+
+    for seed_path in pm_seeds:
+        info = _display_pm_seed_info(seed_path)
+        goal_display = info["goal"][:80] + "..." if len(info["goal"]) > 80 else info["goal"]
+        console.print(f"  [bold]{info['name']}[/] [dim]({info['pm_id']})[/]")
+        console.print(f"  [dim]{goal_display}[/]")
+        console.print()
+
+    console.print(
+        "[dim]A PM seed contains product requirements from a prior PM interview.\n"
+        "Using it as initial context gives the dev interview a head start.[/]"
+    )
+    console.print()
+
+
+def _prompt_pm_seed_selection(pm_seeds: list[Path]) -> Path | None:
+    """Prompt user to select a PM seed to use as initial context.
+
+    Shows a notification banner, lists available seeds, and asks the user
+    to pick one or skip. For a single seed, offers a simple yes/no confirmation.
+
+    Args:
+        pm_seeds: List of available PM seed paths.
+
+    Returns:
+        Selected PM seed path, or None if user declines.
+    """
+    _notify_pm_seed_detected(pm_seeds)
+
+    if len(pm_seeds) == 1:
+        # Single seed — simple yes/no confirmation
+        use_it = Confirm.ask(
+            "[yellow]Use this PM seed as initial context for the dev interview?[/]",
+            default=True,
+        )
+        return pm_seeds[0] if use_it else None
+
+    # Multiple seeds — numbered selection
+    console.print("[bold]Available PM seeds:[/]")
+    console.print()
+    for i, seed_path in enumerate(pm_seeds, 1):
+        info = _display_pm_seed_info(seed_path)
+        goal_display = info["goal"][:80] + "..." if len(info["goal"]) > 80 else info["goal"]
+        console.print(f"  [cyan]{i}[/] - [bold]{info['name']}[/] ({info['pm_id']})")
+        console.print(f"      {goal_display}")
+    console.print("  [cyan]0[/] - Skip (start fresh interview)")
+    console.print()
+
+    choice = Prompt.ask(
+        "[yellow]Select PM seed[/]",
+        choices=[str(i) for i in range(len(pm_seeds) + 1)],
+        default="1",
+    )
+
+    idx = int(choice)
+    if idx == 0:
+        return None
+    return pm_seeds[idx - 1]
+
+
+def _load_pm_seed_as_context(seed_path: Path) -> str:
+    """Load a PM seed YAML and convert to initial_context string.
+
+    Args:
+        seed_path: Path to the pm_seed YAML file.
+
+    Returns:
+        YAML-formatted string for use as dev interview initial_context.
+    """
+    result = _load_pm_seed_as_context_result(seed_path)
+    if result.is_err:
+        raise ValueError(str(result.error))
+    return result.value
+
+
+@app.command()
+def start(
+    context: Annotated[
+        str | None,
+        typer.Argument(help="Initial context or idea (interactive prompt if not provided)."),
+    ] = None,
+    resume: Annotated[
+        str | None,
+        typer.Option(
+            "--resume",
+            "-r",
+            help="Resume an existing interview by ID.",
+        ),
+    ] = None,
+    state_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--state-dir",
+            help="Custom directory for interview state files.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+        ),
+    ] = None,
+    orchestrator: Annotated[
+        bool,
+        typer.Option(
+            "--orchestrator",
+            "-o",
+            help="Use Claude Code (Max Plan) instead of LiteLLM. No API key required.",
+        ),
+    ] = False,
+    runtime: Annotated[
+        AgentRuntimeBackend | None,
+        typer.Option(
+            "--runtime",
+            help=(
+                "Agent runtime backend for the workflow execution step after seed generation "
+                "(claude, codex, opencode, hermes, gemini, copilot, goose, kiro, "
+                "pi, gjc, antigravity, grok, or zcode)."
+            ),
+            case_sensitive=False,
+        ),
+    ] = None,
+    llm_backend: Annotated[
+        LLMBackend | None,
+        typer.Option(
+            "--llm-backend",
+            help=(
+                "LLM backend for interview, ambiguity scoring, and seed generation "
+                "(claude_code, litellm, codex, copilot, opencode, gemini, goose, "
+                "kiro, pi, zcode, or dsh)."
+            ),
+            case_sensitive=False,
+        ),
+    ] = None,
+    debug: Annotated[
+        bool,
+        typer.Option(
+            "--debug",
+            "-d",
+            help="Show verbose logs including debug messages.",
+        ),
+    ] = False,
+) -> None:
+    """Start an interactive interview to refine your requirements.
+
+    This command initiates the Big Bang phase, which transforms vague ideas
+    into clear, executable requirements through iterative questioning.
+
+    Example:
+        ouroboros init start "I want to build a task management CLI tool"
+
+        ouroboros init start --orchestrator "Build a REST API"
+
+        ouroboros init start --orchestrator --runtime codex "Build a REST API"
+
+        ouroboros init start --llm-backend codex "Build a REST API"
+
+        ouroboros init start --resume interview_20260116_120000
+
+        ouroboros init start
+    """
+    # Get initial context if not provided
+    if not resume:
+        # Auto-detect PM seeds and offer to use as context
+        seeds_dir = Path.home() / ".ouroboros" / "seeds"
+        if not _has_dev_seed(seeds_dir):
+            pm_seeds = _find_pm_seeds(seeds_dir)
+            if pm_seeds:
+                if context:
+                    # User provided context but PM seed exists — notify and ask
+                    _notify_pm_seed_detected(pm_seeds)
+                    use_pm = Confirm.ask(
+                        "[yellow]Use PM seed instead of the provided context?[/]",
+                        default=False,
+                    )
+                    if use_pm:
+                        selected = (
+                            _prompt_pm_seed_selection(pm_seeds)
+                            if len(pm_seeds) > 1
+                            else pm_seeds[0]
+                        )
+                        if selected:
+                            context = _load_pm_seed_as_context(selected)
+                            print_success(f"Using PM seed: {selected.name}")
+                else:
+                    # No context provided — offer PM seed as primary option
+                    selected = _prompt_pm_seed_selection(pm_seeds)
+                    if selected:
+                        context = _load_pm_seed_as_context(selected)
+                        print_success(f"Using PM seed: {selected.name}")
+
+        if not context:
+            console.print("[bold cyan]Welcome to Ouroboros Interview![/]")
+            console.print()
+            console.print(
+                "This interactive process will help refine your ideas into clear requirements.",
+            )
+            console.print(
+                "You control when to stop - no arbitrary round limit.",
+            )
+            console.print()
+
+            context = asyncio.run(multiline_prompt_async("What would you like to build?"))
+
+        if context:
+            resolved_context = resolve_initial_context_input(context, cwd=Path.cwd())
+            if resolved_context.is_err:
+                print_error(str(resolved_context.error))
+                raise typer.Exit(code=1)
+            context = resolved_context.value
+
+    if not resume and not context:
+        print_error("Initial context is required when not resuming.")
+        raise typer.Exit(code=1)
+
+    # Apply the saved logging.level, with --debug overriding it.
+    configure_cli_logging(debug=debug)
+    if debug:
+        print_info("Debug mode enabled - showing verbose logs")
+
+    # Show mode info
+    selected_llm_backend = _resolve_init_llm_backend(
+        orchestrator,
+        llm_backend.value if llm_backend else None,
+    )
+    resolved_llm_backend = resolve_llm_backend(selected_llm_backend)
+    if resolved_llm_backend == "claude_code":
+        print_info("Using Claude Code (Max Plan) - no API key required")
+    elif resolved_llm_backend == "litellm":
+        print_info("Using LiteLLM - API key required")
+    else:
+        print_info(f"Using {resolved_llm_backend} interview backend")
+
+    if orchestrator and runtime:
+        print_info(f"Workflow runtime backend: {runtime.value}")
+
+    if llm_backend:
+        print_info(f"Interview LLM backend: {llm_backend.value}")
+
+    # Run interview
+    try:
+        asyncio.run(
+            _run_interview(
+                context or "",
+                resume,
+                state_dir,
+                orchestrator,
+                debug,
+                public_runtime_backend(runtime.value if runtime else None),
+                llm_backend.value if llm_backend else None,
+            )
+        )
+    except typer.Exit:
+        raise
+    except KeyboardInterrupt:
+        console.print()
+        print_info("Interview interrupted. Progress has been saved.")
+        raise typer.Exit(code=0)
+    except Exception as e:
+        print_error(f"Interview failed: {e}")
+        raise typer.Exit(code=1)
+
+
+@app.command("list")
+def list_interviews(
+    state_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--state-dir",
+            help="Custom directory for interview state files.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+        ),
+    ] = None,
+) -> None:
+    """List all interview sessions."""
+    engine = InterviewEngine(
+        state_dir=state_dir or Path.home() / ".ouroboros" / "data",
+    )
+
+    interviews = asyncio.run(engine.list_interviews())
+
+    if not interviews:
+        print_info("No interviews found.")
+        return
+
+    console.print("[bold cyan]Interview Sessions:[/]")
+    console.print()
+
+    for interview in interviews:
+        status_color = "green" if interview["status"] == "completed" else "yellow"
+        console.print(
+            f"[bold]{interview['interview_id']}[/] "
+            f"[{status_color}]{interview['status']}[/] "
+            f"({interview['rounds']} rounds)"
+        )
+        console.print(f"  Updated: {interview['updated_at']}")
+        console.print()
+
+
+__all__ = ["app"]

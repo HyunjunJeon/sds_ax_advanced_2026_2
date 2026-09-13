@@ -1,0 +1,334 @@
+"""Lineage event definitions for evolutionary loop tracking.
+
+Events follow the BaseEvent pattern (frozen pydantic, to_db_dict()) and use
+the dot.notation.past_tense naming convention.
+
+These events carry enough data to reconstruct OntologyLineage state via
+LineageProjector.project().
+"""
+
+from typing import Any
+
+from ouroboros.events.base import BaseEvent
+
+
+def lineage_created(
+    lineage_id: str,
+    goal: str,
+) -> BaseEvent:
+    """Create event for new lineage creation."""
+    return BaseEvent(
+        type="lineage.created",
+        aggregate_type="lineage",
+        aggregate_id=lineage_id,
+        data={
+            "goal": goal,
+        },
+    )
+
+
+def lineage_generation_started(
+    lineage_id: str,
+    generation_number: int,
+    phase: str,
+    seed_id: str | None = None,
+    seed_json: str | None = None,
+    active_ac_indices: list[int] | None = None,
+    frozen_ac_indices: list[int] | None = None,
+    active_ac_descriptions: list[str] | None = None,
+    focus_reason: str | None = None,
+) -> BaseEvent:
+    """Create event when a generation begins.
+
+    The optional ``ac_focus`` block tells observers WHAT this generation is
+    redoing: which AC indices failed the prior evaluation (active), which are
+    frozen by prior PASS evidence, and the human-readable descriptions of the
+    active ones. Descriptions only — never verify_command/output_assertion
+    (answer-sheet hiding applies to every surface a worker could see quoted).
+    """
+    data: dict[str, Any] = {
+        "generation_number": generation_number,
+        "phase": phase,
+        "seed_id": seed_id,
+    }
+    if seed_json is not None:
+        data["seed_json"] = seed_json
+    if active_ac_indices is not None:
+        data["ac_focus"] = {
+            "active_ac_indices": active_ac_indices,
+            "frozen_ac_indices": frozen_ac_indices or [],
+            "active_ac_descriptions": active_ac_descriptions or [],
+            "reason": focus_reason,
+        }
+    return BaseEvent(
+        type="lineage.generation.started",
+        aggregate_type="lineage",
+        aggregate_id=lineage_id,
+        data=data,
+    )
+
+
+def lineage_generation_completed(
+    lineage_id: str,
+    generation_number: int,
+    seed_id: str,
+    ontology_snapshot: dict,
+    evaluation_summary: dict | None = None,
+    wonder_questions: list[str] | None = None,
+    seed_json: str | None = None,
+    execution_output: str | None = None,
+    parent_seed_id: str | None = None,
+    seed_quality_canary_feedback: list[dict] | None = None,
+    active_ac_indices: list[int] | None = None,
+    frozen_ac_indices: list[int] | None = None,
+    verification_handoff_pending: bool = False,
+) -> BaseEvent:
+    """Create event when a generation completes successfully."""
+    data = {
+        "generation_number": generation_number,
+        "seed_id": seed_id,
+        "ontology_snapshot": ontology_snapshot,
+        "evaluation_summary": evaluation_summary,
+        "wonder_questions": wonder_questions or [],
+        "verification_handoff_pending": verification_handoff_pending,
+    }
+    if seed_quality_canary_feedback is not None:
+        data["seed_quality_canary_feedback"] = seed_quality_canary_feedback
+    if active_ac_indices is not None:
+        data["active_ac_indices"] = active_ac_indices
+    if frozen_ac_indices is not None:
+        data["frozen_ac_indices"] = frozen_ac_indices
+    if parent_seed_id is not None:
+        data["parent_seed_id"] = parent_seed_id
+    if seed_json is not None:
+        data["seed_json"] = seed_json
+    if execution_output is not None:
+        data["execution_output"] = execution_output[:10_000]
+    return BaseEvent(
+        type="lineage.generation.completed",
+        aggregate_type="lineage",
+        aggregate_id=lineage_id,
+        data=data,
+    )
+
+
+def lineage_generation_phase_changed(
+    lineage_id: str,
+    generation_number: int,
+    phase: str,
+    *,
+    last_completed_phase: str | None = None,
+    seed_id: str | None = None,
+    seed_json: str | None = None,
+    partial_state: dict[str, Any] | None = None,
+    active_ac_indices: list[int] | None = None,
+    frozen_ac_indices: list[int] | None = None,
+) -> BaseEvent:
+    """Create a phase transition with an optional durable recovery checkpoint."""
+    data: dict[str, Any] = {"generation_number": generation_number, "phase": phase}
+    if last_completed_phase is not None:
+        data["last_completed_phase"] = last_completed_phase
+    if seed_id is not None:
+        data["seed_id"] = seed_id
+    if seed_json is not None:
+        data["seed_json"] = seed_json
+    if partial_state is not None:
+        data["partial_state"] = partial_state
+    if active_ac_indices is not None:
+        data["active_ac_indices"] = active_ac_indices
+    if frozen_ac_indices is not None:
+        data["frozen_ac_indices"] = frozen_ac_indices
+    return BaseEvent(
+        type="lineage.generation.phase_changed",
+        aggregate_type="lineage",
+        aggregate_id=lineage_id,
+        data=data,
+    )
+
+
+def lineage_generation_failed(
+    lineage_id: str,
+    generation_number: int,
+    phase: str,
+    error: str,
+) -> BaseEvent:
+    """Create event when a generation fails mid-lifecycle."""
+    return BaseEvent(
+        type="lineage.generation.failed",
+        aggregate_type="lineage",
+        aggregate_id=lineage_id,
+        data={
+            "generation_number": generation_number,
+            "phase": phase,
+            "error": error,
+        },
+    )
+
+
+def lineage_generation_interrupted(
+    lineage_id: str,
+    generation_number: int,
+    last_completed_phase: str | None = None,
+    partial_state: dict | None = None,
+    seed_json: str | None = None,
+) -> BaseEvent:
+    """Create event when a generation is gracefully interrupted by SIGINT.
+
+    Distinct from 'failed' — carries partial results and the last phase
+    that completed successfully, enabling phase-level resume.
+
+    Args:
+        last_completed_phase: Must be a valid GenerationPhase value
+            (wondering, reflecting, seeding, executing) or None if
+            no phase completed before interruption.
+        seed_json: JSON-serialized current seed at time of interruption,
+            enabling resume with the evolved seed (not the stale parent).
+    """
+    data: dict = {
+        "generation_number": generation_number,
+    }
+    if last_completed_phase is not None:
+        data["last_completed_phase"] = last_completed_phase
+    if partial_state:
+        data["partial_state"] = partial_state
+    if seed_json:
+        data["seed_json"] = seed_json
+    return BaseEvent(
+        type="lineage.generation.interrupted",
+        aggregate_type="lineage",
+        aggregate_id=lineage_id,
+        data=data,
+    )
+
+
+def lineage_generation_watchdog_decision(
+    lineage_id: str,
+    generation_number: int,
+    action: str,
+    reason: str,
+    *,
+    execution_id: str | None = None,
+    details: dict | None = None,
+) -> BaseEvent:
+    """Create event when the generation watchdog makes a control decision."""
+    data: dict = {
+        "generation_number": generation_number,
+        "action": action,
+        "reason": reason,
+    }
+    if execution_id is not None:
+        data["execution_id"] = execution_id
+    if details:
+        data["details"] = details
+    return BaseEvent(
+        type="lineage.generation.watchdog_decision",
+        aggregate_type="lineage",
+        aggregate_id=lineage_id,
+        data=data,
+    )
+
+
+def lineage_ontology_evolved(
+    lineage_id: str,
+    generation_number: int,
+    delta: dict,
+) -> BaseEvent:
+    """Create event when ontology changes between generations."""
+    return BaseEvent(
+        type="lineage.ontology.evolved",
+        aggregate_type="lineage",
+        aggregate_id=lineage_id,
+        data={
+            "generation_number": generation_number,
+            "delta": delta,
+        },
+    )
+
+
+def lineage_converged(
+    lineage_id: str,
+    generation_number: int,
+    reason: str,
+    similarity: float,
+) -> BaseEvent:
+    """Create event when convergence is detected."""
+    return BaseEvent(
+        type="lineage.converged",
+        aggregate_type="lineage",
+        aggregate_id=lineage_id,
+        data={
+            "generation_number": generation_number,
+            "reason": reason,
+            "similarity": similarity,
+        },
+    )
+
+
+def lineage_exhausted(
+    lineage_id: str,
+    generation_number: int,
+    max_generations: int,
+) -> BaseEvent:
+    """Create event when max generations is reached."""
+    return BaseEvent(
+        type="lineage.exhausted",
+        aggregate_type="lineage",
+        aggregate_id=lineage_id,
+        data={
+            "generation_number": generation_number,
+            "max_generations": max_generations,
+        },
+    )
+
+
+def lineage_rewound(
+    lineage_id: str,
+    from_generation: int,
+    to_generation: int,
+) -> BaseEvent:
+    """Create event when user rewinds to a previous generation."""
+    return BaseEvent(
+        type="lineage.rewound",
+        aggregate_type="lineage",
+        aggregate_id=lineage_id,
+        data={
+            "from_generation": from_generation,
+            "to_generation": to_generation,
+        },
+    )
+
+
+def lineage_wonder_degraded(
+    lineage_id: str,
+    generation_number: int,
+    error: str,
+) -> BaseEvent:
+    """Create event when WonderEngine fails and falls back to defaults."""
+    return BaseEvent(
+        type="lineage.wonder.degraded",
+        aggregate_type="lineage",
+        aggregate_id=lineage_id,
+        data={
+            "generation_number": generation_number,
+            "error": error,
+        },
+    )
+
+
+def lineage_stagnated(
+    lineage_id: str,
+    generation_number: int,
+    reason: str,
+    window: int,
+) -> BaseEvent:
+    """Create event when stagnation is detected (repeated feedback/unchanged ontology)."""
+    return BaseEvent(
+        type="lineage.stagnated",
+        aggregate_type="lineage",
+        aggregate_id=lineage_id,
+        data={
+            "generation_number": generation_number,
+            "reason": reason,
+            "stagnation_window": window,
+        },
+    )

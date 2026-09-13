@@ -1,0 +1,405 @@
+"""Tests for Stage 1 mechanical verification."""
+
+import asyncio
+import sys
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from ouroboros.evaluation.mechanical import (
+    CommandResult,
+    MechanicalConfig,
+    MechanicalVerifier,
+    parse_coverage_from_output,
+    run_command,
+    run_mechanical_verification,
+)
+from ouroboros.evaluation.models import CheckType
+
+# Config with commands set for tests that need real/mocked command execution
+_TEST_CONFIG = MechanicalConfig(
+    lint_command=("echo", "lint-ok"),
+    build_command=("echo", "build-ok"),
+    test_command=("echo", "test-ok"),
+    static_command=("echo", "static-ok"),
+    coverage_command=("echo", "coverage-ok"),
+)
+
+
+class TestParseCoverageFromOutput:
+    """Tests for coverage parsing."""
+
+    def test_parse_total_percentage(self) -> None:
+        """Parse coverage from TOTAL line."""
+        output = """
+        src/module.py     100      10    90%
+        TOTAL            1000     100    90%
+        """
+        assert parse_coverage_from_output(output) == 0.90
+
+    def test_parse_100_percent(self) -> None:
+        """Parse 100% coverage."""
+        output = "TOTAL   500   0   100%"
+        assert parse_coverage_from_output(output) == 1.0
+
+    def test_parse_0_percent(self) -> None:
+        """Parse 0% coverage."""
+        output = "TOTAL   500   500   0%"
+        assert parse_coverage_from_output(output) == 0.0
+
+    def test_parse_coverage_alternative_format(self) -> None:
+        """Parse alternative Coverage: XX% format."""
+        output = "Coverage: 85.5%"
+        result = parse_coverage_from_output(output)
+        assert result is not None
+        assert abs(result - 0.855) < 0.001
+
+    def test_parse_no_coverage_found(self) -> None:
+        """Return None when no coverage found."""
+        output = "All tests passed"
+        assert parse_coverage_from_output(output) is None
+
+
+class TestMechanicalConfig:
+    """Tests for MechanicalConfig."""
+
+    def test_default_values(self) -> None:
+        """Verify default configuration values."""
+        config = MechanicalConfig()
+        assert config.coverage_threshold == 0.7
+        assert config.timeout_seconds == 300
+        assert config.working_dir is None
+        assert config.lint_command is None
+        assert config.build_command is None
+        assert config.test_command is None
+        assert config.static_command is None
+        assert config.coverage_command is None
+
+    def test_custom_values(self) -> None:
+        """Create config with custom values."""
+        from pathlib import Path
+
+        config = MechanicalConfig(
+            coverage_threshold=0.8,
+            timeout_seconds=60,
+            working_dir=Path("/tmp"),
+        )
+        assert config.coverage_threshold == 0.8
+        assert config.timeout_seconds == 60
+        assert config.working_dir == Path("/tmp")
+
+
+class TestCommandResult:
+    """Tests for CommandResult."""
+
+    def test_creation(self) -> None:
+        """Create CommandResult."""
+        result = CommandResult(
+            return_code=0,
+            stdout="output",
+            stderr="",
+        )
+        assert result.return_code == 0
+        assert result.timed_out is False
+
+    def test_timeout(self) -> None:
+        """Create timed out CommandResult."""
+        result = CommandResult(
+            return_code=-1,
+            stdout="",
+            stderr="Timeout",
+            timed_out=True,
+        )
+        assert result.timed_out is True
+
+
+class TestRunCommand:
+    """Tests for run_command function."""
+
+    @pytest.mark.asyncio
+    async def test_successful_command(self) -> None:
+        """Run successful command."""
+        result = await run_command((sys.executable, "-c", "print('hello')"), timeout=5)
+        assert result.return_code == 0
+        assert "hello" in result.stdout
+        assert result.timed_out is False
+
+    @pytest.mark.asyncio
+    async def test_cancelled_command_kills_child_process(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Outer evaluation deadlines must not leave mechanical subprocesses alive."""
+
+        class FakeProcess:
+            returncode: int | None = None
+
+            def __init__(self) -> None:
+                self.killed = False
+                self.waited = False
+
+            async def communicate(self):
+                await asyncio.Event().wait()
+
+            def kill(self) -> None:
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self) -> int:
+                self.waited = True
+                return self.returncode or 0
+
+        fake_process = FakeProcess()
+
+        async def fake_create_subprocess_exec(*_args, **_kwargs):
+            return fake_process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+        task = asyncio.create_task(run_command(("long-running",), timeout=999))
+        await asyncio.sleep(0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert fake_process.killed is True
+        assert fake_process.waited is True
+
+    @pytest.mark.asyncio
+    async def test_failed_command(self) -> None:
+        """Run failing command."""
+        result = await run_command((sys.executable, "-c", "raise SystemExit(7)"), timeout=5)
+        assert result.return_code == 7
+
+    @pytest.mark.asyncio
+    async def test_command_not_found(self) -> None:
+        """Handle command not found."""
+        result = await run_command(("nonexistent_command_xyz",), timeout=5)
+        assert result.return_code == -1
+        assert "not found" in result.stderr.lower() or "Command not found" in result.stderr
+
+    @pytest.mark.asyncio
+    async def test_command_strips_nested_mcp_sentinel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mechanical checks should not inherit the MCP server recursion sentinel."""
+        monkeypatch.setenv("_OUROBOROS_NESTED", "1")
+
+        result = await run_command(
+            (
+                sys.executable,
+                "-c",
+                "import os; print(os.environ.get('_OUROBOROS_NESTED', 'missing'))",
+            ),
+            timeout=5,
+        )
+
+        assert result.return_code == 0
+        assert result.stdout.strip() == "missing"
+
+
+class TestMechanicalVerifier:
+    """Tests for MechanicalVerifier class."""
+
+    @pytest.mark.asyncio
+    async def test_verify_generates_events(self) -> None:
+        """Verify generates start and complete events."""
+        with patch(
+            "ouroboros.evaluation.mechanical.run_command",
+            new_callable=AsyncMock,
+        ) as mock_run:
+            mock_run.return_value = CommandResult(0, "OK", "")
+
+            verifier = MechanicalVerifier(_TEST_CONFIG)
+            result = await verifier.verify("exec-1", checks=[CheckType.LINT])
+
+            assert result.is_ok
+            mech_result, events = result.value
+            assert len(events) == 2
+            assert events[0].type == "evaluation.stage1.started"
+            assert events[1].type == "evaluation.stage1.completed"
+
+    @pytest.mark.asyncio
+    async def test_verify_all_pass(self) -> None:
+        """All checks passing."""
+        with patch(
+            "ouroboros.evaluation.mechanical.run_command",
+            new_callable=AsyncMock,
+        ) as mock_run:
+            mock_run.return_value = CommandResult(0, "All OK", "")
+
+            verifier = MechanicalVerifier(_TEST_CONFIG)
+            result = await verifier.verify(
+                "exec-1",
+                checks=[CheckType.LINT, CheckType.BUILD],
+            )
+
+            assert result.is_ok
+            mech_result, _ = result.value
+            assert mech_result.passed is True
+            assert len(mech_result.checks) == 2
+            assert all(c.passed for c in mech_result.checks)
+
+    @pytest.mark.asyncio
+    async def test_verify_one_fails(self) -> None:
+        """One check failing marks overall as failed."""
+        with patch(
+            "ouroboros.evaluation.mechanical.run_command",
+            new_callable=AsyncMock,
+        ) as mock_run:
+            # First call passes, second fails
+            mock_run.side_effect = [
+                CommandResult(0, "OK", ""),
+                CommandResult(1, "", "Error"),
+            ]
+
+            verifier = MechanicalVerifier(_TEST_CONFIG)
+            result = await verifier.verify(
+                "exec-1",
+                checks=[CheckType.LINT, CheckType.BUILD],
+            )
+
+            assert result.is_ok
+            mech_result, _ = result.value
+            assert mech_result.passed is False
+            assert len(mech_result.failed_checks) == 1
+
+    @pytest.mark.asyncio
+    async def test_verify_failed_check_preserves_command_and_output_tail(self) -> None:
+        """Failed checks keep tail diagnostics instead of only the noisy prefix."""
+        with patch(
+            "ouroboros.evaluation.mechanical.run_command",
+            new_callable=AsyncMock,
+        ) as mock_run:
+            mock_run.return_value = CommandResult(
+                1,
+                "prefix\n" + ("." * 700) + "\nFAILED tests/test_example.py::test_case",
+                "stderr prefix\n" + ("x" * 700) + "\nAssertionError: boom",
+            )
+
+            verifier = MechanicalVerifier(_TEST_CONFIG)
+            result = await verifier.verify("exec-1", checks=[CheckType.TEST])
+
+            assert result.is_ok
+            mech_result, _ = result.value
+            details = mech_result.checks[0].details
+            assert details["command"] == ["echo", "test-ok"]
+            assert "FAILED tests/test_example.py::test_case" in details["stdout_tail"]
+            assert "AssertionError: boom" in details["stderr_tail"]
+            assert "FAILED tests/test_example.py::test_case" not in details["stdout_preview"]
+
+    @pytest.mark.asyncio
+    async def test_verify_coverage_below_threshold(self) -> None:
+        """Coverage below threshold marks check as failed."""
+        with patch(
+            "ouroboros.evaluation.mechanical.run_command",
+            new_callable=AsyncMock,
+        ) as mock_run:
+            # Return coverage output with 50% (below 70% threshold)
+            mock_run.return_value = CommandResult(
+                0,
+                "TOTAL   100   50   50%",
+                "",
+            )
+
+            config = MechanicalConfig(
+                coverage_threshold=0.7,
+                coverage_command=("echo", "coverage"),
+            )
+            verifier = MechanicalVerifier(config)
+            result = await verifier.verify("exec-1", checks=[CheckType.COVERAGE])
+
+            assert result.is_ok
+            mech_result, _ = result.value
+            assert mech_result.passed is False
+            assert mech_result.coverage_score == 0.5
+
+    @pytest.mark.asyncio
+    async def test_verify_coverage_above_threshold(self) -> None:
+        """Coverage above threshold passes."""
+        with patch(
+            "ouroboros.evaluation.mechanical.run_command",
+            new_callable=AsyncMock,
+        ) as mock_run:
+            mock_run.return_value = CommandResult(
+                0,
+                "TOTAL   100   20   80%",
+                "",
+            )
+
+            config = MechanicalConfig(
+                coverage_threshold=0.7,
+                coverage_command=("echo", "coverage"),
+            )
+            verifier = MechanicalVerifier(config)
+            result = await verifier.verify("exec-1", checks=[CheckType.COVERAGE])
+
+            assert result.is_ok
+            mech_result, _ = result.value
+            assert mech_result.passed is True
+            assert mech_result.coverage_score == 0.8
+
+    @pytest.mark.asyncio
+    async def test_verify_timeout_handling(self) -> None:
+        """Timeout is handled gracefully."""
+        with patch(
+            "ouroboros.evaluation.mechanical.run_command",
+            new_callable=AsyncMock,
+        ) as mock_run:
+            mock_run.return_value = CommandResult(
+                -1,
+                "",
+                "Command timed out",
+                timed_out=True,
+            )
+
+            verifier = MechanicalVerifier(_TEST_CONFIG)
+            result = await verifier.verify("exec-1", checks=[CheckType.TEST])
+
+            assert result.is_ok
+            mech_result, _ = result.value
+            assert mech_result.passed is False
+            assert "timed out" in mech_result.checks[0].message.lower()
+
+            # Timeout failures must carry the same command/cwd diagnostics as
+            # other failures so the formatter can show which check hung.
+            timeout_details = mech_result.checks[0].details
+            assert timeout_details["timed_out"] is True
+            assert timeout_details["command"] == ["echo", "test-ok"]
+            assert "working_dir" in timeout_details
+
+    @pytest.mark.asyncio
+    async def test_verify_skips_unconfigured_checks(self) -> None:
+        """Checks with no command configured are skipped (passed with skip message)."""
+        config = MechanicalConfig()  # All commands are None
+        verifier = MechanicalVerifier(config)
+        result = await verifier.verify(
+            "exec-1",
+            checks=[CheckType.LINT, CheckType.BUILD, CheckType.TEST],
+        )
+
+        assert result.is_ok
+        mech_result, _ = result.value
+        assert mech_result.passed is True
+        assert all(c.passed for c in mech_result.checks)
+        assert all("skipped" in c.message.lower() for c in mech_result.checks)
+
+
+class TestRunMechanicalVerification:
+    """Tests for convenience function."""
+
+    @pytest.mark.asyncio
+    async def test_convenience_function(self) -> None:
+        """Test the convenience function works."""
+        with patch(
+            "ouroboros.evaluation.mechanical.run_command",
+            new_callable=AsyncMock,
+        ) as mock_run:
+            mock_run.return_value = CommandResult(0, "OK", "")
+
+            result = await run_mechanical_verification(
+                "exec-1",
+                checks=[CheckType.LINT],
+            )
+
+            assert result.is_ok

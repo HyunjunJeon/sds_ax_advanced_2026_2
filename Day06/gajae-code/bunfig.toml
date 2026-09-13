@@ -1,0 +1,24 @@
+telemetry = false
+
+[install]
+minimumReleaseAge = 259200 # 3 days in seconds
+minimumReleaseAgeExcludes = ["@types/bun", "bun-types"]
+linker = "hoisted"
+exact = true
+saveTextLockfile = true
+
+[loader]
+".md" = "text"
+".py" = "text"
+".lark" = "text"
+
+[test]
+preload = ["./scripts/test-preload.ts"]
+pathIgnorePatterns = [
+  "**/node_modules/**",
+  ".wt/**",
+  ".worktrees/**",
+]
+
+[run]
+bun = true

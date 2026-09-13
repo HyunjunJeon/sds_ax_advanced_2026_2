@@ -1,0 +1,221 @@
+"""Helpers for resolving project directories from seed and runtime context."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import structlog
+
+log = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class SeedProjectPathResolution:
+    """Outcome of resolving a seed-encoded project directory.
+
+    Distinguishes the two ``path is None`` cases that callers previously
+    conflated:
+
+    * ``rejected=False`` — the seed encoded no project path, or the seed
+      was ``None``. Falling back to the caller's stable base is safe.
+    * ``rejected=True`` — at least one path was encoded but every
+      candidate escaped ``stable_base``. The seed *intended* to point
+      somewhere; the caller must surface that explicitly (audit log,
+      tool error, etc.) rather than silently running in the base
+      directory.
+    """
+
+    path: Path | None
+    rejected: bool
+
+
+def resolve_path_against_base(
+    raw_path: str | Path | None,
+    *,
+    stable_base: Path,
+    enforce_containment: bool = False,
+) -> Path | None:
+    """Resolve a path against a stable base directory.
+
+    When ``enforce_containment`` is True the resolved path (after tilde
+    expansion and symlink resolution) must live inside ``stable_base``;
+    otherwise ``None`` is returned and a containment-violation warning is
+    logged. Callers handling untrusted input (e.g. seed-encoded paths) must
+    opt in so absolute paths and ``..`` traversal cannot escape the
+    project directory.
+    """
+    if raw_path is None:
+        return None
+
+    candidate = Path(raw_path).expanduser()
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+    else:
+        resolved = (stable_base / candidate).resolve()
+
+    if enforce_containment:
+        base_resolved = stable_base.resolve()
+        if resolved != base_resolved:
+            try:
+                resolved.relative_to(base_resolved)
+            except ValueError:
+                log.warning(
+                    "project_paths.containment_violation",
+                    raw_path=str(raw_path),
+                    resolved=str(resolved),
+                    stable_base=str(base_resolved),
+                )
+                return None
+
+    return resolved
+
+
+def _metadata_path_candidates(seed: Any) -> tuple[str, ...]:
+    """Extract user-declared project directories from seed metadata."""
+    if seed is None:
+        return ()
+    seed_meta = getattr(seed, "metadata", None)
+    if seed_meta is None:
+        return ()
+    project_dir = getattr(seed_meta, "project_dir", None) or getattr(
+        seed_meta,
+        "working_directory",
+        None,
+    )
+    if isinstance(project_dir, str) and project_dir:
+        return (project_dir,)
+    return ()
+
+
+def _reference_path_candidates(seed: Any) -> tuple[str, ...]:
+    """Extract brownfield ``context_references[].path`` candidates from a seed.
+
+    These are heuristic project-root candidates: the seed generator emits
+    ``context_references`` as documentation pointers (often individual files),
+    not as canonical project directories. Callers that consume them as
+    project-root candidates must additionally verify each resolved path is an
+    existing directory; see :func:`resolve_seed_project_path`.
+    """
+    if seed is None:
+        return ()
+    brownfield_context = getattr(seed, "brownfield_context", None)
+    context_references = getattr(brownfield_context, "context_references", ()) or ()
+
+    candidates: list[str] = []
+    for reference in context_references:
+        path = getattr(reference, "path", None)
+        role = getattr(reference, "role", None)
+        if isinstance(path, str) and path and role == "primary" and path not in candidates:
+            candidates.append(path)
+
+    for reference in context_references:
+        path = getattr(reference, "path", None)
+        if isinstance(path, str) and path and path not in candidates:
+            candidates.append(path)
+
+    return tuple(candidates)
+
+
+def project_path_candidates_from_seed(seed: Any) -> tuple[str, ...]:
+    """Extract likely project directories from seed metadata and brownfield refs.
+
+    Returns a flat ordered tuple of candidate strings. Metadata-declared
+    paths come first, followed by primary brownfield references, then
+    remaining references. ``resolve_seed_project_path`` is the right consumer
+    when type-aware validation is needed; this helper is intentionally
+    structure-only and does not filter by filesystem state.
+    """
+    metadata = _metadata_path_candidates(seed)
+    references = _reference_path_candidates(seed)
+    return metadata + tuple(c for c in references if c not in metadata)
+
+
+def resolve_seed_project_path(seed: Any, *, stable_base: Path) -> SeedProjectPathResolution:
+    """Resolve the highest-priority project path encoded in a seed.
+
+    Seed-encoded paths originate from untrusted sources — seeds may be
+    imported via ``ooo publish`` or generated by an LLM — so every candidate
+    is required to resolve inside ``stable_base``. Candidates are tried in
+    priority order:
+
+    1. ``metadata.project_dir`` / ``metadata.working_directory`` — these are
+       user-declared. The resolver returns the first contained candidate
+       as-is and does not check filesystem state; the caller (e.g.,
+       ``_resolve_cli_project_dir``) is responsible for any further
+       normalization such as collapsing a file path to its parent
+       directory.
+    2. ``brownfield_context.context_references[].path`` (primary role first,
+       then remaining references) — these are heuristic candidates emitted
+       by the seed generator as documentation pointers, often to individual
+       *files* whose paths only make sense relative to the real project
+       root. A reference candidate is only accepted when its resolved path
+       actually exists on disk. A **relative** reference that resolves to an
+       existing file proves ``stable_base`` is the base its seed-relative
+       paths (including ``expected_artifacts``) were written against, so
+       ``stable_base`` itself is returned as the project root — collapsing
+       the file to its parent instead pushed the runtime cwd into a
+       subdirectory (``app/widgets`` for ``app/widgets/kanban.js``) and made
+       every AC's artifact verification unsatisfiable (#2194). An absolute
+       existing-file reference carries no base information and is returned
+       as-is (callers collapse to its parent). A non-existent path is logged
+       and skipped so the caller's runtime cwd is never set to a synthetic
+       join (e.g. ``<.ouroboros/seeds>/<reference.path>``).
+
+    ``rejected`` is set only when at least one candidate was *encoded but
+    rejected for containment* (escaping ``stable_base``). Reference
+    candidates that resolve inside ``stable_base`` but point at
+    non-existent paths are heuristic misses, not security events, so they
+    fall through silently and the caller falls back to ``stable_base``.
+
+    Returns a :class:`SeedProjectPathResolution`:
+
+    * ``path is not None``  — a contained, valid candidate was found.
+      ``rejected`` is ``False``.
+    * ``path is None``, ``rejected=False`` — the seed encoded no project
+      paths, or every encoded candidate was a benign heuristic miss
+      (reference path that did not exist on disk).
+    * ``path is None``, ``rejected=True`` — at least one candidate
+      escaped ``stable_base``. Callers must surface this as an explicit
+      containment failure, not a benign empty seed.
+    """
+    metadata_candidates = _metadata_path_candidates(seed)
+    reference_candidates = _reference_path_candidates(seed)
+    containment_rejected = False
+
+    for candidate in metadata_candidates:
+        resolved = resolve_path_against_base(
+            candidate,
+            stable_base=stable_base,
+            enforce_containment=True,
+        )
+        if resolved is None:
+            containment_rejected = True
+            continue
+        return SeedProjectPathResolution(path=resolved, rejected=False)
+
+    for candidate in reference_candidates:
+        resolved = resolve_path_against_base(
+            candidate,
+            stable_base=stable_base,
+            enforce_containment=True,
+        )
+        if resolved is None:
+            containment_rejected = True
+            continue
+        if not resolved.exists():
+            log.info(
+                "project_paths.reference_skipped_nonexistent",
+                raw_path=candidate,
+                resolved=str(resolved),
+                stable_base=str(stable_base.resolve()),
+            )
+            continue
+        if resolved.is_file() and not Path(candidate).expanduser().is_absolute():
+            return SeedProjectPathResolution(path=stable_base.resolve(), rejected=False)
+        return SeedProjectPathResolution(path=resolved, rejected=False)
+
+    if containment_rejected:
+        return SeedProjectPathResolution(path=None, rejected=True)
+    return SeedProjectPathResolution(path=None, rejected=False)

@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""Magic Keyword Detector for Ouroboros.
+
+Detects trigger keywords in user prompts and suggests
+the appropriate Ouroboros skill to invoke.
+
+IMPORTANT: If MCP is not configured (ooo setup not run),
+ALL ooo commands (except setup/help) redirect to setup first.
+
+Hook: UserPromptSubmit
+Input: JSON hook payload via stdin, with raw prompt text supported as a fallback
+Output: Structured hook context when a skill is suggested; otherwise no output
+"""
+
+import json
+from pathlib import Path
+import re
+import sys
+
+
+def _configure_utf8_stdio() -> None:
+    """Keep hook output safe on non-UTF-8 Windows locales."""
+    for stream in (sys.stdout, sys.stderr):
+        encoding = getattr(stream, "encoding", None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if encoding and encoding.lower().replace("-", "") != "utf8" and reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+_configure_utf8_stdio()
+
+# Skills that work without MCP setup (bypass the setup gate)
+# qa has a built-in fallback that adopts the qa-judge agent directly
+# resume-session reads the EventStore directly — its purpose is recovering after
+# an MCP disconnect, so the no-MCP path is exactly when the user needs it.
+SETUP_BYPASS_SKILLS = [
+    "/ouroboros:setup",
+    "/ouroboros:ouroboros-help",
+    "/ouroboros:qa",
+    "/ouroboros:resume-session",
+]
+
+# Keyword → skill mapping
+# "ooo <cmd>" prefix always works; natural language keywords also supported
+KEYWORD_MAP = [
+    # ooo prefix shortcuts (checked first for priority)
+    {"patterns": ["ooo auto"], "skill": "/ouroboros:auto"},
+    {"patterns": ["ooo interview", "ooo socratic"], "skill": "/ouroboros:interview"},
+    {"patterns": ["ooo seed", "ooo crystallize"], "skill": "/ouroboros:seed"},
+    {
+        "patterns": ["ooo run", "ooo execute"],
+        "skill": "/ouroboros:ouroboros-run",
+    },
+    {"patterns": ["ooo eval", "ooo evaluate"], "skill": "/ouroboros:evaluate"},
+    {"patterns": ["ooo evolve"], "skill": "/ouroboros:evolve"},
+    {"patterns": ["ooo stuck", "ooo unstuck", "ooo lateral"], "skill": "/ouroboros:unstuck"},
+    {
+        "patterns": ["ooo status", "ooo drift"],
+        "skill": "/ouroboros:ouroboros-status",
+    },
+    {"patterns": ["ooo ralph"], "skill": "/ouroboros:ralph"},
+    {"patterns": ["ooo tutorial"], "skill": "/ouroboros:tutorial"},
+    {"patterns": ["ooo welcome"], "skill": "/ouroboros:welcome"},
+    {"patterns": ["ooo setup"], "skill": "/ouroboros:setup"},
+    {"patterns": ["ooo help"], "skill": "/ouroboros:ouroboros-help"},
+    {"patterns": ["ooo pm", "ooo prd"], "skill": "/ouroboros:pm"},
+    {"patterns": ["ooo qa", "qa check", "quality check"], "skill": "/ouroboros:qa"},
+    {"patterns": ["ooo cancel", "ooo abort"], "skill": "/ouroboros:cancel"},
+    {"patterns": ["ooo update", "ooo upgrade"], "skill": "/ouroboros:update"},
+    {"patterns": ["ooo brownfield"], "skill": "/ouroboros:brownfield"},
+    {"patterns": ["ooo publish"], "skill": "/ouroboros:publish"},
+    # Canonical form only. The short `ooo resume` alias was rejected because
+    # word-boundary matching would route prose like "please ooo resume work on
+    # this" to /ouroboros:resume-session, and skills/resume-session/SKILL.md
+    # explicitly chose the hyphenated name to avoid /resume collision.
+    {"patterns": ["ooo resume-session"], "skill": "/ouroboros:resume-session"},
+    # Natural language triggers
+    # PM triggers must precede generic interview to avoid "pm interview" being shadowed
+    {
+        "patterns": [
+            "write prd",
+            "pm interview",
+            "product requirements",
+            "create prd",
+        ],
+        "skill": "/ouroboros:pm",
+    },
+    {
+        "patterns": [
+            "interview me",
+            "clarify requirements",
+            "clarify my requirements",
+            "socratic interview",
+            "socratic questioning",
+        ],
+        "skill": "/ouroboros:interview",
+    },
+    {
+        "patterns": ["crystallize", "generate seed", "create seed", "freeze requirements"],
+        "skill": "/ouroboros:seed",
+    },
+    {
+        "patterns": ["ouroboros run", "execute seed", "run seed", "run workflow"],
+        "skill": "/ouroboros:ouroboros-run",
+    },
+    {
+        "patterns": ["evaluate this", "3-stage check", "three-stage", "verify execution"],
+        "skill": "/ouroboros:evaluate",
+    },
+    {
+        "patterns": ["evolve", "evolutionary loop", "iterate until converged"],
+        "skill": "/ouroboros:evolve",
+    },
+    {
+        "patterns": [
+            "think sideways",
+            "i'm stuck",
+            "im stuck",
+            "i am stuck",
+            "break through",
+            "lateral thinking",
+        ],
+        "skill": "/ouroboros:unstuck",
+    },
+    {
+        "patterns": [
+            "am i drifting",
+            "drift check",
+            "session status",
+            "check drift",
+            "goal deviation",
+        ],
+        "skill": "/ouroboros:ouroboros-status",
+    },
+    {
+        "patterns": ["ralph", "don't stop", "must complete", "until it works", "keep going"],
+        "skill": "/ouroboros:ralph",
+    },
+    {"patterns": ["ouroboros setup", "setup ouroboros"], "skill": "/ouroboros:setup"},
+    {"patterns": ["ouroboros help"], "skill": "/ouroboros:ouroboros-help"},
+    {
+        "patterns": ["update ouroboros", "upgrade ouroboros"],
+        "skill": "/ouroboros:update",
+    },
+    {
+        "patterns": [
+            "cancel execution",
+            "stop job",
+            "kill stuck",
+            "abort execution",
+        ],
+        "skill": "/ouroboros:cancel",
+    },
+    {
+        "patterns": [
+            "brownfield defaults",
+            "brownfield scan",
+        ],
+        "skill": "/ouroboros:brownfield",
+    },
+]
+
+
+def is_mcp_configured() -> bool:
+    """Check if MCP server is registered in ~/.claude/mcp.json."""
+    try:
+        mcp_path = Path.home() / ".claude" / "mcp.json"
+        if not mcp_path.exists():
+            return False
+        return "ouroboros" in mcp_path.read_text()
+    except Exception:
+        return False
+
+
+def _has_prior_install_state() -> bool:
+    """Detect a prior Ouroboros install when ``prefs.json`` is absent.
+
+    A missing ``prefs.json`` usually means a genuine first run, but on its own
+    it is not sufficient: ``ooo setup`` and the MCP runtime can leave behind
+    config, credentials, or the event-sourcing database — and register the MCP
+    server — without ever writing ``prefs.json``. The welcome flow is the only
+    path that writes the ``welcomeCompleted`` gate-key, and it is skippable, so
+    a user who configured Ouroboros but never finished (or skipped) the welcome
+    is otherwise treated as first-time forever and re-nagged on every prompt.
+    Any of these install signals means the user is past first-touch.
+
+    This helper deliberately has no ``try/except`` of its own: any exception
+    propagates to ``is_first_time``'s handler, which fails open to first-time.
+    """
+    ouro_dir = Path.home() / ".ouroboros"
+    markers = ("config.yaml", "credentials.yaml", "ouroboros.db")
+    if any((ouro_dir / marker).exists() for marker in markers):
+        return True
+    return is_mcp_configured()
+
+
+def is_first_time() -> bool:
+    """Check if this is the user's first interaction.
+
+    Older onboarding flows wrote ``welcomeShown`` or other preference keys
+    without ``welcomeCompleted``. Treat any valid existing prefs as a
+    non-first-run state so upgrades do not repeatedly auto-trigger the welcome
+    experience. When ``prefs.json`` is missing entirely, fall back to other
+    install signals (see ``_has_prior_install_state``) so a configured user who
+    never completed the welcome flow is not nagged on every prompt.
+    """
+    try:
+        prefs_path = Path.home() / ".ouroboros" / "prefs.json"
+        if not prefs_path.exists():
+            return not _has_prior_install_state()
+        prefs = json.loads(prefs_path.read_text())
+        if not isinstance(prefs, dict):
+            # Intentional asymmetry vs. the missing-prefs branch above: a
+            # malformed prefs.json stays first-time even when install markers
+            # exist. A corrupt prefs file is a stronger signal than orphan
+            # markers — re-running welcome rewrites it cleanly — so do NOT
+            # route this through _has_prior_install_state().
+            return True
+        if prefs.get("welcomeCompleted") or prefs.get("welcomeShown"):
+            return False
+        return not bool(prefs)
+    except Exception:
+        return True
+
+
+def _word_boundary_match(pattern: str, text: str) -> bool:
+    """Match ``pattern`` against ``text`` with strong end-of-token boundaries.
+
+    The naive ``(?:^|\\b)pattern(?:\\b|$)`` form mis-matches when the
+    pattern ends in a hyphenated token. ``\\b`` triggers on any
+    word-character ↔ non-word-character transition, so a pattern like
+    ``"ooo resume-session"`` matched ``"ooo resume-session-extra"``
+    because ``\\b`` fired between ``n`` and the trailing ``-``. The
+    detector then routed legitimately-different commands (e.g. a future
+    ``ooo resume-session-cleanup``) to ``/ouroboros:resume-session``.
+
+    Tighten both sides:
+
+    * Leading boundary: start-of-string OR a non-word, non-hyphen
+      character before the pattern. Prevents ``myooo auto`` from
+      matching ``ooo auto`` (the ``\\b`` form already did this; we
+      preserve that) AND prevents a leading hyphen from forming a
+      false token break.
+    * Trailing boundary: end-of-string OR a non-word, non-hyphen
+      character. The non-hyphen requirement is what actually fixes the
+      bug: now ``ooo resume-session-extra`` no longer matches
+      ``ooo resume-session`` because the trailing ``-`` is rejected as
+      a boundary.
+
+    The pattern itself can still legitimately *contain* a hyphen
+    (``"ooo resume-session"`` matches ``"ooo resume-session"`` because
+    ``re.escape`` quotes the inner ``-`` literally and the boundary
+    only inspects the character that comes AFTER the match).
+    """
+    boundary_lead = r"(?:^|[^\w-])"
+    boundary_trail = r"(?:$|[^\w-])"
+    return bool(re.search(boundary_lead + re.escape(pattern) + boundary_trail, text))
+
+
+def detect_keywords(text: str) -> dict:
+    """Detect keywords in user prompt text."""
+    lower = text.lower().strip()
+
+    for entry in KEYWORD_MAP:
+        for pattern in entry["patterns"]:
+            if _word_boundary_match(pattern, lower):
+                return {
+                    "detected": True,
+                    "keyword": pattern,
+                    "suggested_skill": entry["skill"],
+                }
+
+    # Bare "ooo" (with no subcommand) → welcome (first-touch experience)
+    if lower in ("ooo", "ooo?"):
+        return {
+            "detected": True,
+            "keyword": "ooo",
+            "suggested_skill": "/ouroboros:welcome",
+        }
+
+    return {"detected": False, "keyword": None, "suggested_skill": None}
+
+
+def _extract_prompt_and_host(hook_input: str) -> tuple[str, str]:
+    """Extract a prompt and identify the hook host from its wire envelope."""
+
+    try:
+        payload = json.loads(hook_input)
+    except (ValueError, RecursionError):
+        return hook_input, "claude"
+
+    if (
+        isinstance(payload, dict)
+        and payload.get("hook_event_name") == "UserPromptSubmit"
+        and isinstance(payload.get("session_id"), str)
+        and isinstance(payload.get("prompt"), str)
+    ):
+        host = "codex" if isinstance(payload.get("turn_id"), str) else "claude"
+        return payload["prompt"], host
+    return hook_input, "claude"
+
+
+def _emit_context(context: str) -> None:
+    """Emit a schema-valid UserPromptSubmit response."""
+
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": context,
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+def main() -> None:
+    # Read the hook payload from stdin. Older integrations may still pipe raw text.
+    try:
+        hook_input = sys.stdin.read().strip()
+    except Exception:
+        hook_input = ""
+
+    user_input, host = _extract_prompt_and_host(hook_input)
+
+    result = detect_keywords(user_input)
+
+    # First-time user: add welcome context to their first message.
+    if not result["detected"] and is_first_time():
+        skill_name = "welcome"
+        _emit_context(f"""<skill-suggestion>
+🎯 MATCHED SKILLS (use AskUserQuestion to let user choose):
+- /ouroboros:{skill_name} - First time using Ouroboros! Starting welcome experience.
+IMPORTANT: Auto-triggering welcome experience now. Use AskUserQuestion to confirm or skip.
+</skill-suggestion>""")
+        return
+
+    if result["detected"]:
+        skill = result["suggested_skill"]
+        keyword = result["keyword"]
+
+        # Codex hook envelopes do not expose the parent session's profile/config
+        # layers, so a child hook process cannot reconstruct its effective MCP state.
+        needs_setup = host != "codex" and not is_mcp_configured()
+        if skill not in SETUP_BYPASS_SKILLS and needs_setup:
+            _emit_context("""<skill-suggestion>
+🎯 REQUIRED SKILL:
+- /ouroboros:setup - Ouroboros setup required. Run "ooo setup" first to register the MCP server.
+</skill-suggestion>""")
+        else:
+            skill_name = skill.replace("/ouroboros:", "")
+            _emit_context(f"""<skill-suggestion>
+🎯 MATCHED SKILLS:
+- /ouroboros:{skill_name} - Detected "{keyword}"
+</skill-suggestion>""")
+
+
+if __name__ == "__main__":
+    main()

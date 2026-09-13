@@ -1,0 +1,933 @@
+name: CI
+
+on:
+   push:
+      branches: [main]
+      tags: ["v*"]
+   pull_request:
+      branches: [main]
+   schedule:
+      - cron: "23 4 * * *"
+   workflow_dispatch:
+      inputs:
+         rehearsal:
+            description: "Run the exact tag build/verify graph, the non-tag main graph, or publish an immutable nightly prerelease after the full source graph passes. Manual nightlies release dev; scheduled nightlies release main."
+            required: true
+            type: choice
+            options: [tag-build-verify, main-nontag, nightly-release]
+
+# Least privilege by default: only `publish` needs write, and it declares its
+# own job-level `contents: write` override. This keeps rehearsal dispatches
+# (and every build/verify job) on a read-scoped GITHUB_TOKEN.
+permissions:
+   contents: read
+
+concurrency:
+   # Real stable and nightly publication share one non-cancelling cross-channel
+   # lane so npm dist-tags and closed evidence cannot race each other.
+   group: ${{ (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) && 'gajae-npm-release' || format('ci-{0}-{1}', github.ref, github.event_name == 'workflow_dispatch' && inputs.rehearsal || 'event') }}
+   cancel-in-progress: ${{ !(startsWith(github.ref, 'refs/tags/v') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) }}
+
+jobs:
+   release_metadata:
+      if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release') }}
+      runs-on: ubuntu-22.04
+      timeout-minutes: 5
+      outputs:
+         channel: ${{ steps.release.outputs.channel }}
+         version: ${{ steps.release.outputs.version }}
+         nightly_version: ${{ steps.release.outputs.nightly_version }}
+         tag_name: ${{ steps.release.outputs.tag_name }}
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.4.0"
+         - name: Resolve immutable release identity
+           id: release
+           shell: bash
+           env:
+              IS_NIGHTLY: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) && '1' || '0' }}
+              EVENT_NAME: ${{ github.event_name }}
+              SOURCE_SHA: ${{ github.sha }}
+              RUN_ID: ${{ github.run_id }}
+           run: |
+              set -euo pipefail
+              if [ "$IS_NIGHTLY" = 1 ]; then
+                 expected_ref=refs/heads/dev
+                 if [ "$EVENT_NAME" = schedule ]; then
+                    expected_ref=refs/heads/main
+                 fi
+                 if [ "$GITHUB_REF" != "$expected_ref" ]; then
+                    echo "Nightly release for $EVENT_NAME must run from $expected_ref, not $GITHUB_REF" >&2
+                    exit 1
+                 fi
+                 timestamp="$(git show -s --format=%cI "$SOURCE_SHA")"
+                 version="$(bun scripts/nightly-release.ts version --timestamp "$timestamp" --run-id "$RUN_ID" --source-sha "$SOURCE_SHA")"
+                 {
+                    echo "channel=nightly"
+                    echo "version=$version"
+                    echo "nightly_version=$version"
+                    echo "tag_name=v$version"
+                 } >> "$GITHUB_OUTPUT"
+              elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+                 version="${GITHUB_REF_NAME#v}"
+                 if ! [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+                    echo "Stable release tag must be exact vX.Y.Z, received $GITHUB_REF_NAME" >&2
+                    exit 1
+                 fi
+                 manifest_version="$(bun -e 'const manifest = await Bun.file("packages/coding-agent/package.json").json(); process.stdout.write(manifest.version)')"
+                 if [ "$manifest_version" != "$version" ]; then
+                    echo "Stable release tag $GITHUB_REF_NAME does not match package version $manifest_version" >&2
+                    exit 1
+                 fi
+                 {
+                    echo "channel=stable"
+                    echo "version=$version"
+                    echo "nightly_version="
+                    echo "tag_name=$GITHUB_REF_NAME"
+                 } >> "$GITHUB_OUTPUT"
+              else
+                 {
+                    echo "channel=rehearsal"
+                    echo "version="
+                    echo "nightly_version="
+                    echo "tag_name="
+                 } >> "$GITHUB_OUTPUT"
+              fi
+         - name: Validate stable tag protected-main provenance
+           if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+           env:
+              SOURCE_SHA: ${{ github.sha }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              # A stable tag workflow is evaluated from the tagged revision and
+              # later grants repository write plus the OIDC identity token, so
+              # the tagged commit must provably come from the protected main
+              # line: fetch
+              # the live default branch from origin and require ancestry.
+              # This check alone cannot stop an actor allowed to create tags
+              # from pointing one at a side-branch commit with modified
+              # workflow YAML; closing that half requires the owner-controlled
+              # repository settings documented on the publish job below.
+              git fetch --quiet --tags --prune --unshallow origin +refs/heads/main:refs/remotes/origin/main \
+                 || git fetch --quiet --tags --prune origin +refs/heads/main:refs/remotes/origin/main
+              if ! git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main; then
+                 echo "Stable release tag $GITHUB_REF_NAME resolves to $SOURCE_SHA, which is not an ancestor of origin/main; refusing release" >&2
+                 exit 1
+              fi
+   # ---------------------------------------------------------------------------
+   # PR + main branch: lint/typecheck (native-free) and the test suite.
+   # These never run on tags — a tag is cut from an already-green main.
+   # ---------------------------------------------------------------------------
+   check:
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag' || inputs.rehearsal == 'nightly-release') }}
+      runs-on: ubuntu-22.04
+      timeout-minutes: 20
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+           with:
+              node-version: "24"
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.4.0"
+         - name: Cache bun dependencies
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+           with:
+              path: ~/.bun/install/cache
+              key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+         - run: bun install --frozen-lockfile
+         - name: Lint and type check (native-free)
+           run: bun run ci:check:full
+
+   # ---------------------------------------------------------------------------
+   # PR + main branch: sharded full test suite. Unlike dev CI (changed-path
+   # affected), Main CI runs the COMPLETE task union via CI_FORCE_FULL. Long-tail
+   # tasks are sub-split (coding-agent tests 16-way, rust-test 4 nextest
+   # partitions) so no single shard dominates wall-time. The `test` aggregate job
+   # keeps the stable branch-protection status name.
+   # ---------------------------------------------------------------------------
+   main_plan:
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag' || inputs.rehearsal == 'nightly-release') }}
+      runs-on: ubuntu-22.04
+      timeout-minutes: 10
+      env:
+         CI_FORCE_FULL: "1"
+         CI_CODING_AGENT_TEST_SHARDS: "16"
+         CI_RUST_TEST_PARTITIONS: "4"
+      outputs:
+         matrix: ${{ steps.plan.outputs.matrix }}
+         has_tasks: ${{ steps.plan.outputs.has_tasks }}
+         has_native: ${{ steps.plan.outputs.has_native }}
+         has_python: ${{ steps.plan.outputs.has_python }}
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.4.0"
+         - name: Compute full Main CI task matrix
+           id: plan
+           run: bun scripts/ci-dev-affected.ts --matrix-json
+
+   main_native:
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag' || inputs.rehearsal == 'nightly-release') && needs.main_plan.outputs.has_native == 'true' }}
+      needs: [main_plan]
+      runs-on: ubuntu-22.04
+      timeout-minutes: 30
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+           with:
+              node-version: "24"
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.4.0"
+         - name: Cache bun dependencies
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+           with:
+              path: ~/.bun/install/cache
+              key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+         - run: bun install --frozen-lockfile
+         - name: Build native addon (linux-x64 baseline + modern)
+           env:
+              TARGET_PLATFORM: linux
+              TARGET_ARCH: x64
+              TARGET_VARIANTS: baseline modern
+           run: bun run ci:build:native
+         - name: Verify required native addon variants
+           run: |
+              test -f packages/natives/native/pi_natives.linux-x64-baseline.node
+              test -f packages/natives/native/pi_natives.linux-x64-modern.node
+         - name: Upload native addon(s)
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: main-native-${{ github.run_id }}
+              path: |
+                 packages/natives/native/pi_natives.linux-x64-baseline.node
+                 packages/natives/native/pi_natives.linux-x64-modern.node
+              if-no-files-found: error
+              retention-days: 1
+              overwrite: true
+
+
+   main_shards:
+      name: test-shard / ${{ matrix.key }}
+      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag' || inputs.rehearsal == 'nightly-release') && needs.main_plan.outputs.has_tasks == 'true' && needs.main_native.result != 'failure' && needs.main_native.result != 'cancelled' }}
+      needs: [main_plan, main_native]
+      runs-on: ubuntu-22.04
+      timeout-minutes: ${{ matrix.rust && 90 || 60 }}
+      strategy:
+         fail-fast: false
+         max-parallel: 16
+         matrix: ${{ fromJSON(needs.main_plan.outputs.matrix) }}
+      env:
+         CI_FORCE_FULL: "1"
+         CI_CODING_AGENT_TEST_SHARDS: "16"
+         CI_RUST_TEST_PARTITIONS: "4"
+         AFFECTED_TASK_KEY: ${{ matrix.key }}
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+           with:
+              node-version: "24"
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.4.0"
+         - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2  # nightly
+           if: ${{ matrix.rust }}
+           with:
+              toolchain: nightly-2026-04-29
+         - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e  # v2
+           if: ${{ matrix.nextest }}
+           with:
+              tool: nextest@0.9.137
+         - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+           if: ${{ matrix.rust }}
+           with:
+              shared-key: main-rust-linux-x64
+              save-if: ${{ github.ref == 'refs/heads/main' }}
+              cache-workspace-crates: true
+         - name: Cache bun dependencies
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+           with:
+              path: ~/.bun/install/cache
+              key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+         - run: bun install --frozen-lockfile
+         - name: Download native addon(s)
+           if: ${{ matrix.native }}
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: main-native-${{ github.run_id }}
+              path: packages/natives/native
+         - name: Run task shard
+           env:
+              GITHUB_ACTIONS: ""
+           run: bun scripts/ci-dev-affected.ts --task="$AFFECTED_TASK_KEY"
+
+   acp_conformance:
+      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag' || inputs.rehearsal == 'nightly-release') && needs.main_plan.outputs.has_tasks == 'true' && needs.main_native.result != 'failure' && needs.main_native.result != 'cancelled' }}
+      needs: [main_plan, main_native]
+      runs-on: ubuntu-22.04
+      timeout-minutes: 20
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+           with:
+              node-version: "24"
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.4.0"
+         - name: Cache bun dependencies
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+           with:
+              path: ~/.bun/install/cache
+              key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+         - run: bun install --frozen-lockfile
+         - name: Download native addon(s)
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: main-native-${{ github.run_id }}
+              path: packages/natives/native
+         - name: Run ACP conformance
+           run: |
+              # Real (non-symlinked) seeded scratch workspace, matching the promoted baseline:
+              # the ACP client enforces its session cwd root against the resolved path.
+              scratch="$(mktemp -d "$RUNNER_TEMP/acp-conformance-XXXXXX")"
+              scratch="$(cd "$scratch" && pwd -P)"
+              printf 'acpx conformance workspace\n' > "$scratch/README.md"
+              bun run conformance:run -- \
+                 --agent-command "bun packages/coding-agent/scripts/acp-conformance-agent.ts" \
+                 --format json \
+                 --report "$RUNNER_TEMP/acp-conformance/report.json" \
+                 --cwd "$scratch"
+         - name: Upload ACP conformance report
+           if: ${{ always() }}
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: acp-conformance-report-${{ github.run_id }}
+              path: ${{ runner.temp }}/acp-conformance/report.json
+              if-no-files-found: warn
+              retention-days: 7
+              overwrite: true
+
+   # Branch protection must keep requiring this stable aggregate status.
+   test:
+      if: ${{ always() && !startsWith(github.ref, 'refs/tags/v') && (github.event_name != 'workflow_dispatch' || inputs.rehearsal == 'main-nontag' || inputs.rehearsal == 'nightly-release') }}
+      needs: [main_plan, main_native, main_shards, acp_conformance]
+      runs-on: ubuntu-22.04
+      timeout-minutes: 5
+      steps:
+         - name: Fail closed unless every shard succeeded
+           run: |
+              plan='${{ needs.main_plan.result }}'
+              native='${{ needs.main_native.result }}'
+              shards='${{ needs.main_shards.result }}'
+              conformance='${{ needs.acp_conformance.result }}'
+              echo "main_plan=$plan main_native=$native main_shards=$shards acp_conformance=$conformance"
+              test "$plan" = success
+              case "$native" in success|skipped) ;; *) echo "native gate failed"; exit 1;; esac
+              test "$shards" = success
+              test "$conformance" = success
+
+   nightly_gate:
+      if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) }}
+      needs: [check, test]
+      runs-on: ubuntu-22.04
+      timeout-minutes: 5
+      steps:
+         - name: Require the complete main verification graph
+           run: |
+              test '${{ needs.check.result }}' = success
+              test '${{ needs.test.result }}' = success
+
+   # ---------------------------------------------------------------------------
+   # Stable tags and verified nightly runs build native addons for every published
+   # platform, then standalone binaries. Rehearsals stop after binary verification;
+   # nightly publication waits for `nightly_gate` before touching npm or GitHub.
+   # ---------------------------------------------------------------------------
+   native:
+      if: ${{ always() && needs.release_metadata.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) }}
+      needs: [release_metadata]
+      timeout-minutes: 90
+      runs-on: ${{ matrix.os }}
+      strategy:
+         fail-fast: false
+         matrix:
+            include:
+               - { os: ubuntu-22.04, platform: linux, arch: x64, variant: baseline, rust_checks: true }
+               - { os: ubuntu-22.04, platform: linux, arch: x64, variant: modern }
+               - { os: ubuntu-22.04, platform: linux, arch: arm64, target: aarch64-unknown-linux-gnu }
+               - { os: macos-14, platform: darwin, arch: arm64 }
+               - { os: macos-15-intel, platform: darwin, arch: x64, variant: baseline }
+               - { os: windows-latest, platform: win32, arch: x64, variant: baseline }
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: ./.github/actions/build-native
+           with:
+              hash: ${{ github.sha }}
+              platform: ${{ matrix.platform }}
+              arch: ${{ matrix.arch }}
+              variant: ${{ matrix.variant }}
+              target: ${{ matrix.target }}
+              rust_checks: ${{ matrix.rust_checks && 'true' || 'false' }}
+              save_cache: "true"
+              nightly_version: ${{ needs.release_metadata.outputs.nightly_version }}
+
+   binaries:
+      if: ${{ always() && needs.release_metadata.result == 'success' && needs.native.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'tag-build-verify') || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.rehearsal == 'nightly-release')) }}
+      needs: [native, release_metadata]
+      timeout-minutes: 60
+      runs-on: ${{ matrix.os }}
+      strategy:
+         fail-fast: false
+         matrix:
+            include:
+               - { os: ubuntu-22.04, platform: linux, arch: x64, target_id: linux-x64, binary_path: packages/coding-agent/binaries/gjc-linux-x64 }
+               - { os: ubuntu-24.04-arm, platform: linux, arch: arm64, target_id: linux-arm64, binary_path: packages/coding-agent/binaries/gjc-linux-arm64 }
+               - { os: macos-14, platform: darwin, arch: arm64, target_id: darwin-arm64, binary_path: packages/coding-agent/binaries/gjc-darwin-arm64 }
+               - { os: macos-15-intel, platform: darwin, arch: x64, target_id: darwin-x64, binary_path: packages/coding-agent/binaries/gjc-darwin-x64 }
+               - { os: windows-latest, platform: win32, arch: x64, target_id: win32-x64, binary_path: packages/coding-agent/binaries/gjc-windows-x64.exe }
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+           with:
+              node-version: "24"
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.4.0"
+         - name: Cache bun dependencies
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+           with:
+              path: ~/.bun/install/cache
+              key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+         - run: bun install --frozen-lockfile
+         - name: Stage nightly release version
+           if: ${{ needs.release_metadata.outputs.nightly_version != '' }}
+           run: bun scripts/nightly-release.ts stage --version "${{ needs.release_metadata.outputs.nightly_version }}" --source-sha "${{ github.sha }}"
+         - name: Download native addon(s)
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              pattern: pi-natives-${{ matrix.platform }}-${{ matrix.arch }}*
+              path: packages/natives/native
+              merge-multiple: true
+         - name: Verify memory-guard native loader export
+           run: bun test packages/natives/test/memory-guard-native.test.ts
+
+         - name: Build release binary
+           env:
+              RELEASE_TARGETS: ${{ matrix.target_id }}
+           run: bun run ci:release:build-binaries
+         - name: Smoke memory-guard native route (Windows)
+           if: runner.os == 'Windows'
+           shell: pwsh
+           run: |
+              $json = & "${{ matrix.binary_path }}" internal memory-guard-native-smoke --json
+              $data = $json | ConvertFrom-Json
+              if ($data.api -ne "memory_guard_windows_job_probe_v1") {
+                 throw "unexpected api: $($data.api)"
+              }
+              if ($data.source -ne "pi_natives") {
+                 throw "unexpected source: $($data.source)"
+              }
+              if ($data.result.platform -ne "win32") {
+                 throw "unexpected platform: $($data.result.platform)"
+              }
+              if (@("job_snapshot", "not_in_job", "api_error") -notcontains $data.result.kind) {
+                 throw "unexpected result kind: $($data.result.kind)"
+              }
+         - name: Smoke release binary
+           if: runner.os != 'Windows'
+           run: |
+              runtime_dir="$(mktemp -d)"
+              HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" "${{ matrix.binary_path }}" --version
+              HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" "${{ matrix.binary_path }}" --smoke-test
+         - name: Smoke release binary (Windows)
+           if: runner.os == 'Windows'
+           shell: pwsh
+           run: |
+              $runtimeDir = Join-Path $env:TEMP ("gjc-runtime-" + [System.Guid]::NewGuid().ToString("N"))
+              New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+              $env:HOME = Join-Path $runtimeDir "home"
+              $env:XDG_DATA_HOME = Join-Path $runtimeDir "xdg"
+              & "${{ matrix.binary_path }}" --version
+              & "${{ matrix.binary_path }}" --smoke-test
+         - name: Upload release binary artifact
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: gjc-binary-${{ matrix.target_id }}
+              path: ${{ matrix.binary_path }}
+
+   release_prepare:
+      if: ${{ always() && needs.native.result == 'success' && needs.binaries.result == 'success' && ((needs.release_metadata.outputs.channel == 'stable' && startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch') || (needs.release_metadata.outputs.channel == 'nightly' && needs.nightly_gate.result == 'success')) }}
+      needs: [native, binaries, release_metadata, nightly_gate]
+      timeout-minutes: 45
+      runs-on: ubuntu-22.04
+      permissions:
+         contents: read
+         # Release-note attribution enumerates the pull requests behind each
+         # shipped commit. This job holds no write scope and no OIDC identity
+         # token: everything untrusted (dependency installs, repository
+         # scripts, GitHub API reads) happens here, before any credential that
+         # can publish exists.
+         pull-requests: read
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+           with:
+              # Release notes need the full history and the tag list.
+              fetch-depth: 0
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.4.0"
+         - name: Cache bun dependencies
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+           with:
+              path: ~/.bun/install/cache
+              key: bun-1.4.0-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
+         - run: bun install --frozen-lockfile
+         - name: Stage nightly release version
+           if: ${{ needs.release_metadata.outputs.nightly_version != '' }}
+           run: bun scripts/nightly-release.ts stage --version "${{ needs.release_metadata.outputs.nightly_version }}" --source-sha "${{ github.sha }}"
+         - name: Download all native addons
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              pattern: pi-natives-*
+              path: packages/natives/native
+              merge-multiple: true
+         - name: Prepare immutable package evidence
+           env:
+              RELEASE_CHANNEL: ${{ needs.release_metadata.outputs.channel }}
+           run: |
+              set -euo pipefail
+              evidence_dir="$RUNNER_TEMP/release-evidence"
+              rm -rf "$evidence_dir"
+              bun scripts/ci-release-publish.ts --prepare-evidence --evidence-dir "$evidence_dir" --release-channel "$RELEASE_CHANNEL"
+         - name: Persist pre-publication package evidence
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: release-evidence-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/release-evidence
+              if-no-files-found: error
+              retention-days: 30
+              overwrite: true
+         - name: Reject pre-existing release tag or release
+           env:
+              GH_TOKEN: ${{ github.token }}
+              TAG_NAME: ${{ needs.release_metadata.outputs.tag_name }}
+              SOURCE_SHA: ${{ github.sha }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              # Reject any pre-existing tag that does not peel to this run's source.
+              # Lightweight tags report the commit directly; annotated tags require
+              # the peeled ^{} ref. ls-remote --tags emits both lines; we match the
+              # peeled line when present and fall back to the direct ref otherwise.
+              raw_remote="$(git ls-remote --tags origin "refs/tags/$TAG_NAME" "refs/tags/$TAG_NAME^{}")"
+              if [ -n "$raw_remote" ]; then
+                 peeled="$(printf '%s\n' "$raw_remote" | awk -F '\t' '$2 ~ /\^\{\}$/ { print $1; exit }')"
+                 if [ -z "$peeled" ]; then
+                    peeled="$(printf '%s\n' "$raw_remote" | awk -F '\t' '$2 !~ /\^\{\}$/ { print $1; exit }')"
+                 fi
+                 if [ "$peeled" != "$SOURCE_SHA" ]; then
+                    echo "Release tag $TAG_NAME already exists and peels to ${peeled:-<empty>}, not $SOURCE_SHA; refusing upsert" >&2
+                    exit 1
+                 fi
+              fi
+              status="$(curl --silent --show-error --output "$RUNNER_TEMP/release-preflight.json" --write-out '%{http_code}' \
+                 --header "Authorization: Bearer $GH_TOKEN" \
+                 --header "Accept: application/vnd.github+json" \
+                 "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$TAG_NAME")"
+              case "$status" in
+                 404) ;;
+                 200) echo "Release $TAG_NAME already exists; refusing upsert" >&2; exit 1 ;;
+                 *) echo "Cannot verify release absence: GitHub API returned HTTP $status" >&2; exit 1 ;;
+              esac
+         - name: Derive and validate release notes
+           # A curated release is assembled by cherry-picking onto main, so
+           # generate_release_notes has no merged pull requests to describe and
+           # emits a body containing only a compare link (v0.14.1 shipped that).
+           # The body is resolved and validated HERE, in the credential-free
+           # preparation job, before the publish job performs the irreversible
+           # npm publication: a fetch, API, parse, or generation failure aborts
+           # the run while nothing immutable has shipped yet.
+           env:
+              GH_TOKEN: ${{ github.token }}
+              TAG_NAME: ${{ needs.release_metadata.outputs.tag_name }}
+              SOURCE_SHA: ${{ github.sha }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              git fetch --quiet --tags --prune
+              notes_dir="$RUNNER_TEMP/release-notes"
+              mkdir -p "$notes_dir"
+              notes="$notes_dir/release-notes.md"
+              # Only exact stable vX.Y.Z tags that are ancestors of this release
+              # head may anchor the range; nightly/RC or unrelated-branch tags
+              # would derive notes from the wrong base. The loop is pipe-free so
+              # a no-candidate outcome reaches the documented empty-notes
+              # fallback instead of aborting under pipefail.
+              #
+              # A tag whose GitHub Release was never published is skipped too. A
+              # stable cut that fails after tagging (v0.15.1 died in this very
+              # step, before any package reached npm) leaves an immutable tag
+              # that shipped nothing, and anchoring on it would hide every
+              # change users never received from the release that finally
+              # carries them. Only a published, non-draft release counts as
+              # "already shipped".
+              previous=""
+              while IFS= read -r tag; do
+                 [ "$tag" = "$TAG_NAME" ] && continue
+                 [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+                 if ! git merge-base --is-ancestor "$tag" "$SOURCE_SHA"; then
+                    continue
+                 fi
+                 # Fail closed on anything but a definitive "no such release":
+                 # an auth/transport/5xx failure must not silently widen the
+                 # range to an older base.
+                 lookup_error="$notes_dir/release-lookup.err"
+                 release_status=0
+                 release_draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.draft' 2>"$lookup_error")" || release_status=$?
+                 if [ "$release_status" -eq 0 ]; then
+                    if [ "$release_draft" = "false" ]; then
+                       previous="$tag"
+                       break
+                    fi
+                    echo "Skipping $tag: its GitHub Release is still a draft" >&2
+                    continue
+                 fi
+                 if grep -qiE 'HTTP 404|Not Found' "$lookup_error"; then
+                    echo "Skipping $tag: tagged but never published as a GitHub Release" >&2
+                    continue
+                 fi
+                 echo "Release lookup for $tag failed: $(cat "$lookup_error")" >&2
+                 exit 1
+              done < <(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname)
+              if [ -z "$previous" ]; then
+                 echo "No previous stable tag to compare against; leaving notes empty" >&2
+                 : > "$notes"
+              else
+                 bun scripts/release-notes.ts \
+                    --repo "$GITHUB_REPOSITORY" \
+                    --base "$previous" \
+                    --head "$SOURCE_SHA" \
+                    --head-tag "$TAG_NAME" \
+                    --out "$notes"
+                 # The release cannot be redone once packages are immutable, so
+                 # the persisted body must be deterministic: a second derivation
+                 # has to reproduce it byte-for-byte.
+                 repeat="$notes_dir/release-notes-repeat.md"
+                 bun scripts/release-notes.ts \
+                    --repo "$GITHUB_REPOSITORY" \
+                    --base "$previous" \
+                    --head "$SOURCE_SHA" \
+                    --head-tag "$TAG_NAME" \
+                    --out "$repeat"
+                 cmp --silent "$notes" "$repeat" || { echo "Release notes derivation is not deterministic" >&2; exit 1; }
+                 rm -f "$repeat"
+              fi
+              (cd "$notes_dir" && sha256sum release-notes.md > release-notes.sha256)
+         - name: Persist validated release notes
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: release-notes-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/release-notes
+              if-no-files-found: error
+              retention-days: 30
+              overwrite: true
+
+   release_approval:
+      # Approval gate BEFORE the credential boundary, STABLE releases only:
+      # scheduled and manual nightlies are the documented unattended lane and
+      # must never wait on a reviewer. The environment's protection rules
+      # (required reviewers, restricted deployment refs) are owner-controlled
+      # repository settings and are NOT evaluated from the tagged revision.
+      # This job holds no permissions and no OIDC token, so placing the
+      # environment HERE — not on publish — keeps the publish job's OIDC
+      # subject ref-scoped (repo:...:ref:refs/tags/v*), the identity the npm
+      # trusted-publisher registrations and the shipped v0.14.1 exchange
+      # already prove. Owner prerequisites (documented blocker, verified
+      # absent at review time): configure the npm-release environment with
+      # required non-self reviewers and no administrator bypass, restrict its
+      # deployment refs to the release refs, and protect `main` plus
+      # `refs/tags/v*` creation with rulesets. Until then this gate is a hook.
+      # `always() &&` is load-bearing, not decoration: `nightly_gate` is an
+      # ANCESTOR of release_prepare and is skipped on every stable tag, and
+      # GitHub propagates a skipped ancestor to each descendant whose condition
+      # omits always(). Without it this job — and publish and release_finalize
+      # behind it — skip with zero steps on every stable tag while every build
+      # is green, which is exactly how v0.15.0 and v0.15.1 tagged and published
+      # nothing. release_prepare already carries always() for the same reason.
+      if: ${{ always() && needs.release_prepare.result == 'success' && needs.release_metadata.outputs.channel == 'stable' }}
+      needs: [release_prepare, release_metadata]
+      timeout-minutes: 30
+      runs-on: ubuntu-22.04
+      permissions: {}
+      environment: npm-release
+      steps:
+         - name: Record release approval
+           run: echo "Stable release approved for ${{ github.ref }} via the npm-release environment gate"
+
+   publish:
+      # Fixed publisher boundary: the ONLY job holding the OIDC identity
+      # token, and it holds nothing else — no contents scope, no checkout, no
+      # bun, no repository code. A malicious tagged revision cannot influence
+      # what executes here: the steps are pinned actions plus this workflow
+      # shell, and the payload is the sha512-sealed tarball set produced by
+      # release_prepare. Publication itself is `npm publish` from the exact,
+      # integrity-verified npm CLI against the sealed bytes only; the sealed
+      # sha512 is re-verified at this boundary before every publish, registry
+      # state is reconciled by integrity, and the per-package receipt feeds
+      # the finalize job's evidence.
+      #
+      # The OIDC subject stays ref-scoped (repo:...:ref:refs/tags/v*) — the
+      # identity the npm trusted-publisher registrations and the shipped
+      # v0.14.1 exchange already prove. Owner-controlled release
+      # prerequisites that cannot be set from this repository (documented
+      # blocker, verified absent at review time): a ruleset protecting
+      # `main`, a tag ruleset for `refs/tags/v*` restricting creation to
+      # maintainers, and the npm-release environment on release_approval
+      # with required non-self reviewers and no admin bypass.
+      # always(): see release_approval — the skipped nightly_gate ancestor
+      # otherwise skips this job on every stable tag. The gate itself is
+      # unchanged: nightly publishes on channel, stable only behind approval.
+      if: ${{ always() && needs.release_prepare.result == 'success' && (needs.release_metadata.outputs.channel == 'nightly' || needs.release_approval.result == 'success') }}
+      needs: [release_prepare, release_approval, release_metadata]
+      timeout-minutes: 45
+      runs-on: ubuntu-22.04
+      permissions:
+         # npm trusted publishing (OIDC): npm >= 11.5.1 exchanges this job's
+         # GitHub OIDC token for a short-lived registry credential, so no
+         # long-lived NPM_TOKEN is involved and nothing expires under us.
+         id-token: write
+      steps:
+         - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+           with:
+              # Exact patch pin: this job holds the OIDC identity token, so the
+              # bootstrap runtime must not float across Node releases.
+              node-version: "24.19.0"
+         - name: Pin npm for OIDC trusted publishing
+           # Trusted publishing requires npm >= 11.5.1; do not rely on whatever
+           # npm the Node distribution happens to bundle. The pin is exact and
+           # integrity-verifiable: a mutable range inside this credential-
+           # bearing job would let a drifting or compromised CLI publish.
+           env:
+              NPM_PIN_VERSION: "11.5.1"
+              # sha512 of https://registry.npmjs.org/npm/-/npm-11.5.1.tgz
+              # (matches the registry dist.integrity for npm@11.5.1).
+              NPM_TARBALL_SHA512: "232e6f5d9e799bcb486920b3e9ba907fdf96e576cf7e8c9446c8162e33a416096a1d37a9e910d9a918f6b1f606791c99bc6bb61ee2569b496ec74af13d0dbd95"
+           shell: bash
+           run: |
+              set -euo pipefail
+              tmp="$(mktemp -d "$RUNNER_TEMP/npm-pin.XXXXXX")"
+              npm pack "npm@${NPM_PIN_VERSION}" --pack-destination "$tmp"
+              echo "$NPM_TARBALL_SHA512  $tmp/npm-${NPM_PIN_VERSION}.tgz" | sha512sum --check --strict -
+              npm install -g "$tmp/npm-${NPM_PIN_VERSION}.tgz"
+              test "$(npm --version)" = "$NPM_PIN_VERSION"
+         - name: Download pre-publication package evidence
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: release-evidence-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/release-evidence
+         - name: Publish sealed tarballs to npm
+           env:
+              RELEASE_CHANNEL: ${{ needs.release_metadata.outputs.channel }}
+              RELEASE_VERSION: ${{ needs.release_metadata.outputs.version }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              evidence_dir="$RUNNER_TEMP/release-evidence"
+              expected="$evidence_dir/gajae-release-packages-expected-v1.json"
+              registry="https://registry.npmjs.org/"
+              case "$RELEASE_CHANNEL" in
+                 stable) npm_tag=latest ;;
+                 nightly) npm_tag=nightly ;;
+                 *) echo "Unknown release channel $RELEASE_CHANNEL" >&2; exit 1 ;;
+              esac
+              records="$RUNNER_TEMP/receipt-records.json"
+              echo '[]' > "$records"
+              order_file="$evidence_dir/gajae-release-publish-order-v1.json"
+              # The sealed plan publishes dependencies before dependents; it
+              # must cover exactly the expected package set.
+              if [ "$(jq -r '.order[]' "$order_file" | sort)" != "$(jq -r '.packages[].name' "$expected" | sort)" ]; then
+                 echo "Publish order file does not cover exactly the expected package set" >&2
+                 exit 1
+              fi
+              for name in $(jq -r '.order[]' "$order_file"); do
+                 record="$(jq -c --arg name "$name" '.packages[] | select(.name == $name)' "$expected")"
+                 if [ -z "$record" ]; then
+                    echo "Publish order references unknown package $name" >&2
+                    exit 1
+                 fi
+                 version="$(jq -r '.version' <<<"$record")"
+                 sha="$(jq -r '.tarball_sha512' <<<"$record")"
+                 expected_sri="$(jq -r '.expected_sri' <<<"$record")"
+                 tarball="$evidence_dir/tarballs/$sha.tgz"
+                 # Re-verify the sealed bytes at the credential boundary.
+                 echo "$sha  $tarball" | sha512sum --check --strict -
+                 published=false
+                 observed="$(npm view "${name}@${version}" dist.integrity --registry="$registry" 2>/dev/null || true)"
+                 if [ "$observed" = "$expected_sri" ]; then
+                    echo "Skipping $name@$version (registry already carries the sealed bytes)"
+                 else
+                    if ! output="$(npm publish "$tarball" --access public --registry="$registry" --tag="$npm_tag" 2>&1)"; then
+                       raced="$(npm view "${name}@${version}" dist.integrity --registry="$registry" 2>/dev/null || true)"
+                       if [ "$raced" != "$expected_sri" ]; then
+                          echo "npm publish failed for $name@$version: $output" >&2
+                          exit 1
+                       fi
+                       echo "Skipping $name@$version (concurrent exact publication)"
+                    else
+                       published=true
+                       echo "Published $name@$version"
+                    fi
+                    # npm is read-after-write eventually consistent: re-observe
+                    # with bounded backoff until the sealed integrity is visible.
+                    # 0.15.4 proved 60s is not enough (agent-core became visible
+                    # only after the window elapsed, failing an otherwise clean
+                    # publish); allow up to 10 minutes.
+                    attempt=0
+                    while :; do
+                       attempt=$((attempt + 1))
+                       observed="$(npm view "${name}@${version}" dist.integrity --registry="$registry" 2>/dev/null || true)"
+                       [ "$observed" = "$expected_sri" ] && break
+                       if [ "$attempt" -ge 40 ]; then
+                          echo "$name@$version did not become visible with the sealed integrity" >&2
+                          exit 1
+                       fi
+                       sleep 15
+                    done
+                 fi
+                 tagged="$(npm view "${name}@${npm_tag}" version --registry="$registry" 2>/dev/null || true)"
+                 if [ "$tagged" != "$version" ]; then
+                    echo "npm tag $npm_tag for $name resolves $tagged, expected $version" >&2
+                    exit 1
+                 fi
+                 jq --arg name "$name" --arg version "$version" --arg sha "$sha" --arg sri "$observed" --argjson published "$published" \
+                    '. += [{name:$name, version:$version, tarball_sha512:$sha, registry_integrity:$sri, published:$published}]' \
+                    "$records" > "$records.tmp"
+                 mv "$records.tmp" "$records"
+              done
+              jq -n --arg version "$RELEASE_VERSION" --arg channel "$RELEASE_CHANNEL" --slurpfile packages "$records" \
+                 '{schema_version: 1, release_version: $version, release_channel: $channel, packages: $packages[0]}' \
+                 > "$evidence_dir/gajae-release-oidc-publish-receipt-v1.json"
+         - name: Persist OIDC publish receipt
+           uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+           with:
+              name: release-publish-receipt-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/release-evidence/gajae-release-oidc-publish-receipt-v1.json
+              if-no-files-found: error
+              retention-days: 30
+              overwrite: true
+
+   release_finalize:
+      # Repository-write boundary WITHOUT the OIDC token: assembles the final
+      # release evidence from the fixed publisher's receipt, creates the
+      # GitHub Release, and verifies it. Repository code may execute here
+      # because no npm credential capability exists in this job.
+      # always(): see release_approval. Only a successful publish finalizes.
+      if: ${{ always() && needs.publish.result == 'success' }}
+      needs: [publish, release_metadata]
+      timeout-minutes: 45
+      runs-on: ubuntu-22.04
+      permissions:
+         contents: write
+      steps:
+         - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+           with:
+              persist-credentials: false
+         - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+           with:
+              bun-version: "1.4.0"
+         - name: Download pre-publication package evidence
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: release-evidence-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/release-evidence
+         - name: Download OIDC publish receipt
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: release-publish-receipt-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/release-evidence
+         - name: Download validated release notes
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              name: release-notes-${{ needs.release_metadata.outputs.version }}
+              path: ${{ runner.temp }}/release-notes
+         - name: Verify release notes integrity
+           shell: bash
+           run: |
+              set -euo pipefail
+              cd "$RUNNER_TEMP/release-notes"
+              sha256sum --check --strict release-notes.sha256
+         - name: Assemble final release evidence
+           env:
+              RELEASE_CHANNEL: ${{ needs.release_metadata.outputs.channel }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              bun scripts/ci-release-publish.ts --finalize-evidence \
+                 --evidence-dir "$RUNNER_TEMP/release-evidence" \
+                 --release-channel "$RELEASE_CHANNEL"
+         - name: Download release binaries
+           uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+           with:
+              pattern: gjc-binary-*
+              path: release-binaries
+              merge-multiple: true
+         - name: Publish binary checksum manifest
+           env:
+              TAG_NAME: ${{ needs.release_metadata.outputs.tag_name }}
+              RELEASE_CHANNEL: ${{ needs.release_metadata.outputs.channel }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              bun scripts/release-binaries-manifest.ts --bin-dir release-binaries --tag "$TAG_NAME" --channel "$RELEASE_CHANNEL"
+         - name: Create GitHub Release
+           uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+           with:
+              tag_name: ${{ needs.release_metadata.outputs.tag_name }}
+              target_commitish: ${{ github.sha }}
+              name: ${{ needs.release_metadata.outputs.channel == 'nightly' && format('GJC Nightly {0}', needs.release_metadata.outputs.version) || format('GJC {0}', needs.release_metadata.outputs.version) }}
+              draft: false
+              prerelease: ${{ needs.release_metadata.outputs.channel == 'nightly' }}
+              make_latest: ${{ needs.release_metadata.outputs.channel != 'nightly' }}
+              body_path: ${{ runner.temp }}/release-notes/release-notes.md
+              generate_release_notes: false
+              fail_on_unmatched_files: true
+              files: |
+                 release-binaries/gjc-*
+                 release-binaries/gajae-release-binaries-v1.json
+                 release-binaries/gajae-release-binaries.sha256
+                 ${{ runner.temp }}/release-evidence/gajae-release-packages-expected-v1.json
+                 ${{ runner.temp }}/release-evidence/gajae-release-packages-v1.json
+                 ${{ runner.temp }}/release-evidence/gajae-release-channel-v1.json
+         - name: Verify immutable GitHub Release
+           env:
+              GH_TOKEN: ${{ github.token }}
+              TAG_NAME: ${{ needs.release_metadata.outputs.tag_name }}
+              EXPECTED_PRERELEASE: ${{ needs.release_metadata.outputs.channel == 'nightly' && 'true' || 'false' }}
+              SOURCE_SHA: ${{ github.sha }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              git fetch --force origin "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
+              resolved="$(git rev-parse "$TAG_NAME^{commit}")"
+              test "$resolved" = "$SOURCE_SHA" || { echo "Release tag $TAG_NAME resolves to $resolved, expected $SOURCE_SHA" >&2; exit 1; }
+              release_json="$RUNNER_TEMP/release-final.json"
+              gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG_NAME" > "$release_json"
+              RELEASE_JSON="$release_json" bun -e '
+                 const release = await Bun.file(Bun.env.RELEASE_JSON).json();
+                 const expectedPrerelease = Bun.env.EXPECTED_PRERELEASE === "true";
+                 if (release.tag_name !== Bun.env.TAG_NAME || release.draft !== false || release.prerelease !== expectedPrerelease) {
+                    throw new Error("GitHub Release identity/state does not match the requested release");
+                 }
+                 const expectedAssets = [
+                    "gjc-linux-x64", "gjc-linux-arm64", "gjc-darwin-arm64", "gjc-darwin-x64", "gjc-windows-x64.exe",
+                    "gajae-release-binaries-v1.json", "gajae-release-binaries.sha256",
+                    "gajae-release-packages-expected-v1.json", "gajae-release-packages-v1.json", "gajae-release-channel-v1.json",
+                 ];
+                 const assets = new Set(release.assets.map(asset => asset.name));
+                 const missing = expectedAssets.filter(name => !assets.has(name));
+                 if (missing.length > 0) throw new Error("GitHub Release is missing assets: " + missing.join(", "));
+              '

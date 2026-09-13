@@ -1,0 +1,300 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { type AuthCredentialStore, AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
+import { withEnv } from "./helpers";
+
+const SUPPRESS_ANTHROPIC_ENV = {
+	ANTHROPIC_API_KEY: undefined,
+	ANTHROPIC_OAUTH_TOKEN: undefined,
+} as const;
+
+describe("AuthStorage config-override apiKey", () => {
+	let tempDir = "";
+	let store: AuthCredentialStore | null = null;
+	let authStorage: AuthStorage | null = null;
+
+	beforeEach(async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-config-override-"));
+		store = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		authStorage = new AuthStorage(store);
+	});
+
+	afterEach(async () => {
+		store?.close();
+		store = null;
+		authStorage = null;
+		if (tempDir) {
+			await fs.rm(tempDir, { recursive: true, force: true });
+			tempDir = "";
+		}
+	});
+
+	async function seedOAuth(provider: string, access: string): Promise<void> {
+		if (!authStorage) throw new Error("test setup failed");
+		await authStorage.set(provider, [
+			{
+				type: "oauth",
+				access,
+				refresh: `${access}-refresh`,
+				expires: Date.now() + 60 * 60_000,
+			},
+		]);
+	}
+
+	test("setConfigApiKey beats OAuth access token for getApiKey", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			await seedOAuth("anthropic", "oauth-from-broker");
+			authStorage.setConfigApiKey("anthropic", "gateway-bearer");
+
+			expect(await authStorage.getApiKey("anthropic")).toBe("gateway-bearer");
+			expect(await authStorage.peekApiKey("anthropic")).toBe("gateway-bearer");
+		});
+	});
+
+	test("runtime override (--api-key) still beats setConfigApiKey", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			await seedOAuth("anthropic", "oauth-from-broker");
+			authStorage.setConfigApiKey("anthropic", "gateway-bearer");
+			authStorage.setRuntimeApiKey("anthropic", "cli-flag-bearer");
+
+			expect(await authStorage.getApiKey("anthropic")).toBe("cli-flag-bearer");
+		});
+	});
+
+	test("removeConfigApiKey restores OAuth resolution", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			await seedOAuth("anthropic", "oauth-from-broker");
+			authStorage.setConfigApiKey("anthropic", "gateway-bearer");
+			expect(await authStorage.getApiKey("anthropic")).toBe("gateway-bearer");
+
+			authStorage.removeConfigApiKey("anthropic");
+			expect(await authStorage.getApiKey("anthropic")).toBe("oauth-from-broker");
+		});
+	});
+
+	test("clearConfigApiKeys drops every config override at once", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			await seedOAuth("anthropic", "oauth-anthropic");
+			await seedOAuth("openai-codex", "oauth-codex");
+			authStorage.setConfigApiKey("anthropic", "gateway-bearer-A");
+			authStorage.setConfigApiKey("openai-codex", "gateway-bearer-B");
+
+			authStorage.clearConfigApiKeys();
+
+			expect(await authStorage.getApiKey("anthropic")).toBe("oauth-anthropic");
+			expect(await authStorage.getApiKey("openai-codex")).toBe("oauth-codex");
+		});
+	});
+
+	test("setConfigApiKey suppresses OAuth account_uuid attribution", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "oauth-with-account",
+					refresh: "r",
+					expires: Date.now() + 60 * 60_000,
+					accountId: "acc-123",
+				},
+			]);
+			// Sanity: without override, accountId is exposed.
+			expect(authStorage.getOAuthAccountId("anthropic")).toBe("acc-123");
+
+			authStorage.setConfigApiKey("anthropic", "gateway-bearer");
+			// With an explicit config bearer in play, OAuth account attribution
+			// must NOT leak — outbound auth is the gateway bearer, not OAuth.
+			expect(authStorage.getOAuthAccountId("anthropic")).toBeUndefined();
+		});
+	});
+
+	test("describeCredentialSource reports config override", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			await seedOAuth("anthropic", "oauth-from-broker");
+			authStorage.setConfigApiKey("anthropic", "gateway-bearer");
+			expect(authStorage.describeCredentialSource("anthropic")).toBe("config override (models.yml)");
+		});
+	});
+	test("env-sourced override yields to a stored login api_key", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			await authStorage.set("anthropic", [{ type: "api_key", key: "stored-login-key" }]);
+			authStorage.setConfigApiKey("anthropic", "stale-env-key", { envSourced: true });
+
+			expect(await authStorage.getApiKey("anthropic")).toBe("stored-login-key");
+			expect(await authStorage.peekApiKey("anthropic")).toBe("stored-login-key");
+		});
+	});
+
+	test("env-sourced override applies when no stored credential exists", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			authStorage.setConfigApiKey("anthropic", "env-key", { envSourced: true });
+
+			expect(await authStorage.getApiKey("anthropic")).toBe("env-key");
+			expect(await authStorage.peekApiKey("anthropic")).toBe("env-key");
+		});
+	});
+
+	test("env-sourced override still beats a stored OAuth credential", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			await seedOAuth("anthropic", "oauth-from-broker");
+			authStorage.setConfigApiKey("anthropic", "gateway-bearer-from-env", { envSourced: true });
+
+			expect(await authStorage.getApiKey("anthropic")).toBe("gateway-bearer-from-env");
+			expect(await authStorage.peekApiKey("anthropic")).toBe("gateway-bearer-from-env");
+		});
+	});
+
+	test("literal config override still beats a stored login api_key", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			await authStorage.set("anthropic", [{ type: "api_key", key: "stored-login-key" }]);
+			authStorage.setConfigApiKey("anthropic", "literal-pin");
+
+			expect(await authStorage.getApiKey("anthropic")).toBe("literal-pin");
+			expect(await authStorage.peekApiKey("anthropic")).toBe("literal-pin");
+		});
+	});
+
+	test("re-pinning a literal key after an env-sourced override restores top priority", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			await authStorage.set("anthropic", [{ type: "api_key", key: "stored-login-key" }]);
+			authStorage.setConfigApiKey("anthropic", "stale-env-key", { envSourced: true });
+			expect(await authStorage.getApiKey("anthropic")).toBe("stored-login-key");
+
+			authStorage.setConfigApiKey("anthropic", "literal-pin");
+			expect(await authStorage.getApiKey("anthropic")).toBe("literal-pin");
+		});
+	});
+
+	test("describeCredentialSource reports the stored credential that shadows an env-sourced override", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			await authStorage.set("anthropic", [{ type: "api_key", key: "stored-login-key" }]);
+			authStorage.setConfigApiKey("anthropic", "stale-env-key", { envSourced: true });
+
+			expect(authStorage.describeCredentialSource("anthropic")).toContain("api_key");
+		});
+	});
+
+	test("owner-scoped config reads do not cross-use same-provider registrations", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			const firstOwner = {};
+			const secondOwner = {};
+			const unregisteredOwner = {};
+			await seedOAuth("anthropic", "oauth-global");
+			authStorage.setConfigApiKey("anthropic", "first-key", { owner: firstOwner });
+			authStorage.setConfigApiKey("anthropic", "second-key", { owner: secondOwner });
+
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: firstOwner })).toBe("first-key");
+			expect(await authStorage.peekApiKey("anthropic", { owner: firstOwner })).toBe("first-key");
+			expect(authStorage.hasAuth("anthropic", undefined, { owner: firstOwner })).toBe(true);
+			expect(authStorage.getEffectiveCredentialType("anthropic", undefined, { owner: firstOwner })).toBe("api_key");
+			expect(authStorage.describeCredentialSource("anthropic", undefined, { owner: firstOwner })).toBe(
+				"config override (models.yml)",
+			);
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: secondOwner })).toBe("second-key");
+			// A caller with no registration of its own must never borrow the latest
+			// sibling owner key; it resolves the shared stored OAuth credential.
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: unregisteredOwner })).toBe("oauth-global");
+			expect(await authStorage.peekApiKey("anthropic", { owner: unregisteredOwner })).toBe("oauth-global");
+			expect(authStorage.hasAuth("anthropic", undefined, { owner: unregisteredOwner })).toBe(true);
+			expect(authStorage.getEffectiveCredentialType("anthropic", undefined, { owner: unregisteredOwner })).toBe(
+				"oauth",
+			);
+			authStorage.setConfigApiKey("openai-codex-device", "alias-key", { owner: firstOwner });
+			expect(await authStorage.getApiKey("openai-codex", undefined, { owner: firstOwner })).toBe("alias-key");
+
+			// Unowned callers continue to observe the latest process-wide registration.
+			expect(await authStorage.getApiKey("anthropic")).toBe("second-key");
+		});
+	});
+
+	test("owner-scoped selector guards ignore a sibling same-provider override", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			const storage = authStorage;
+			await seedOAuth("anthropic", "oauth-from-broker");
+			const firstOwner = {};
+			const secondOwner = {};
+			const row = storage.listCredentialInventory("anthropic")[0];
+			if (!row) throw new Error("Expected seeded OAuth row");
+			const selector = { kind: "id" as const, value: String(row.id) };
+			storage.setConfigApiKey("anthropic", "second-owner-key", { owner: secondOwner });
+
+			storage.setSessionCredentialSelector("owner-a", "anthropic", selector, firstOwner);
+			expect(storage.resolveOAuthPinTarget("anthropic", selector, firstOwner).canonicalSelector).toEqual({
+				kind: "id",
+				value: String(row.id),
+			});
+			storage.switchSessionCredential("anthropic", "owner-a", selector, firstOwner);
+
+			expect(() => authStorage!.setSessionCredentialSelector("owner-b", "anthropic", selector, secondOwner)).toThrow(
+				"config API key override",
+			);
+			expect(() => authStorage!.resolveOAuthPinTarget("anthropic", selector, secondOwner)).toThrow(
+				"override is active",
+			);
+			expect(() => authStorage!.switchSessionCredential("anthropic", "owner-b", selector, secondOwner)).toThrow(
+				"config API key override",
+			);
+
+			// Unowned callers retain process-wide override semantics.
+			expect(() => authStorage!.setSessionCredentialSelector("global", "anthropic", selector)).toThrow(
+				"config API key override",
+			);
+
+			// A registry's own override still takes precedence over its selector.
+			authStorage.setConfigApiKey("anthropic", "first-owner-key", { owner: firstOwner });
+			expect(() => authStorage!.setSessionCredentialSelector("owner-a", "anthropic", selector, firstOwner)).toThrow(
+				"config API key override",
+			);
+		});
+	});
+
+	test("owner-aware import preflight ignores sibling overrides but preserves omitted-owner global semantics", async () => {
+		await withEnv(SUPPRESS_ANTHROPIC_ENV, async () => {
+			if (!authStorage) throw new Error("test setup failed");
+			const ownerA = {};
+			const ownerB = {};
+			authStorage.setConfigApiKey("anthropic", "owner-a-key", { owner: ownerA });
+
+			const ownerBImport = await authStorage.importCredentialIfAbsent(
+				"anthropic",
+				{
+					type: "oauth",
+					access: "owner-b-access",
+					refresh: "owner-b-refresh",
+					expires: Date.now() + 60 * 60_000,
+				},
+				ownerB,
+			);
+			expect(ownerBImport).toMatchObject({ inserted: true, reason: "inserted", provider: "anthropic" });
+			expect(await authStorage.getApiKey("anthropic", undefined, { owner: ownerB })).toBe("owner-b-access");
+
+			const omittedOwnerImport = await authStorage.importCredentialIfAbsent("anthropic", {
+				type: "oauth",
+				access: "omitted-owner-access",
+				refresh: "omitted-owner-refresh",
+				expires: Date.now() + 60 * 60_000,
+			});
+			expect(omittedOwnerImport).toMatchObject({
+				inserted: false,
+				reason: "skipped-existing-config",
+				provider: "anthropic",
+			});
+			expect(await authStorage.getApiKey("anthropic")).toBe("owner-a-key");
+		});
+	});
+});

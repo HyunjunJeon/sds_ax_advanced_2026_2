@@ -1,0 +1,67 @@
+*.wasm filter=lfs diff=lfs merge=lfs -text linguist-vendored
+
+# Default: normalize text files, but do not force binary files as text.
+* text=auto eol=lf
+
+# Common binary assets and archives must never be line-ending normalized.
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.gif -text
+*.webp -text
+*.ico -text
+*.pdf -text
+*.zip -text
+*.gz -text
+*.tar -text
+*.tgz -text
+*.7z -text
+*.ttf -text
+*.otf -text
+*.woff -text
+*.woff2 -text
+*.mp3 -text
+*.mp4 -text
+*.mov -text
+*.avi -text
+*.db -text
+*.sqlite -text
+*.exe -text
+*.dll -text
+*.so -text
+*.dylib -text
+*.class -text
+*.jar -text
+
+# Lock files are binary (machine-generated, should not be manually edited)
+*.lock -text
+Cargo.lock -text
+package-lock.json -text
+bun.lock -text
+bun.lockb -text
+yarn.lock -text
+pnpm-lock.yaml -text
+poetry.lock -text
+
+# Executed by Linux
+*.sh text eol=lf
+*.py text eol=lf
+
+# Windows-native scripts
+*.ps1 text eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# CHANGELOGs are deliberately NOT given `merge=union`. Union never conflicts --
+# it concatenates both sides of an overlapping hunk. Release commits insert
+# `## [X.Y.Z]` directly beneath the surviving `## [Unreleased]` heading, so a
+# branch that added entries under Unreleased overlaps exactly that region and
+# union silently files those entries inside a version that already shipped.
+# GitHub also ignores the driver when computing mergeability, so it reported
+# phantom conflicts on every PR that touched a CHANGELOG. A real conflict that
+# an author resolves is strictly better than a silent misfile.
+
+# Byte-exact render-golden fixtures must never be normalized. Mark them
+# -diff too so `git diff --check` does not flag trailing whitespace on raw
+# ANSI byte sequences that happen to have no NUL bytes.
+*.bin -text -diff
