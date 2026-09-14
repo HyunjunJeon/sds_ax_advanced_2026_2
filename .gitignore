@@ -17,5 +17,9 @@ wheels/
 # OS
 .DS_Store
 
+# AI
+.gjc
+.ouroboros
+
 # Lecture Note
 Lecture_Note/
