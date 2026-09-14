@@ -25,3 +25,8 @@
 1. https://github.com/NVIDIA/SkillSpector
 
 2. https://github.com/microsoft/skillopt
+
+---
+
+[AI SDLC]
+1. https://claude.com/blog/the-ai-native-sdlc-playbook
