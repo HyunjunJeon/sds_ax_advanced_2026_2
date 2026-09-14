@@ -171,7 +171,7 @@ CLI 명령은 `gajae-code/packages/coding-agent/src/cli.ts:43-82`에 테이블�
 
 - **작게 고정된 계획 중심 워크플로.** 번들 스킬 네 개가 순서대로 이어집니다: `deep-interview → ralplan → ultragoal`, 필요하면 `autoresearch`(`gajae-code/README.md:179-189`).
   - `ralplan`은 Planner, Architect, Critic이 합의할 때까지 계획을 반복합니다(`packages/coding-agent/src/defaults/gjc/skills/ralplan/SKILL.md:12`).
-  - `ultragoal`은 대화 상태가 아니라 `goals.json`과 `ledger.jsonl`에 남은 **파일 증거로만 완료를 판정**합니다(`.../skills/ultragoal/SKILL.md:15`).
+  - `ultragoal` 스킬 지침은 대화 속 goal 상태가 아니라 `goals.json`과 `ledger.jsonl`에 남은 **파일 증거로만 완료를 확인**하도록 규정합니다(`.../skills/ultragoal/SKILL.md:14`). 이 규칙이 코드로 강제되는지는 확인이 필요합니다.
 - **서브에이전트는 같은 프로세스 안에서 돕니다.** `task` 도구(`src/task/index.ts:594`)가 `createAgentSession`을 다시 호출합니다(`src/task/executor.ts:1956`). 공개 역할은 executor, architect, planner, critic 네 가지입니다.
 - **권한은 사용자 승인이 아니라 프로필로 제한합니다.**
   - bash 제한 프로필 `workflow` / `read-only`(`src/tools/bash-allowed-prefixes.ts:13`)

@@ -99,4 +99,5 @@ cd Day03 && uv run ...     # Day03 작업
 | `Day02/` | DeepAgents · OpenViking · Skills 기반 RAG 한 개를 끝까지 만든다 | [Day02/AGENTS.md](Day02/AGENTS.md) |
 | `Day03/` | 같은 RAG를 7가지 멀티에이전트 구조로 확장하고 통제 실험으로 비교한다 | [Day03/AGENTS.md](Day03/AGENTS.md) |
 | `Day05/` | 주문 취소·결제·재고 업무로 Agent Evaluation을 설계하고 DeepEval·Langfuse로 개선과 회귀를 검증한다 | [Day05/AGENTS.md](Day05/AGENTS.md) |
+| `Day06/` | AI Agent Harness 4종(pi·gajae-code·deepseek-harness·ouroboros)의 소스를 여섯 책임(지침·도구·실행 제어·상태·검증·기록)으로 분석한다 | [Day06/AGENTS.md](Day06/AGENTS.md) |
 | `Lecture_Note/` | 강의 슬라이드 (git 제외) | — |
