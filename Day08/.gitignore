@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+.pytest_cache/
+outputs/
+work/
+.hf-cache/
+
+# 강사 전용
+scripts/*

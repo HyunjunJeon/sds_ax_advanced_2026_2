@@ -1,0 +1,5 @@
+{
+  "kim.dev": {"user_id": "kim.dev", "tenant": "nurisoft", "projects": ["alpha"], "can_send": true, "display": "김도윤 (결제플랫폼팀)"},
+  "hr.lead": {"user_id": "hr.lead", "tenant": "nurisoft", "projects": ["beta"], "can_send": true, "display": "HR플랫폼팀 리드"},
+  "intern.lee": {"user_id": "intern.lee", "tenant": "nurisoft", "projects": ["alpha"], "can_send": false, "display": "이하은 (인턴, 전달 권한 없음)"}
+}

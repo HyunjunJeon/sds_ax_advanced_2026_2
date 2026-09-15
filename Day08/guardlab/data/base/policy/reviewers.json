@@ -1,0 +1,5 @@
+{
+  "alpha": ["seojun.park@nurisoft.example", "minjun.choi@nurisoft.example"],
+  "beta": ["hr.lead@nurisoft.example"],
+  "allowed_domains": ["nurisoft.example"]
+}
