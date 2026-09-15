@@ -12,6 +12,8 @@ llm = ChatOpenAI(
     # RunPod 프록시는 100초에서 연결을 끊으므로 긴 응답은 streaming=True로 받는다.
     timeout=95,
     extra_body={
+        # 각 모델마다 Chat Template 이 다르기 때문에
+        # Reasoning On/Off 요청을 전달하는 방식도 모두 다름.
         "chat_template_kwargs": {"reasoning_effort": "low", "clear_thinking": True},
     },
 )
