@@ -21,8 +21,6 @@
 """
 
 from deepagents import create_deep_agent
-from langchain.agents.middleware import PIIMiddleware
-
 from guardlab.budget import budget_middleware
 from guardlab.cases import get_case
 from guardlab.components import OutputGuardMiddleware, make_output_wrapper
@@ -33,14 +31,17 @@ from guardlab.prompts import MAIN_PROMPT, research_spec, verifier_spec
 from guardlab.runner import announce, output_dir, prepare, print_row, run_case
 from guardlab.tools import RawOps, build_tools
 from guardlab.trace import TraceMiddleware
+from langchain.agents.middleware import PIIMiddleware
 
 # ── 실행 조건 ────────────────────────────────────────────────────────────────
 CASES = ["doc_include_contacts", "user_asks_contacts", "normal"]
 CONFIGS = ["builtin_regex_middleware", "final_only", "before_send", "all_boundaries"]
-DETECTOR = "regex"      # "regex" / "lfm"
-MODEL_MODE = "live"     # "live" / "scripted" (대본: 개인정보가 든 본문을 승인 검토자에게 전달 제안)
+DETECTOR = "regex"  # "regex" / "lfm"
+MODEL_MODE = (
+    "live"  # "live" / "scripted" (대본: 개인정보가 든 본문을 승인 검토자에게 전달 제안)
+)
 REPEATS = 1
-SCRIPT_CASE = "doc_include_contacts"   # scripted 모드에서는 대본이 행동을 정하므로 이 사례만 돌린다
+SCRIPT_CASE = "doc_include_contacts"  # scripted 모드에서는 대본이 행동을 정하므로 이 사례만 돌린다
 
 
 def build_agent(prepared, model, config: str):
@@ -54,7 +55,9 @@ def build_agent(prepared, model, config: str):
       all_boundaries            초안·전달·최종 답변 모두 검사.
     """
     log = prepared.log
-    pii = PIIGuard(DETECTOR)                    # 구간(Span)만 준다. 마스킹·허용 판단은 defenses 의 코드가 한다
+    pii = PIIGuard(
+        DETECTOR
+    )  # 구간(Span)만 준다. 마스킹·허용 판단은 defenses 의 코드가 한다
     ops = RawOps(prepared.ws, prepared.outbox, log)
 
     # 도구 래퍼: send_report(그리고 check_save=True 면 save_report)의 인자를 실행 직전에 검사한다.
@@ -71,9 +74,16 @@ def build_agent(prepared, model, config: str):
     if config == "builtin_regex_middleware":
         # 내장 부품. apply_to_output=True 는 최종 AIMessage 본문만 가린다. send_report 의 body 인자는 검사하지 않는다.
         main_mw += [
-            PIIMiddleware("email", strategy="redact", apply_to_input=False, apply_to_output=True),
-            PIIMiddleware("kr_phone", detector=r"01[016789]-?\d{3,4}-?\d{4}", strategy="redact",
-                          apply_to_input=False, apply_to_output=True),
+            PIIMiddleware(
+                "email", strategy="redact", apply_to_input=False, apply_to_output=True
+            ),
+            PIIMiddleware(
+                "kr_phone",
+                detector=r"01[016789]-?\d{3,4}-?\d{4}",
+                strategy="redact",
+                apply_to_input=False,
+                apply_to_output=True,
+            ),
         ]
     elif config in ("final_only", "all_boundaries"):
         # after_agent 훅: 실행이 끝난 뒤 마지막 AIMessage 를 검사해 마스킹한다.
@@ -87,8 +97,13 @@ def build_agent(prepared, model, config: str):
         context_schema=UserContext,
         backend=prepared.ws.backend(),
         subagents=[
-            research_spec([by_name["list_projects"], by_name["read_doc"]], middleware=[TraceMiddleware(log, "research")]),
-            verifier_spec([by_name["read_doc"]], middleware=[TraceMiddleware(log, "verifier")]),
+            research_spec(
+                [by_name["list_projects"], by_name["read_doc"]],
+                middleware=[TraceMiddleware(log, "research")],
+            ),
+            verifier_spec(
+                [by_name["read_doc"]], middleware=[TraceMiddleware(log, "verifier")]
+            ),
         ],
         middleware=[*main_mw, *budget_middleware()],
     )
@@ -106,8 +121,10 @@ def make_model():
 
 if __name__ == "__main__":
     if MODEL_MODE == "live":
-        announce(f"사례 {len(CASES)}건 × 구성 {len(CONFIGS)}개 × {REPEATS}회, 실행당 모델 호출 약 10~15회",
-                 "DETECTOR='lfm' 이면 첫 실행에 모델 다운로드(약 1.4GB)가 있다.")
+        announce(
+            f"사례 {len(CASES)}건 × 구성 {len(CONFIGS)}개 × {REPEATS}회, 실행당 모델 호출 약 10~15회",
+            "DETECTOR='lfm' 이면 첫 실행에 모델 다운로드(약 1.4GB)가 있다.",
+        )
     rows = []
     case_ids = CASES if MODEL_MODE == "live" else [SCRIPT_CASE]
     for config in CONFIGS:
@@ -117,13 +134,27 @@ if __name__ == "__main__":
                 prepared = prepare(case, "03", config, r)
                 agent = build_agent(prepared, make_model(), config)
                 out = run_case(agent, prepared)
-                row = evaluate(case, prepared.ctx, prepared.ws, prepared.outbox, prepared.log,
-                               final_answer=out["final_answer"], error=out["error"], elapsed_s=out["elapsed_s"],
-                               config={"name": config, "detector": DETECTOR, "model_mode": MODEL_MODE})
+                row = evaluate(
+                    case,
+                    prepared.ctx,
+                    prepared.ws,
+                    prepared.outbox,
+                    prepared.log,
+                    final_answer=out["final_answer"],
+                    error=out["error"],
+                    elapsed_s=out["elapsed_s"],
+                    config={
+                        "name": config,
+                        "detector": DETECTOR,
+                        "model_mode": MODEL_MODE,
+                    },
+                )
                 rows.append(row)
                 print_row(row)
     path = save_rows(rows, output_dir("03"))
     print(explain(rows, title="03 공개 경계"))
     print(f"\n결과: {path}")
-    print("읽을 것: '유출' 열이 어느 구성에서 비는가. final_only 에서 답변은 깨끗한데 전송함에 개인정보가 남는 행을 찾아라.")
+    print(
+        "읽을 것: '유출' 열이 어느 구성에서 비는가. final_only 에서 답변은 깨끗한데 전송함에 개인정보가 남는 행을 찾아라."
+    )
     print("        normal 사례에서 필요한 이름까지 지워지지 않았는가(과잉 삭제).")

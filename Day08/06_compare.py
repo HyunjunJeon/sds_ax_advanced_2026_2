@@ -19,38 +19,58 @@
 """
 
 from deepagents import create_deep_agent
-
 from guardlab.budget import budget_middleware
 from guardlab.cases import get_case, load_holdout
-from guardlab.components import (InputGuardMiddleware, MemoryGuardMiddleware, OutputGuardMiddleware, load_reviewers,
-                                 make_action_wrapper, make_output_wrapper, scope_permissions)
+from guardlab.components import (
+    InputGuardMiddleware,
+    MemoryGuardMiddleware,
+    OutputGuardMiddleware,
+    load_reviewers,
+    make_action_wrapper,
+    make_output_wrapper,
+    scope_permissions,
+)
 from guardlab.context import UserContext
+from guardlab.defenses import PermissionTable
 from guardlab.evaluate import evaluate, explain, save_rows, summarize
-from guardlab.harness import minimal_tools
 from guardlab.guards import InjectionGuard, PIIGuard
+from guardlab.harness import minimal_tools
 from guardlab.prompts import MAIN_PROMPT, research_spec, verifier_spec
 from guardlab.runner import announce, output_dir, prepare, print_row, run_case
 from guardlab.tools import RawOps, build_tools
 from guardlab.trace import TraceMiddleware
-from guardlab.defenses import PermissionTable
 
 # ── 실험 정의 ────────────────────────────────────────────────────────────────
 # 수업용 기본값. 06 의 질문("하나를 빼면 어디가 열리는가")에는 B3 와 B4, 기준선 B0 이면 충분하다.
 # 과제: ARCHITECTURES = ["B0", "B1", "B2", "B3", "B4"], CASES 에 "doc_include_contacts", "doc_poison_memory" 추가.
 ARCHITECTURES = ["B0", "B3", "B4"]
 CASES = ["doc_send_outside", "doc_read_beta"]
-REPEATS = 1                # 3회 이상부터 비율을 말할 수 있다. 수업 중에는 1회.
-REMOVE = "action_guard"    # B4 에서 뺄 방어: "input_guard" / "action_guard" / "output_guard" / "permissions" / "memory_guard" / "subagent_min" / "builtin_tools_off"
-HOLDOUT = False            # True 면 미공개 사례 2건을 추가한다. 최종 확인에만 쓴다.
-INJECTION_GUARD = "fake"   # "remote"(RunPod) / "fake"
-DETECTOR = "regex"         # "regex" / "lfm"
-MODEL_MODE = "live"        # "live" / "scripted"(부품 연결 확인용)
+REPEATS = 1  # 3회 이상부터 비율을 말할 수 있다. 수업 중에는 1회.
+REMOVE = "action_guard"  # B4 에서 뺄 방어: "input_guard" / "action_guard" / "output_guard" / "permissions" / "memory_guard" / "subagent_min" / "builtin_tools_off"
+HOLDOUT = False  # True 면 미공개 사례 2건을 추가한다. 최종 확인에만 쓴다.
+INJECTION_GUARD = "fake"  # "remote"(RunPod) / "fake"
+DETECTOR = "regex"  # "regex" / "lfm"
+MODEL_MODE = "live"  # "live" / "scripted"(부품 연결 확인용)
 
 DEFENSES = {
     "B0": set(),
     "B1": {"input_guard", "output_guard"},
-    "B2": {"action_guard", "permissions", "memory_guard", "subagent_min", "builtin_tools_off"},
-    "B3": {"input_guard", "output_guard", "action_guard", "permissions", "memory_guard", "subagent_min", "builtin_tools_off"},
+    "B2": {
+        "action_guard",
+        "permissions",
+        "memory_guard",
+        "subagent_min",
+        "builtin_tools_off",
+    },
+    "B3": {
+        "input_guard",
+        "output_guard",
+        "action_guard",
+        "permissions",
+        "memory_guard",
+        "subagent_min",
+        "builtin_tools_off",
+    },
 }
 DEFENSES["B4"] = DEFENSES["B3"] - {REMOVE}
 
@@ -60,8 +80,14 @@ MEMORY = ["/memory/AGENTS.md"]
 
 def make_table() -> PermissionTable:
     rv = load_reviewers()
-    return PermissionTable(reviewers={k: v for k, v in rv.items() if isinstance(v, list) and k != "allowed_domains"},
-                           allowed_domains=tuple(rv.get("allowed_domains", ["nurisoft.example"])))
+    return PermissionTable(
+        reviewers={
+            k: v
+            for k, v in rv.items()
+            if isinstance(v, list) and k != "allowed_domains"
+        },
+        allowed_domains=tuple(rv.get("allowed_domains", ["nurisoft.example"])),
+    )
 
 
 def build_agent(prepared, model, defenses: set[str], sub_model=None):
@@ -96,25 +122,44 @@ def build_agent(prepared, model, defenses: set[str], sub_model=None):
         stack = [TraceMiddleware(log, agent_name)]
         if "input_guard" in defenses:
             # 01 과 달리 Subagent 스택에도 넣는다. research 가 읽는 원문까지 검사 대상이 된다.
-            stack.append(InputGuardMiddleware(guard, log, scope=("user", "tool_result"), agent_name=agent_name))
+            stack.append(
+                InputGuardMiddleware(
+                    guard, log, scope=("user", "tool_result"), agent_name=agent_name
+                )
+            )
         return stack
 
     main_mw = mw("main")
     if "output_guard" in defenses:
         main_mw.append(OutputGuardMiddleware(pii, log, agent_name="main"))
     if "memory_guard" in defenses:
-        main_mw.append(MemoryGuardMiddleware(log, memory_paths=tuple(MEMORY), agent_name="main"))
+        main_mw.append(
+            MemoryGuardMiddleware(log, memory_paths=tuple(MEMORY), agent_name="main")
+        )
 
     if "subagent_min" in defenses:
         subagents = [
-            research_spec([by_name["list_projects"], by_name["read_doc"]], middleware=mw("research"), model=sub_model),
-            verifier_spec([by_name["read_doc"]], middleware=mw("verifier"), model=sub_model),
-            {"name": "general-purpose", "description": "사용하지 않음", "system_prompt": "이 Agent 는 도구가 없다.",
-             "tools": [], "middleware": mw("general-purpose")},
+            research_spec(
+                [by_name["list_projects"], by_name["read_doc"]],
+                middleware=mw("research"),
+                model=sub_model,
+            ),
+            verifier_spec(
+                [by_name["read_doc"]], middleware=mw("verifier"), model=sub_model
+            ),
+            {
+                "name": "general-purpose",
+                "description": "사용하지 않음",
+                "system_prompt": "이 Agent 는 도구가 없다.",
+                "tools": [],
+                "middleware": mw("general-purpose"),
+            },
         ]
     else:
-        subagents = [research_spec(tools, middleware=mw("research"), model=sub_model),
-                     verifier_spec(tools, middleware=mw("verifier"), model=sub_model)]
+        subagents = [
+            research_spec(tools, middleware=mw("research"), model=sub_model),
+            verifier_spec(tools, middleware=mw("verifier"), model=sub_model),
+        ]
 
     def assemble():
         return create_deep_agent(
@@ -124,13 +169,17 @@ def build_agent(prepared, model, defenses: set[str], sub_model=None):
             context_schema=UserContext,
             backend=prepared.ws.backend(),
             memory=MEMORY,
-            permissions=scope_permissions(prepared.ctx, prepared.ws) if "permissions" in defenses else None,
+            permissions=scope_permissions(prepared.ctx, prepared.ws)
+            if "permissions" in defenses
+            else None,
             subagents=subagents,
             middleware=[*main_mw, *budget_middleware()],
         )
 
     if "builtin_tools_off" in defenses:
-        with minimal_tools(model):     # 내장 파일 도구·execute 제거 + general-purpose 끔. 블록 밖에서는 원래대로
+        with minimal_tools(
+            model
+        ):  # 내장 파일 도구·execute 제거 + general-purpose 끔. 블록 밖에서는 원래대로
             return assemble()
     return assemble()
 
@@ -147,7 +196,9 @@ def make_models(case_id: str):
             "doc_poison_memory": (rp.script_write_policy, None),
         }
         main_fn, sub_fn = scripts.get(case_id, (rp.script_normal, None))
-        return rp.ScriptedChatModel(steps=main_fn()), (rp.ScriptedChatModel(steps=sub_fn()) if sub_fn else None)
+        return rp.ScriptedChatModel(steps=main_fn()), (
+            rp.ScriptedChatModel(steps=sub_fn()) if sub_fn else None
+        )
     from guardlab.config import build_model
 
     return build_model(), None
@@ -159,7 +210,9 @@ if __name__ == "__main__":
         cases += load_holdout()
     total = len(ARCHITECTURES) * len(cases) * REPEATS
     if MODEL_MODE == "live":
-        announce(f"{len(ARCHITECTURES)}비교군 × 사례 {len(cases)}건 × {REPEATS}회 = {total}실행, 모델 호출 약 {total * 10}~{total * 15}회")
+        announce(
+            f"{len(ARCHITECTURES)}비교군 × 사례 {len(cases)}건 × {REPEATS}회 = {total}실행, 모델 호출 약 {total * 10}~{total * 15}회"
+        )
     rows = []
     for r in range(1, REPEATS + 1):
         # 반복마다 실행 순서를 뒤집는다. 시간대·제공자 상태가 특정 비교군에만 몰리는 것을 막는 통제다 (Day03 09 와 같다).
@@ -170,14 +223,31 @@ if __name__ == "__main__":
                 main_model, sub_model = make_models(case.id)
                 agent = build_agent(prepared, main_model, DEFENSES[arch], sub_model)
                 out = run_case(agent, prepared)
-                row = evaluate(case, prepared.ctx, prepared.ws, prepared.outbox, prepared.log,
-                               final_answer=out["final_answer"], error=out["error"], elapsed_s=out["elapsed_s"],
-                               config={"name": arch, "defenses": sorted(DEFENSES[arch]), "removed": REMOVE if arch == "B4" else "",
-                                       "guard": INJECTION_GUARD, "detector": DETECTOR, "model_mode": MODEL_MODE, "repeat": r})
+                row = evaluate(
+                    case,
+                    prepared.ctx,
+                    prepared.ws,
+                    prepared.outbox,
+                    prepared.log,
+                    final_answer=out["final_answer"],
+                    error=out["error"],
+                    elapsed_s=out["elapsed_s"],
+                    config={
+                        "name": arch,
+                        "defenses": sorted(DEFENSES[arch]),
+                        "removed": REMOVE if arch == "B4" else "",
+                        "guard": INJECTION_GUARD,
+                        "detector": DETECTOR,
+                        "model_mode": MODEL_MODE,
+                        "repeat": r,
+                    },
+                )
                 rows.append(row)
                 print_row(row)
     path = save_rows(rows, output_dir("06"))
     print(explain(rows, title="06 비교군"))
     print("\n" + summarize(rows))
     print(f"\n결과: {path}")
-    print(f"읽을 것: B3 와 B4(-{REMOVE}) 의 차이가 어느 사례·어느 경로에서 나는가. B1 이 막지 못하고 B2 가 막은 행은 '탐지 실패 + 방어 성공'이다.")
+    print(
+        f"읽을 것: B3 와 B4(-{REMOVE}) 의 차이가 어느 사례·어느 경로에서 나는가. B1 이 막지 못하고 B2 가 막은 행은 '탐지 실패 + 방어 성공'이다."
+    )

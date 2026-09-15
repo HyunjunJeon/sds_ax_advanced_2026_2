@@ -86,7 +86,7 @@ CLI 플래그는 없다. 파일을 열어 상수를 고치고 다시 실행한�
 
 | 상수 | 의미 |
 |---|---|
-| `MODEL_MODE` | `"live"` OpenRouter 주모델 (`OPENROUTER_MODEL`, 기본 `z-ai/glm-5.3-flash`) / `"scripted"` 모델 없이 대본 재생 |
+| `MODEL_MODE` | `"live"` OpenRouter 주모델 (`OPENROUTER_MODEL`, 기본 `openai/gpt-5.6-luna`) / `"scripted"` 모델 없이 대본 재생 |
 | `INJECTION_GUARD` | `"remote"` 강사 RunPod의 Kanana·SGuard / `"openrouter"` OpenRouter의 gpt-oss-safeguard 등 정책 Judge / `"fake"` 키워드 규칙 / `"always_allow"` 탐지 실패 가정 |
 | `DETECTOR` | `"regex"` 정규식 / `"lfm"` LiquidAI PII-Detector (로컬 CPU) |
 | `CASES`, `CONFIGS`, `REPEATS` | 사례·비교 구성·반복 |
@@ -129,11 +129,11 @@ CLI 플래그는 없다. 파일을 열어 상수를 고치고 다시 실행한�
 
 ### 주모델 선택 (2026-09-15 실측)
 
-| 모델 | 00 정상 실행 | 비고 |
-|---|---|---|
-| `z-ai/glm-5.3-flash` (기본) | 완료, 17회 호출 | Day07과 같은 모델. 입력 $0.15/M, 출력 $0.50/M |
-| `openai/gpt-5.6-luna` | 완료, 17회 호출 | 입력 $0.20/M, 출력 $1.20/M |
-| `google/gemini-3.8-flash` | 완료하기도 하나 01에서 6회 중 2회 `Corrupted thought signature` 400 | Gemini 3.x의 thought signature가 도구 호출 루프에서 깨진다. 기본에서 제외 |
+| 모델 | 00 정상 실행 (호출 수 / 소요) | 01 라이브 6실행 | 비고 |
+|---|---|---|---|
+| `openai/gpt-5.6-luna` (기본) | 완료, 17회 / 76초 | 6회 모두 완료, 오류 0, 총 6.5분 | 입력 $0.20/M, 출력 $1.20/M |
+| `z-ai/glm-5.3-flash` | 완료, 17회 / 403초 | 6회 모두 완료, 오류 0 | Day07과 같은 모델. 안정적이지만 호출당 약 24초라 수업 시간에 안 맞는다 |
+| `google/gemini-3.8-flash` | 완료, 12회 / 80초 | 6회 중 2회 `Corrupted thought signature` 400 | Gemini 3.x의 thought signature가 도구 호출 루프에서 깨진다 |
 
 ## 강사: Injection 분류기 서빙 (RunPod)
 

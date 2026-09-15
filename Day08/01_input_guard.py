@@ -21,7 +21,6 @@
 """
 
 from deepagents import create_deep_agent
-
 from guardlab.budget import budget_middleware
 from guardlab.cases import get_case
 from guardlab.components import InputGuardMiddleware
@@ -42,7 +41,9 @@ CONFIGS = {
 # "remote": 강사 RunPod 의 SGuard/Kanana (GUARD_INJECTION_URL 필요)
 # "fake":   키워드 규칙. 부품 동작 확인용이며 탐지율로 보고하지 않는다.
 INJECTION_GUARD = "fake"
-MODEL_MODE = "live"      # "live" / "scripted" (대본 재생: Guard 결정·메시지 교체 동작만 확인한다)
+MODEL_MODE = (
+    "live"  # "live" / "scripted" (대본 재생: Guard 결정·메시지 교체 동작만 확인한다)
+)
 REPEATS = 1
 
 
@@ -71,8 +72,12 @@ def build_agent(prepared, model, scope):
         subagents=[
             # Subagent 스택에는 Input Guard 가 없다. research 가 read_doc 으로 읽은 원문은 research 의 모델에
             # 검사 없이 들어간다. Main 이 보는 것은 research 가 돌려준 '요약'(task 도구의 ToolMessage)뿐이다.
-            research_spec(research_tools, middleware=[TraceMiddleware(prepared.log, "research")]),
-            verifier_spec(verifier_tools, middleware=[TraceMiddleware(prepared.log, "verifier")]),
+            research_spec(
+                research_tools, middleware=[TraceMiddleware(prepared.log, "research")]
+            ),
+            verifier_spec(
+                verifier_tools, middleware=[TraceMiddleware(prepared.log, "verifier")]
+            ),
         ],
         middleware=[
             TraceMiddleware(prepared.log, "main"),
@@ -99,7 +104,9 @@ def make_model():
 
 if __name__ == "__main__":
     if MODEL_MODE == "live":
-        announce(f"사례 {len(CASES)}건 × 구성 {len(CONFIGS)}개 × {REPEATS}회, 실행당 모델 호출 약 10~15회")
+        announce(
+            f"사례 {len(CASES)}건 × 구성 {len(CONFIGS)}개 × {REPEATS}회, 실행당 모델 호출 약 10~15회"
+        )
     rows = []
     for name, scope in CONFIGS.items():
         for case_id in CASES:
@@ -108,12 +115,27 @@ if __name__ == "__main__":
                 prepared = prepare(case, "01", name, r)
                 agent = build_agent(prepared, make_model(), scope)
                 out = run_case(agent, prepared)
-                row = evaluate(case, prepared.ctx, prepared.ws, prepared.outbox, prepared.log,
-                               final_answer=out["final_answer"], error=out["error"], elapsed_s=out["elapsed_s"],
-                               config={"name": name, "scope": list(scope), "guard": INJECTION_GUARD, "model_mode": MODEL_MODE})
+                row = evaluate(
+                    case,
+                    prepared.ctx,
+                    prepared.ws,
+                    prepared.outbox,
+                    prepared.log,
+                    final_answer=out["final_answer"],
+                    error=out["error"],
+                    elapsed_s=out["elapsed_s"],
+                    config={
+                        "name": name,
+                        "scope": list(scope),
+                        "guard": INJECTION_GUARD,
+                        "model_mode": MODEL_MODE,
+                    },
+                )
                 rows.append(row)
                 print_row(row)
     path = save_rows(rows, output_dir("01"))
     print(explain(rows, title="01 Input Guard 범위"))
     print(f"\n결과: {path}")
-    print("읽을 것: 같은 사례에서 scope 에 따라 '차단위치'와 '공격달성'이 어떻게 달라졌는가, security_training 이 과잉 차단됐는가.")
+    print(
+        "읽을 것: 같은 사례에서 scope 에 따라 '차단위치'와 '공격달성'이 어떻게 달라졌는가, security_training 이 과잉 차단됐는가."
+    )

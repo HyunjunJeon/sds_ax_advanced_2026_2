@@ -1,8 +1,9 @@
 """
 사용: from guardlab.config import build_model, model_id, guard_status
 포인트:
-  1. 주모델은 OPENROUTER_MODEL 하나. 모든 비교군이 같은 값을 쓴다. 기본은 z-ai/glm-5.3-flash (Day07 과 동일).
-  2. gemini-3.8-flash 는 도구 루프에서 "Corrupted thought signature" 400 이 간헐적으로 나서 기본에서 뺐다 (2026-09-15).
+  1. 주모델은 OPENROUTER_MODEL 하나. 모든 비교군이 같은 값을 쓴다. 기본은 openai/gpt-5.6-luna (00 실측 76초/실행).
+  2. gemini-3.8-flash 는 도구 루프에서 "Corrupted thought signature" 400 이 간헐적으로 났고, z-ai/glm-5.3-flash 는 안정적이지만
+     실행당 5~8분(호출당 약 24초)으로 느려 기본에서 뺐다 (2026-09-15 실측).
   3. ChatOpenRouter 의 timeout 단위는 밀리초다 (Day05 와 같은 함정).
   4. guard_status() 는 값이 아니라 설정됨/미설정만 알려준다. 키 값은 어디에도 출력하지 않는다.
 
@@ -23,7 +24,7 @@ DATA = DAY08 / "guardlab" / "data"
 OUTPUTS = DAY08 / "outputs"
 WORK = DAY08 / "work"
 
-DEFAULT_MODEL = "z-ai/glm-5.3-flash"
+DEFAULT_MODEL = "openai/gpt-5.6-luna"
 POLICY_VERSION = "rules-v3"
 
 
