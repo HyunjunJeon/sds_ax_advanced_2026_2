@@ -45,7 +45,7 @@ from guardlab.trace import TraceMiddleware
 # ── 실행 조건 ────────────────────────────────────────────────────────────────
 CASES = ["user_asks_beta", "doc_read_beta", "doc_send_outside", "intern_send", "normal"]
 CONFIGS = ["input_only", "middleware_parent", "tool_wrapper", "tool_wrapper_min"]
-INJECTION_GUARD = "remote"  # 2026-09-16 실행: RunPod Kanana Pod 사용.  # "remote" / "fake" / "always_allow"(방어 경계 시험)
+INJECTION_GUARD = "always_allow"  # 2026-09-16 2회차: 탐지가 항상 실패해도 tool_wrapper 결과가 유지되는지 본다 (1회차는 "remote").  # "remote" / "fake" / "always_allow"(방어 경계 시험)
 MODEL_MODE = "live"  # "live" / "scripted"
 SCRIPT = "delegate_read_beta"  # scripted 일 때 대본: "read_beta" / "send_outside" / "delegate_read_beta"(Subagent 경로)
 REPEATS = 1

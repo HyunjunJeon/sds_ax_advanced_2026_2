@@ -17,12 +17,11 @@
 
 실행 조건은 아래 상수다. CLI 플래그는 없다.
     uv run python 00_baseline_agent.py
-결과: outputs/00/<run_id>/runs.jsonl, summary.md. 
+결과: outputs/00/<run_id>/runs.jsonl, summary.md.
 작업 공간: work/00/<case>__<config>__r1/
 """
 
 from deepagents import create_deep_agent
-
 from guardlab.budget import budget_middleware
 from guardlab.cases import get_case
 from guardlab.config import guard_status
@@ -34,8 +33,8 @@ from guardlab.tools import RawOps, build_tools
 from guardlab.trace import TraceMiddleware
 
 # ── 실행 조건 ────────────────────────────────────────────────────────────────
-CASE = "normal"          # cases.jsonl 의 id. 00 은 정상 사례만 돌린다.
-MODEL_MODE = "live"      # "live": OpenRouter 주모델 / "scripted": 모델 없이 대본 재생 (guardlab/replay.py)
+CASE = "normal"  # cases.jsonl 의 id. 00 은 정상 사례만 돌린다.
+MODEL_MODE = "live"  # "live": OpenRouter 주모델 / "scripted": 모델 없이 대본 재생 (guardlab/replay.py)
 REPEATS = 1
 
 
@@ -51,7 +50,7 @@ def build_agent(prepared, model):
     # 1) 업무 도구. RawOps 는 실제 상태를 바꾸는 함수들이고 권한 검사가 없다.
     #    build_tools(ops) 에 wrapper 를 주지 않았으므로, 모델이 제안한 호출은 그대로 실행된다. 이것이 B0 의 정의다.
     ops = RawOps(prepared.ws, prepared.outbox, prepared.log)
-    tools = build_tools(ops)                       # wrapper 없음 = 권한 검사 없음
+    tools = build_tools(ops)  # wrapper 없음 = 권한 검사 없음
 
     # 2) Subagent 별 도구 목록. 조사(research)는 읽기만, 검증(verifier)은 read_doc 만 준다.
     #    "역할을 나눴다"는 것과 "권한을 나눴다"는 것은 다르다. 여기서는 도구 목록만 다르고 검사는 없다.
@@ -59,16 +58,20 @@ def build_agent(prepared, model):
     verifier_tools = [t for t in tools if t.name in ("read_doc",)]
 
     return create_deep_agent(
-        model=model,                               # 주모델. 모든 비교군에서 같은 값 (OPENROUTER_MODEL)
-        system_prompt=MAIN_PROMPT,                 # 안전 지침이 들어 있는 프롬프트. B0 의 유일한 방어
-        tools=tools,                               # Main Agent 가 직접 부를 수 있는 업무 도구 4개
-        context_schema=UserContext,                # invoke(..., context=ctx) 로 넣는 신뢰 컨텍스트의 타입
-        backend=prepared.ws.backend(),             # 내장 파일 도구(read_file 등)가 보는 루트 = 작업 공간
+        model=model,  # 주모델. 모든 비교군에서 같은 값 (OPENROUTER_MODEL)
+        system_prompt=MAIN_PROMPT,  # 안전 지침이 들어 있는 프롬프트. B0 의 유일한 방어
+        tools=tools,  # Main Agent 가 직접 부를 수 있는 업무 도구 4개
+        context_schema=UserContext,  # invoke(..., context=ctx) 로 넣는 신뢰 컨텍스트의 타입
+        backend=prepared.ws.backend(),  # 내장 파일 도구(read_file 등)가 보는 루트 = 작업 공간
         subagents=[
             # 각 Subagent 는 별도의 create_agent 그래프다. 부모의 middleware 를 물려받지 않으므로
             # 기록기(TraceMiddleware)도 Subagent 마다 따로 넣어야 그 안의 도구 호출이 보인다.
-            research_spec(research_tools, middleware=[TraceMiddleware(prepared.log, "research")]),
-            verifier_spec(verifier_tools, middleware=[TraceMiddleware(prepared.log, "verifier")]),
+            research_spec(
+                research_tools, middleware=[TraceMiddleware(prepared.log, "research")]
+            ),
+            verifier_spec(
+                verifier_tools, middleware=[TraceMiddleware(prepared.log, "verifier")]
+            ),
         ],
         # Main 의 middleware: 기록기 + 실행 예산(모델 호출·도구 호출 상한). 예산은 모든 파일에서 같다.
         middleware=[TraceMiddleware(prepared.log, "main"), *budget_middleware()],
@@ -94,15 +97,29 @@ if __name__ == "__main__":
         announce(f"사례 {REPEATS}건, 실행당 모델 호출 약 10~15회 (Subagent 포함)")
     for r in range(1, REPEATS + 1):
         # 실행 절차는 모든 번호 파일이 같다: 준비 → 조립 → 실행 → 평가 → 기록
-        prepared = prepare(case, "00", f"B0-{MODEL_MODE}", r)   # work/00/<case>__<config>__r<n>/ 에 작업 공간 생성
+        prepared = prepare(
+            case, "00", f"B0-{MODEL_MODE}", r
+        )  # work/00/<case>__<config>__r<n>/ 에 작업 공간 생성
         agent = build_agent(prepared, make_model())
-        out = run_case(agent, prepared)                          # 예외도 out["error"] 로 받는다. 실패 행도 남긴다
-        row = evaluate(case, prepared.ctx, prepared.ws, prepared.outbox, prepared.log,   # 답변이 아니라 상태를 읽는다
-                       final_answer=out["final_answer"], error=out["error"], elapsed_s=out["elapsed_s"],
-                       config={"name": f"B0-{MODEL_MODE}", "model_mode": MODEL_MODE})
+        out = run_case(
+            agent, prepared
+        )  # 예외도 out["error"] 로 받는다. 실패 행도 남긴다
+        row = evaluate(
+            case,
+            prepared.ctx,
+            prepared.ws,
+            prepared.outbox,
+            prepared.log,  # 답변이 아니라 상태를 읽는다
+            final_answer=out["final_answer"],
+            error=out["error"],
+            elapsed_s=out["elapsed_s"],
+            config={"name": f"B0-{MODEL_MODE}", "model_mode": MODEL_MODE},
+        )
         rows.append(row)
         print_row(row)
         print("  전송함:", row["outbox"], "| 초안:", row["drafts"])
     path = save_rows(rows, output_dir("00"))
     print(explain(rows, title="00 기준선"))
-    print(f"\n결과: {path}\n평가기가 읽은 것: outbox.jsonl, /drafts, 실행 기록(log). Agent 의 답변은 참고일 뿐이다.")
+    print(
+        f"\n결과: {path}\n평가기가 읽은 것: outbox.jsonl, /drafts, 실행 기록(log). Agent 의 답변은 참고일 뿐이다."
+    )

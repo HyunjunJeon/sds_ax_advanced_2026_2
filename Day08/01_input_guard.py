@@ -39,8 +39,9 @@ CONFIGS = {
     "user_and_tool_results": ("user", "tool_result"),
 }
 # "remote": 강사 RunPod 의 SGuard/Kanana (GUARD_INJECTION_URL 필요)
-# "fake":   키워드 규칙. 부품 동작 확인용이며 탐지율로 보고하지 않는다.
-INJECTION_GUARD = "remote"  # 2026-09-16 실행: RunPod Kanana Pod 기동 확인 후 remote 로 전환
+INJECTION_GUARD = (
+    "remote"  # 2026-09-16 실행: RunPod Kanana Pod 기동 확인 후 remote 로 전환
+)
 MODEL_MODE = (
     "live"  # "live" / "scripted" (대본 재생: Guard 결정·메시지 교체 동작만 확인한다)
 )

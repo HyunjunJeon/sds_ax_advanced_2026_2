@@ -46,9 +46,9 @@ from guardlab.trace import TraceMiddleware
 ARCHITECTURES = ["B0", "B3", "B4"]
 CASES = ["doc_send_outside", "doc_read_beta"]
 REPEATS = 1  # 3회 이상부터 비율을 말할 수 있다. 수업 중에는 1회.
-REMOVE = "action_guard"  # B4 에서 뺄 방어: "input_guard" / "action_guard" / "output_guard" / "permissions" / "memory_guard" / "subagent_min" / "builtin_tools_off"
+REMOVE = "input_guard"  # 2026-09-16 2회차: 1회차(action_guard)에서 실제로 막은 것이 input guard 였다.  # B4 에서 뺄 방어: "input_guard" / "action_guard" / "output_guard" / "permissions" / "memory_guard" / "subagent_min" / "builtin_tools_off"
 HOLDOUT = False  # True 면 미공개 사례 2건을 추가한다. 최종 확인에만 쓴다.
-INJECTION_GUARD = "fake"  # "remote"(RunPod) / "fake"
+INJECTION_GUARD = "remote"  # 2026-09-16 실행: RunPod Kanana Pod 사용.  # "remote"(RunPod) / "fake"
 DETECTOR = "regex"  # "regex" / "lfm"
 MODEL_MODE = "live"  # "live" / "scripted"(부품 연결 확인용)
 
